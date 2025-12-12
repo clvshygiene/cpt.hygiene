@@ -156,13 +156,19 @@ try:
     os.makedirs(IMG_DIR, exist_ok=True)
 
     # ==========================================
-    # SQLite 背景佇列系統 (Durable Queue)
+    # SQLite 背景佇列系統 (Durable Queue) - SRE Optimized
     # ==========================================
     _queue_lock = threading.Lock()
 
     @st.cache_resource
     def get_queue_connection():
-        conn = sqlite3.connect(QUEUE_DB_PATH, check_same_thread=False, timeout=30.0)
+        # [SRE修改] 加入 isolation_level="IMMEDIATE" 以支援交易鎖定
+        conn = sqlite3.connect(
+            QUEUE_DB_PATH, 
+            check_same_thread=False, 
+            timeout=30.0, 
+            isolation_level="IMMEDIATE"
+        )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS task_queue (
                 id TEXT PRIMARY KEY,
@@ -192,39 +198,82 @@ try:
             conn.commit()
         return task_id
 
-    def fetch_next_task(max_attempts: int = 6):
+    # [SRE新增] 獲取佇列健康指標
+    def get_queue_metrics():
         conn = get_queue_connection()
         with _queue_lock:
             cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT id, task_type, created_ts, payload_json, status, attempts, last_error
-                FROM task_queue
-                WHERE status IN ('PENDING', 'RETRY')
-                  AND attempts < ?
-                ORDER BY created_ts ASC
-                LIMIT 1
-                """,
-                (max_attempts,)
-            )
+            cur.execute("SELECT COUNT(*) FROM task_queue WHERE status IN ('PENDING', 'RETRY', 'IN_PROGRESS')")
             row = cur.fetchone()
-        if not row:
-            return None
+            count = row[0] if row else 0
+            
+            cur.execute("SELECT MIN(created_ts) FROM task_queue WHERE status IN ('PENDING', 'RETRY')")
+            row_ts = cur.fetchone()
+            oldest_ts_str = row_ts[0] if row_ts else None
+            
+        oldest_age_sec = 0
+        if oldest_ts_str:
+            try:
+                # 簡單計算時間差 (created_ts 為 ISO+Z)
+                created = datetime.fromisoformat(oldest_ts_str.replace("Z", "+00:00"))
+                now = datetime.now(pytz.utc)
+                oldest_age_sec = (now - created).total_seconds()
+            except:
+                pass
+                
+        return {"count": count, "oldest_age_sec": oldest_age_sec}
 
-        task_id, task_type, created_ts, payload_json, status, attempts, last_error = row
-        try:
-            payload = json.loads(payload_json)
-        except Exception:
-            payload = {}
-        return {
-            "id": task_id,
-            "task_type": task_type,
-            "created_ts": created_ts,
-            "payload": payload,
-            "status": status,
-            "attempts": attempts,
-            "last_error": last_error,
-        }
+    def fetch_next_task(max_attempts: int = 6):
+        conn = get_queue_connection()
+        with _queue_lock:
+            try:
+                cur = conn.cursor()
+                # [SRE修改] 交易開始 (由 isolation_level="IMMEDIATE" 保證)
+                cur.execute(
+                    """
+                    SELECT id, task_type, created_ts, payload_json, status, attempts, last_error
+                    FROM task_queue
+                    WHERE status IN ('PENDING', 'RETRY')
+                    AND attempts < ?
+                    ORDER BY created_ts ASC
+                    LIMIT 1
+                    """,
+                    (max_attempts,)
+                )
+                row = cur.fetchone()
+                
+                if not row:
+                    conn.commit()
+                    return None
+
+                task_id, task_type, created_ts, payload_json, status, attempts, last_error = row
+                
+                # [SRE修改] 原子化更新：直接在交易內標記 IN_PROGRESS
+                cur.execute(
+                    "UPDATE task_queue SET status = 'IN_PROGRESS', attempts = attempts + 1 WHERE id = ?",
+                    (task_id,)
+                )
+                conn.commit()
+                
+                try:
+                    payload = json.loads(payload_json)
+                except Exception:
+                    payload = {}
+                    
+                return {
+                    "id": task_id,
+                    "task_type": task_type,
+                    "created_ts": created_ts,
+                    "payload": payload,
+                    "status": "IN_PROGRESS",
+                    "attempts": attempts + 1,
+                    "last_error": last_error,
+                }
+            except Exception as e:
+                print(f"Fetch task error: {e}")
+                try: conn.rollback()
+                except: pass
+                return None
 
     def update_task_status(task_id: str, status: str, attempts: int, last_error: str | None):
         conn = get_queue_connection()
@@ -236,14 +285,8 @@ try:
             conn.commit()
 
     def get_queue_pending_count() -> int:
-        conn = get_queue_connection()
-        with _queue_lock:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT COUNT(*) FROM task_queue WHERE status IN ('PENDING', 'RETRY', 'IN_PROGRESS')"
-            )
-            row = cur.fetchone()
-        return row[0] if row else 0
+        # 保留舊接口以防其他地方調用，但內部實作一樣
+        return get_queue_metrics()["count"]
 
     def _exp_backoff_seconds(attempts: int) -> float:
         base = 1.0
@@ -251,6 +294,9 @@ try:
         return random.uniform(0, min(cap, base * (2 ** max(0, attempts))))
 
     def _append_main_entry_row(entry: dict):
+        # [SRE修改] 加入節流 (Throttling)
+        time.sleep(0.3)
+
         ws = get_worksheet(SHEET_TABS["main"])
         if not ws:
             raise RuntimeError("無法取得 main_data 工作表")
@@ -271,6 +317,9 @@ try:
         ws.append_row(row)
 
     def _append_appeal_row(entry: dict):
+        # [SRE修改] 加入節流 (Throttling)
+        time.sleep(0.3)
+
         ws = get_worksheet(SHEET_TABS["appeals"])
         if not ws:
             raise RuntimeError("無法取得 appeals 工作表")
@@ -328,7 +377,7 @@ try:
 
     def background_worker(stop_event: threading.Event | None = None):
         max_attempts = 6
-        print("🚀 背景工作者已啟動...(SQLite Queue)")
+        print("🚀 背景工作者已啟動...(SQLite Queue SRE Mode)")
         while True:
             if stop_event is not None and stop_event.is_set():
                 break
@@ -339,10 +388,11 @@ try:
                 continue
 
             task_id = task["id"]
+            # [SRE筆記] attempts 已經在 fetch 時 +1 了
             attempts = int(task["attempts"] or 0)
             payload = task["payload"]
 
-            update_task_status(task_id, "IN_PROGRESS", attempts + 1, None)
+            # [SRE修改] 移除這裡的 update_task_status("IN_PROGRESS")，因為 fetch 已經原子化處理了
 
             ok = False
             err_msg = None
@@ -369,20 +419,20 @@ try:
                 print(f"⚠️ 刪除暫存檔失敗: {cleanup_e}")
 
             if ok:
-                update_task_status(task_id, "DONE", attempts + 1, None)
+                update_task_status(task_id, "DONE", attempts, None)
                 try:
                     st.cache_data.clear()
                 except Exception:
                     pass
                 print(f"✅ Task {task_id}({task['task_type']}) 完成")
             else:
-                if attempts + 1 >= max_attempts:
-                    update_task_status(task_id, "FAILED", attempts + 1, err_msg or "unknown error")
+                if attempts >= max_attempts:
+                    update_task_status(task_id, "FAILED", attempts, err_msg or "unknown error")
                     print(f"❌ Task {task_id} 永久失敗: {err_msg}")
                 else:
-                    update_task_status(task_id, "RETRY", attempts + 1, err_msg or "unknown error")
+                    update_task_status(task_id, "RETRY", attempts, err_msg or "unknown error")
                     sleep_sec = _exp_backoff_seconds(attempts)
-                    print(f"⚠️ Task {task_id} 失敗 (第 {attempts+1} 次)，{sleep_sec:.1f} 秒後重試。錯誤: {err_msg}")
+                    print(f"⚠️ Task {task_id} 失敗 (第 {attempts} 次)，{sleep_sec:.1f} 秒後重試。錯誤: {err_msg}")
                     time.sleep(sleep_sec)
 
     @st.cache_resource
@@ -591,7 +641,7 @@ try:
             for row_idx in rows_to_delete:
                 ws.delete_rows(row_idx)
                 time.sleep(0.8)
-                
+        
             st.cache_data.clear()
             return True
         except Exception as e:
@@ -1004,14 +1054,14 @@ try:
                 
                 if not c_df.empty:
                     st.subheader(f"📊 {cls} 近期紀錄與申訴狀態")
-                    
+            
                     for idx, r in c_df.iterrows():
                         total_raw = r['內掃原始分']+r['外掃原始分']+r['垃圾原始分']+r['晨間打掃原始分']
                         phone_msg = f" | 📱手機: {r['手機人數']}" if r['手機人數'] > 0 else ""
                         
                         record_id = str(r['紀錄ID']).strip()
                         appeal_status = appeal_map.get(record_id, None)
-                        
+                
                         status_icon = ""
                         if appeal_status == "已核可": status_icon = "✅ [申訴成功] "
                         elif appeal_status == "已駁回": status_icon = "🚫 [申訴駁回] "
@@ -1047,7 +1097,7 @@ try:
                                 st.info("💡系統提示：單項每日扣分上限為 2 分 (手機、晨掃除外)，最終成績將由後台自動計算上限。")
 
                             record_date_obj = pd.to_datetime(r['日期']).date() if isinstance(r['日期'], str) else r['日期']
-                            
+            
                             if appeal_status:
                                 pass 
                             elif record_date_obj >= three_days_ago and (total_raw > 0 or r['手機人數'] > 0):
@@ -1086,15 +1136,23 @@ try:
     # --- 模式3: 後台 ---
     elif app_mode == "組長ㄉ窩💃":
         st.title("⚙️ 管理後台")
-        q_size = get_queue_pending_count()
-        if q_size > 0:
-            st.warning(f"🚀 背景系統忙碌中：尚有 {q_size} 筆資料排隊寫入（SQLite Queue）...")
+        
+        # [SRE新增] 系統健康儀表板
+        metrics = get_queue_metrics()
+        q_count = metrics["count"]
+        oldest_age = metrics["oldest_age_sec"]
+        
+        if q_count > 100:
+            st.error(f"🔥 **系統過載警告**：目前佇列積壓 {q_count} 筆資料！(建議暫停操作稍待消化)")
+        elif oldest_age > 300: # 超過 5 分鐘
+            st.warning(f"🐢 **寫入延遲警告**：最舊的一筆資料已滯留 {int(oldest_age)} 秒未寫入。")
+        elif q_count > 0:
+            st.info(f"🚀 背景同步中：尚有 {q_count} 筆資料排隊寫入...")
         else:
-            st.success("✅ 系統待機中：所有資料已同步完成")
+            st.success("✅ 系統健康：所有資料已同步完成")
 
         pwd = st.text_input("管理密碼", type="password")
         if pwd == st.secrets["system_config"]["admin_password"]:
-            # 增加一個 "👀 進度監控" 在最前面
             monitor_tab, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
                 "👀 進度監控", "📊 成績總表", "📝 扣分明細", "📧 寄送通知", 
                 "📣 申訴審核", "⚙️ 系統設定", "📄 名單更新", "🧹 晨掃點名"
@@ -1135,7 +1193,7 @@ try:
                         "role_desc": "、".join(p.get("allowed_roles", [])),
                         "done": p_name in submitted_names
                     }
-                    
+    
                     if is_mobile:
                         mobile_inspectors.append(status_obj)
                     else:
@@ -1379,5 +1437,3 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())
-
-
