@@ -31,7 +31,7 @@ try:
     TW_TZ = pytz.timezone('Asia/Taipei')
 
     MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 單檔圖片 10MB 上限
-    QUEUE_DB_PATH = "task_queue_v2.db"     # SQLite 佇列檔案
+    QUEUE_DB_PATH = "task_queue_v3.db"     # SQLite 佇列檔案
     
     # Google Sheet 網址
     SHEET_URL = "https://docs.google.com/spreadsheets/d/11BXtN3aevJls6Q2IR_IbT80-9XvhBkjbTCgANmsxqkg/edit"
@@ -1208,6 +1208,7 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
+
 
 
 
