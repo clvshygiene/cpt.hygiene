@@ -162,20 +162,7 @@ try:
 
     @st.cache_resource
     def get_queue_connection():
-        conn = sqlite3.connect(
-            QUEUE_DB_PATH,
-            check_same_thread=False,
-            timeout=30.0,
-            isolation_level=None,  # 我們自己控制 transaction
-        )
-
-        # --- SRE: SQLite stability pragmas ---
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA temp_store=MEMORY;")
-        conn.execute("PRAGMA busy_timeout=30000;")  # 30s
-        conn.execute("PRAGMA foreign_keys=ON;")
-
+        conn = sqlite3.connect(QUEUE_DB_PATH, check_same_thread=False, timeout=30.0)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS task_queue (
                 id TEXT PRIMARY KEY,
@@ -187,12 +174,9 @@ try:
                 last_error TEXT
             )
         """)
-
-        # --- SRE: index for faster dequeue when table grows ---
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_task_queue_pick ON task_queue(status, attempts, created_ts);")
-
+        conn.commit()
         return conn
-    
+
     def enqueue_task(task_type: str, payload: dict) -> str:
         conn = get_queue_connection()
         task_id = str(uuid.uuid4())
