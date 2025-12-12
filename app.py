@@ -11,7 +11,7 @@ import re
 import sqlite3
 import json
 import random
-import concurrent.futures  # [V5新增] 引入並行處理模組
+import concurrent.futures
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, date, timedelta
@@ -32,7 +32,7 @@ try:
     TW_TZ = pytz.timezone('Asia/Taipei')
 
     MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 單檔圖片 10MB 上限
-    QUEUE_DB_PATH = "task_queue_v4_wal.db"  # 維持 V4 架構資料庫
+    QUEUE_DB_PATH = "task_queue_v4_wal.db"
     
     # Google Sheet 網址
     SHEET_URL = "https://docs.google.com/spreadsheets/d/11BXtN3aevJls6Q2IR_IbT80-9XvhBkjbTCgANmsxqkg/edit"
@@ -61,22 +61,15 @@ try:
     # SRE Utils: Retry & Backoff Wrapper
     # ==========================================
     def execute_with_retry(func, max_retries=5, base_delay=1.0):
-        """
-        SRE 標準重試邏輯：
-        針對 API 429 (Rate Limit) 與 5xx (Server Error) 進行指數退避。
-        """
         for attempt in range(max_retries):
             try:
-                # 基礎節流：每次寫入前強制休息，降低 Burst QPS
                 time.sleep(0.3 + random.uniform(0, 0.2)) 
                 return func()
             except Exception as e:
                 error_str = str(e).lower()
-                # 判斷是否為可重試的錯誤
                 is_retryable = any(x in error_str for x in ['429', '500', '503', 'quota', 'rate limit', 'timed out', 'connection'])
                 
                 if is_retryable and attempt < max_retries - 1:
-                    # 指數退避 + Jitter
                     sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0, 1)
                     print(f"⚠️ API 忙碌 ({e})，第 {attempt+1} 次重試，等待 {sleep_time:.2f}秒...")
                     time.sleep(sleep_time)
@@ -191,8 +184,6 @@ try:
 
     @st.cache_resource
     def get_queue_connection():
-        # [SRE] 關鍵：check_same_thread=False 允許 ThreadPool 使用此連線
-        # 配合 _queue_lock 確保寫入安全
         conn = sqlite3.connect(
             QUEUE_DB_PATH, 
             check_same_thread=False, 
@@ -324,16 +315,9 @@ try:
             )
             conn.commit()
     
-    # [V5] 新增：重置卡住的任務 (Self-Healing)
     def requeue_stuck_tasks(stale_seconds=600):
-        conn = get_queue_connection()
-        with _queue_lock:
-            # 簡單實作：找出所有 IN_PROGRESS 且太久的，重置回 RETRY
-            # 嚴謹的實作需要 updated_ts，這裡我們假設 Streamlit 重啟是主要原因，直接重置所有
-            pass 
-            # 註：為了保持程式碼精簡且兼容 V4 table，這裡暫時依賴人工或重試機制
-            # 若要嚴謹實作，需 migration table add column. 
-            # V5 策略：依賴 fetch_next_task 的 attempts 限制與外部重啟。
+        # 簡單實作：目前策略依賴重試與 attempts 限制
+        pass 
 
     def _exp_backoff_seconds(attempts: int) -> float:
         base = 2.0
@@ -415,7 +399,6 @@ try:
         except Exception as e:
             return False, str(e)
 
-    # [V5] 多執行緒任務包裝器
     def process_task_wrapper(task, max_attempts):
         task_id = task["id"]
         attempts = int(task["attempts"] or 0)
@@ -429,7 +412,6 @@ try:
             err_msg = f"UNHANDLED: {e}\n{traceback.format_exc()}"
             ok = False
 
-        # 清理暫存
         try:
             image_paths = []
             if isinstance(payload, dict):
@@ -449,10 +431,9 @@ try:
             else:
                 update_task_status(task_id, "RETRY", attempts, err_msg or "unknown")
 
-    # [V5] 極速版 Background Worker (ThreadPool)
     def background_worker(stop_event: threading.Event | None = None):
         max_attempts = 6
-        MAX_WORKERS = 4 # 同時處理 4 個請求
+        MAX_WORKERS = 4
         print(f"🚀 極速版背景工作者啟動 (Workers: {MAX_WORKERS})...")
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -462,37 +443,53 @@ try:
                 if stop_event is not None and stop_event.is_set():
                     break
 
-                # 1. 清理已完成的 Future
                 done_futures = [f for f in futures if f.done()]
                 for f in done_futures:
                     futures.remove(f)
                     try: f.result() 
                     except Exception as e: print(f"Thread Error: {e}")
 
-                # 2. 背壓控制：如果所有 Worker 都在忙，就暫停 fetch
                 if len(futures) >= MAX_WORKERS:
                     time.sleep(0.5)
                     continue
 
-                # 3. 獲取任務
                 task = fetch_next_task(max_attempts=max_attempts)
                 if not task:
                     time.sleep(1.0)
                     continue
 
-                # 4. 丟給 ThreadPool 執行
                 print(f"⚡ 任務 {task['id']} 已分派給執行緒池")
                 future = executor.submit(process_task_wrapper, task, max_attempts)
                 futures.append(future)
 
+    # [V5.1 Fix] 不死鳥機制：改用 Manager 管理，每次 Rerun 都檢查心跳
     @st.cache_resource
-    def start_background_worker():
-        stop_event = threading.Event()
-        t = threading.Thread(target=background_worker, args=(stop_event,), daemon=True)
-        t.start()
-        return stop_event
+    def get_worker_manager():
+        # 建立一個容器來存放 thread 參照，這個容器本身會被 cache
+        return {"thread": None, "stop_event": None}
 
-    _worker_stop_event = start_background_worker()
+    def ensure_worker_started():
+        manager = get_worker_manager()
+        t = manager.get("thread")
+        
+        # 核心邏輯：如果 thread 不存在 或 已經死掉 (is_alive() == False)
+        if t is None or not t.is_alive():
+            print("❤️‍🔥 偵測到背景工作者心跳停止，正在執行 CPR 重啟程序...")
+            stop_event = threading.Event()
+            
+            # 重啟 Worker
+            t = threading.Thread(target=background_worker, args=(stop_event,), daemon=True)
+            t.start()
+            
+            # 更新 Manager 狀態
+            manager["thread"] = t
+            manager["stop_event"] = stop_event
+            print("✅ 背景工作者已復活！")
+        
+        return manager["stop_event"]
+
+    # 這一行放在全域，確保每次有人與網頁互動時，都會觸發檢查
+    _worker_stop_event = ensure_worker_started()
 
     # ==========================================
     # 2. 資料讀寫邏輯 (前端)
@@ -1484,3 +1481,4 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())
+
