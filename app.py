@@ -21,7 +21,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="糾察隊們工作啦!", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
 
 # --- 2. 捕捉全域錯誤 ---
 try:
@@ -895,7 +895,7 @@ try:
     today_tw = now_tw.date()
 
     st.sidebar.title("🏫 功能選單")
-    app_mode = st.sidebar.radio("請選擇模式", ["糾察隊工作囉!", "衛生股長ㄉzone", "衛生組長ㄉ秘密基地"])
+    app_mode = st.sidebar.radio("請選擇模式", ["糾察底家👀", "班級負責人🥸", "組長ㄉ窩💃"])
 
     # --- [SRE優化] 隱藏式診斷面板 ---
     # 平常收合保持介面乾淨，點開即自動檢查，無需多餘按鈕
@@ -919,7 +919,7 @@ try:
             st.warning("⚠️ 未設定 Drive 資料夾 ID")
                 
     # --- 模式1: 糾察評分 ---
-    if app_mode == "糾察隊工作囉!":
+    if app_mode == "糾察底家👀":
         st.title("📝 衛生糾察評分系統")
         if "team_logged_in" not in st.session_state: st.session_state["team_logged_in"] = False
         
@@ -1031,7 +1031,7 @@ try:
                                 st.toast(f"✅ 已排入儲存佇列：{selected_class}"); st.rerun()
 
     # --- 模式2: 衛生股長 (SRE 增強版: 加入申訴狀態回饋) ---
-    elif app_mode == "衛生股長ㄉzone":
+    elif app_mode == "班級負責人🥸":
         st.title("🔎 班級查詢 & 違規申訴")
         df = load_main_data()
         
@@ -1070,7 +1070,7 @@ try:
                 if not c_df.empty:
                     st.subheader(f"📊 {cls} 近期紀錄與申訴狀態")
                     
-# --- 請替換 for 迴圈內的這段邏輯 ---
+                    # --- 請替換 for 迴圈內的這段邏輯 ---
                     for idx, r in c_df.iterrows():
                         # 計算總分
                         total_raw = r['內掃原始分']+r['外掃原始分']+r['垃圾原始分']+r['晨間打掃原始分']
@@ -1168,7 +1168,7 @@ try:
                     st.info("🎉 最近沒有違規紀錄，保持得很好！")
 
     # --- 模式3: 後台 ---
-    elif app_mode == "衛生組長ㄉ秘密基地":
+    elif app_mode == "組長ㄉ窩💃":
         st.title("⚙️ 管理後台")
         q_size = get_queue_pending_count()
         if q_size > 0:
@@ -1276,7 +1276,7 @@ try:
                         for _, row in st.session_state.mail_preview.iterrows():
                             if row["狀態"] == "準備寄送":
                                 subject = f"衛生評分通知 ({target_date}) - {row['班級']}"
-                                content = f"{row['導師姓名']} 老師您好：\n\n貴班今日({target_date}) 衛生評分總扣分為：{row['當日總扣分']} 分。\n請協助督導，謝謝。\n\n衛生組敬上"
+                                content = f"{row['導師姓名']} 老師您好：\n\n貴班今日({target_date}) 衛生評分總扣分為：{row['當日總扣分']} 分。\n請，謝謝。\n\n衛生組敬上"
                                 mail_queue_list.append({'email': row["收件信箱"], 'subject': subject, 'body': content})
                         
                         if mail_queue_list:
@@ -1371,35 +1371,3 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
