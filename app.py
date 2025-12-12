@@ -897,14 +897,26 @@ try:
     st.sidebar.title("🏫 功能選單")
     app_mode = st.sidebar.radio("請選擇模式", ["我是糾察隊(評分)", "我是班上衛生股長", "衛生組後台"])
 
-    # --- 優化版：把除錯資訊藏起來，介面更乾淨 ---
+    # --- [SRE優化] 隱藏式診斷面板 ---
+    # 平常收合保持介面乾淨，點開即自動檢查，無需多餘按鈕
     with st.sidebar.expander("🔧 系統連線診斷", expanded=False):
-        if st.checkbox("顯示連線狀態", value=False):
-            if get_gspread_client(): st.success("✅ Sheets 連線正常")
-            else: st.error("❌ Sheets 連線失敗")
+        # 1. 檢查 Google Sheets API
+        if get_gspread_client(): 
+            st.success("✅ Google Sheets 連線正常")
+        else: 
+            st.error("❌ Sheets 連線失敗")
             
-            if "gcp_service_account" in st.secrets: st.success("✅ 憑證已讀取")
-            else: st.error("⚠️ 未設定憑證")
+        # 2. 檢查 GCP 憑證
+        if "gcp_service_account" in st.secrets: 
+            st.success("✅ GCP 憑證已讀取")
+        else: 
+            st.error("⚠️ 未設定 GCP Service Account")
+            
+        # 3. 檢查 Drive 資料夾設定 (額外幫你加上這項檢查)
+        if "system_config" in st.secrets and "drive_folder_id" in st.secrets["system_config"]:
+            st.success("✅ Drive 資料夾 ID 已設定")
+        else:
+            st.warning("⚠️ 未設定 Drive 資料夾 ID")
                 
     # --- 模式1: 糾察評分 ---
     if app_mode == "我是糾察隊(評分)":
@@ -1346,6 +1358,7 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
+
 
 
 
