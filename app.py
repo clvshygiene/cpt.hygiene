@@ -1094,11 +1094,105 @@ try:
 
         pwd = st.text_input("管理密碼", type="password")
         if pwd == st.secrets["system_config"]["admin_password"]:
-            tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-                "📊 成績總表", "📝 扣分明細", "📧 寄送通知", 
+            # 增加一個 "👀 進度監控" 在最前面
+            monitor_tab, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+                "👀 進度監控", "📊 成績總表", "📝 扣分明細", "📧 寄送通知", 
                 "📣 申訴審核", "⚙️ 系統設定", "📄 名單更新", "🧹 晨掃點名"
             ])
             
+            with monitor_tab:
+                st.subheader("🕵️ 今日評分進度監控")
+                
+                # 1. 設定監控日期 (預設今天)
+                monitor_date = st.date_input("監控日期", today_tw, key="monitor_date")
+                st.caption(f"📅 檢查目標：{monitor_date} (建議於 16:30 前完成)")
+
+                # 2. 準備資料
+                df = load_main_data()
+                
+                # 取得今日已回報的人員名單 (去重)
+                submitted_names = set()
+                if not df.empty:
+                    # 轉成字串比對，確保格式一致
+                    df["日期Str"] = df["日期"].astype(str)
+                    target_str = str(monitor_date)
+                    today_records = df[df["日期Str"] == target_str]
+                    submitted_names = set(today_records["檢查人員"].unique())
+
+                # 3. 分類檢查人員 (一般評分 vs 機動/組長)
+                # 邏輯：有分配 "assigned_classes" 的是班級評分員，沒有的是機動
+                regular_inspectors = [] # 有固定班級
+                mobile_inspectors = []  # 機動/組長 (無固定班級)
+
+                for p in INSPECTOR_LIST:
+                    p_name = p["label"]
+                    # 判斷是否為機動：看 assigned_classes 是否為空
+                    is_mobile = len(p.get("assigned_classes", [])) == 0
+                    
+                    # 建立狀態物件
+                    status_obj = {
+                        "name": p_name,
+                        "role_desc": "、".join(p.get("allowed_roles", [])),
+                        "done": p_name in submitted_names
+                    }
+                    
+                    if is_mobile:
+                        mobile_inspectors.append(status_obj)
+                    else:
+                        regular_inspectors.append(status_obj)
+
+                # 4. 顯示儀表板
+                # --- 計算數據 ---
+                total_regular = len(regular_inspectors)
+                done_regular = sum(1 for x in regular_inspectors if x["done"])
+                
+                total_mobile = len(mobile_inspectors)
+                done_mobile = sum(1 for x in mobile_inspectors if x["done"])
+
+                # --- 顯示進度條 ---
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.metric("班級評分員完成率", f"{done_regular}/{total_regular}", delta=f"尚缺 {total_regular - done_regular} 人")
+                    if total_regular > 0:
+                        st.progress(done_regular / total_regular)
+                with c2:
+                    st.metric("機動/組長完成率", f"{done_mobile}/{total_mobile}", delta=f"尚缺 {total_mobile - done_mobile} 人")
+                    if total_mobile > 0:
+                        st.progress(done_mobile / total_mobile)
+
+                st.divider()
+
+                # 5. 顯示未完成名單 (左右並列)
+                col_reg, col_mob = st.columns(2)
+                
+                with col_reg:
+                    st.write("#### 🔴 班級評分員 (未完成)")
+                    missing_reg = [x for x in regular_inspectors if not x["done"]]
+                    if missing_reg:
+                        for p in missing_reg:
+                            st.error(f"❌ {p['name']}")
+                    else:
+                        st.success("🎉 全員完成！")
+
+                    with st.expander("查看已完成名單"):
+                        for p in regular_inspectors:
+                            if p["done"]: st.write(f"✅ {p['name']}")
+
+                with col_mob:
+                    st.write("#### 🟠 機動/組長 (未完成)")
+                    st.caption("機動人員若今日無違規需登記，可能也不會送出資料，請斟酌參考。")
+                    missing_mob = [x for x in mobile_inspectors if not x["done"]]
+                    if missing_mob:
+                        for p in missing_mob:
+                            # 機動組顯示負責項目，方便組長判斷他今天是不是真的沒事
+                            st.warning(f"⚠️ {p['name']} \n   (負責: {p['role_desc']})")
+                    else:
+                        st.success("🎉 全員完成！")
+
+                    with st.expander("查看已完成名單"):
+                        for p in mobile_inspectors:
+                            if p["done"]: st.write(f"✅ {p['name']}")
+
             with tab1: # 成績總表
                 st.subheader("成績總表")
                 df = load_main_data()
