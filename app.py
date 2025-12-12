@@ -679,31 +679,60 @@ try:
             except: pass
         return roster_dict
         
-    @st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600)
     def load_sorted_classes():
+        """
+        [SRE修正版] 強制依照業務邏輯排序：
+        1. 年級 (1 -> 2 -> 3)
+        2. 科別 (商 -> 英 -> 資 -> 家 -> 服)
+        3. 班級名稱 (字串排序)
+        """
         ws = get_worksheet(SHEET_TABS["roster"])
         if not ws: return [], []
         try:
             df = pd.DataFrame(ws.get_all_records())
             class_col = next((c for c in df.columns if "班級" in c), None)
             if not class_col: return [], []
+            
+            # 取得所有不重複班級並移除空白
             unique_classes = df[class_col].dropna().unique().tolist()
-            unique_classes = [c.strip() for c in unique_classes if c.strip()]
+            unique_classes = [str(c).strip() for c in unique_classes if str(c).strip()]
             
-            def sort_key(name):
-                match = re.search(r'\d+', name)
-                grade = int(match.group()) if match else 99
-                return (grade, name)
+            # 定義科別權重 (越小越前面)
+            dept_order = {"商": 1, "英": 2, "資": 3, "家": 4, "服": 5}
             
-            sorted_all = sorted(unique_classes, key=sort_key)
+            def get_sort_key(name):
+                # 1. 解析年級 (優先找中文數字，再找阿拉伯數字)
+                grade = 99
+                if "一" in name or "1" in name: grade = 1
+                if "二" in name or "2" in name: grade = 2
+                if "三" in name or "3" in name: grade = 3
+                
+                # 2. 解析科別權重
+                dept_score = 99
+                for k, v in dept_order.items():
+                    if k in name:
+                        dept_score = v
+                        break
+                
+                # 回傳 Tuple 進行多重排序: (年級, 科別權重, 原始名稱)
+                return (grade, dept_score, name)
+            
+            # 執行排序
+            sorted_all = sorted(unique_classes, key=get_sort_key)
+            
+            # 建構結構化資料 (給前端篩選用)
             structured = []
             for c in sorted_all:
-                match = re.search(r'\d+', c)
-                g_num = match.group() if match else "?"
-                g_label = f"{g_num}年級" if g_num != "?" else "其他"
+                # 再次解析年級作為標籤
+                grade_val = get_sort_key(c)[0]
+                g_label = f"{grade_val}年級" if grade_val != 99 else "其他"
                 structured.append({"grade": g_label, "name": c})
+                
             return sorted_all, structured
-        except: return [], []
+        except Exception as e:
+            print(f"Sorting Error: {e}")
+            return [], []
 
     @st.cache_data(ttl=21600)
     def load_teacher_emails():
@@ -934,14 +963,40 @@ try:
                                     save_entry({**base, "班級": row["班級"], "評分項目": role, "垃圾原始分": len(vios), "備註": f"{trash_cat}-{'、'.join(vios)}", "違規細項": trash_cat})
                                     cnt += 1
                             st.success(f"已排入背景處理： {cnt} 班" if cnt else "無違規"); st.rerun()
-                else:
-                    st.markdown("### 🏫選擇班級")
-                    if assigned_classes: selected_class = st.radio("請點選班級", assigned_classes)
-                    else:
-                        g = st.radio("年級", grades, horizontal=True)
-                        selected_class = st.radio("班級", [c["name"] for c in structured_classes if c["grade"] == g], horizontal=True)
+else:
+                    st.markdown("### 🏫 選擇受檢班級")
                     
+                    # [SRE Fix] 1. 為 radio 加上 key，防止 State Lost
+                    # [SRE Fix] 2. 顯示當前選中班級，讓使用者 Double Check
+                    
+                    if assigned_classes:
+                        # 這裡加上 key，確保 Inspector 切換時，radio 狀態獨立
+                        radio_key = f"radio_assigned_{inspector_name}"
+                        selected_class = st.radio(
+                            "請點選您的負責班級", 
+                            assigned_classes, 
+                            key=radio_key
+                        )
+                    else:
+                        # 這裡使用上面修復過的排序邏輯
+                        g = st.radio("步驟 A: 選擇年級", grades, horizontal=True, key="radio_grade_select")
+                        filtered_classes = [c["name"] for c in structured_classes if c["grade"] == g]
+                        
+                        if not filtered_classes:
+                            st.warning("⚠️ 此年級無班級資料")
+                            selected_class = None
+                        else:
+                            selected_class = st.radio(
+                                "步驟 B: 選擇班級", 
+                                filtered_classes, 
+                                horizontal=True,
+                                key=f"radio_class_select_{g}" # 動態 key 避免混亂
+                            )
+                    
+                    # [SRE Fix] 顯式確認與防呆
                     if selected_class:
+                        st.markdown(f"👉 目前鎖定評分對象： **<span style='color:red;font-size:1.2em'>{selected_class}</span>**", unsafe_allow_html=True)
+                        
                         if check_duplicate_record(main_df, input_date, inspector_name, role, selected_class):
                                 st.warning(f"⚠️ 注意：您今天已經評過「{selected_class}」了！")
                         st.info(f"📍 正在評分：**{selected_class}**")
@@ -1222,6 +1277,7 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
+
 
 
 
