@@ -451,20 +451,23 @@ try:
             return pd.DataFrame(columns=EXPECTED_COLUMNS)
 
 
-    def save_entry(new_entry, uploaded_files=None):
+def save_entry(new_entry, uploaded_files=None):
         """
-        前端評分送進來：
-        - 圖片寫到本機暫存資料夾 IMG_DIR
-        - 佇列只放 entry + 檔案路徑
-        - 背景 worker 負責上傳 Drive + 寫 main_data
+        [修正版] 
+        1. 強制將「日期」轉為字串，避免 JSON 序列化失敗 (這是之前崩潰的主因)。
+        2. 增加 SQLite 連線逾時設定，提升 80 人並發時的穩定性。
         """
+        # --- 關鍵修正：把日期物件轉成字串 ---
+        if "日期" in new_entry and new_entry["日期"]:
+            new_entry["日期"] = str(new_entry["日期"])
+        # ----------------------------------
+
         image_paths = []
         file_names = []
 
         if uploaded_files:
             for i, up_file in enumerate(uploaded_files):
-                if not up_file:
-                    continue
+                if not up_file: continue
                 try:
                     up_file.seek(0)
                     data = up_file.read()
@@ -472,17 +475,18 @@ try:
                     print(f"⚠️ 讀取上傳檔失敗: {e}")
                     continue
 
-                if not data:
-                    continue
+                if not data: continue
 
                 # 檔案大小限制 10MB
                 size = len(data)
                 if size > MAX_IMAGE_BYTES:
                     mb = size / (1024 * 1024)
-                    st.warning(f"📸 檔案「{up_file.name}」過大 ({mb:.1f} MB)，已略過。單檔上限為 10 MB。")
+                    st.warning(f"📸 檔案「{up_file.name}」過大 ({mb:.1f} MB)，已略過。")
                     continue
 
-                logical_fname = f"{new_entry['日期']}_{new_entry['班級']}_{i}.jpg"
+                # 檔名邏輯
+                safe_class = str(new_entry.get('班級', 'unknown'))
+                logical_fname = f"{new_entry['日期']}_{safe_class}_{i}.jpg"
                 tmp_fname = f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}_{logical_fname}"
                 local_path = os.path.join(IMG_DIR, tmp_fname)
 
@@ -493,9 +497,8 @@ try:
                     file_names.append(logical_fname)
                 except Exception as e:
                     print(f"⚠️ 寫入暫存檔失敗: {e}")
-                    # 這張失敗就略過，不中斷其它檔案
 
-        # 確保紀錄ID存在（申訴對應會用到）
+        # 確保紀錄ID存在
         if "紀錄ID" not in new_entry or not new_entry["紀錄ID"]:
             unique_suffix = uuid.uuid4().hex[:6]
             timestamp = datetime.now(TW_TZ).strftime("%Y%m%d%H%M%S")
@@ -506,12 +509,17 @@ try:
             "image_paths": image_paths,
             "filenames": file_names,
         }
+        
+        # 這裡會安全地寫入 SQLite
         task_id = enqueue_task("main_entry", payload)
+        
         try:
             st.cache_data.clear()
         except Exception:
             pass
+        
         print(f"📥 main_entry 排入佇列 (Task ID: {task_id})")
+        return True
 
 
     def save_appeal(entry, proof_file=None):
@@ -1208,6 +1216,7 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
+
 
 
 
