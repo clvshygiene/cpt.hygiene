@@ -451,7 +451,7 @@ try:
             return pd.DataFrame(columns=EXPECTED_COLUMNS)
 
 
-def save_entry(new_entry, uploaded_files=None):
+    def save_entry(new_entry, uploaded_files=None):
         """
         [修正版] 
         1. 強制將「日期」轉為字串，避免 JSON 序列化失敗 (這是之前崩潰的主因)。
@@ -1216,6 +1216,7 @@ def save_entry(new_entry, uploaded_files=None):
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
+
 
 
 
