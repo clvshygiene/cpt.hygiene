@@ -34,7 +34,7 @@ try:
     QUEUE_DB_PATH = "task_queue.db"     # SQLite 佇列檔案
     
     # Google Sheet 網址
-    SHEET_URL = "https://docs.google.com/spreadsheets/d/17xLz54UvrXjpnfI3xp5gA2Q4WRiLK6LK/edit?usp=sharing&ouid=100972944502681260409&rtpof=true&sd=true"
+    SHEET_URL = "https://docs.google.com/spreadsheets/d/11BXtN3aevJls6Q2IR_IbT80-9XvhBkjbTCgANmsxqkg/edit?gid=1145717759#gid=1145717759"
 
     SHEET_TABS = {
         "main": "main_data", 
@@ -1208,6 +1208,7 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
+
 
 
 
