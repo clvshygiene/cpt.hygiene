@@ -679,7 +679,7 @@ try:
             except: pass
         return roster_dict
         
-@st.cache_data(ttl=3600)
+    @st.cache_data(ttl=3600)
     def load_sorted_classes():
         """
         [SRE修正版] 強制依照業務邏輯排序：
@@ -1277,6 +1277,7 @@ else:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
+
 
 
 
