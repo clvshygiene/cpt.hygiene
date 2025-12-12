@@ -444,13 +444,15 @@ try:
 
             if "週次" in df.columns:
                 df["週次"] = pd.to_numeric(df["週次"], errors="coerce").fillna(0).astype(int)
-
-        return df[EXPECTED_COLUMNS]
-        
-        # 👇 請補上這一段缺少的 except 區塊 👇
+  
         except Exception as e:
             st.error(f"讀取資料錯誤: {e}")
             return pd.DataFrame(columns=EXPECTED_COLUMNS)
+        
+        return df[EXPECTED_COLUMNS]
+        
+        # 👇 請補上這一段缺少的 except 區塊 👇
+
         # 👆 補到這裡為止 👆
 
     def save_entry(new_entry, uploaded_files=None):
@@ -1374,6 +1376,7 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
+
 
 
 
