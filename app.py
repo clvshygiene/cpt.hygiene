@@ -21,7 +21,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="衛生糾察評分系統(雲端旗艦版)", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="糾察隊們工作啦!", layout="wide", page_icon="🧹")
 
 # --- 2. 捕捉全域錯誤 ---
 try:
@@ -1371,6 +1371,7 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
+
 
 
 
