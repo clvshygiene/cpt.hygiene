@@ -1179,12 +1179,12 @@ try:
         pwd = st.text_input("管理密碼", type="password")
         if pwd == st.secrets["system_config"]["admin_password"]:
             tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-                "📊 成績總表", "📝 詳細明細", "📧 寄送通知", 
-                "📣 申訴審核", "⚙️ 系統設定", "📄 名單管理", "🧹 晨掃管理"
+                "📊 成績總表", "📝 扣分明細", "📧 寄送通知", 
+                "📣 申訴審核", "⚙️ 系統設定", "📄 名單更新", "🧹 晨掃點名"
             ])
             
             with tab1: # 成績總表
-                st.subheader("成績排行榜與總表")
+                st.subheader("成績總表")
                 df = load_main_data()
                 all_classes_df = pd.DataFrame(all_classes, columns=["班級"])
                 if not df.empty:
@@ -1318,7 +1318,7 @@ try:
                 nd = st.date_input("開學日", datetime.strptime(curr, "%Y-%m-%d").date())
                 if st.button("更新開學日"): save_setting("semester_start", str(nd)); st.success("已更新")
                 st.divider()
-                st.markdown("### 🗑️ 資料維護 (安全刪除版)")
+                st.markdown("### 🗑️ 資料維護")
                 df = load_main_data()
                 if not df.empty:
                     del_mode = st.radio("刪除模式", ["單筆刪除", "日期區間刪除"])
@@ -1371,6 +1371,7 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
+
 
 
 
