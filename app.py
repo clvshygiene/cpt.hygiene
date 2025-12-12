@@ -450,21 +450,19 @@ try:
             st.error(f"讀取資料錯誤: {e}")
             return pd.DataFrame(columns=EXPECTED_COLUMNS)
 
-
     def save_entry(new_entry, uploaded_files=None):
         """
-        [修正版] 
-        1. 強制將「日期」轉為字串，避免 JSON 序列化失敗 (這是之前崩潰的主因)。
-        2. 增加 SQLite 連線逾時設定，提升 80 人並發時的穩定性。
+        [修正版] 包含日期轉字串修正，並支援 SQLite 佇列寫入
         """
-        # --- 關鍵修正：把日期物件轉成字串 ---
+        # --- 關鍵修正：把日期物件轉成字串，避免 JSON 序列化失敗 ---
         if "日期" in new_entry and new_entry["日期"]:
             new_entry["日期"] = str(new_entry["日期"])
-        # ----------------------------------
+        # ----------------------------------------------------
 
         image_paths = []
         file_names = []
 
+        # 處理圖片上傳 (先寫入暫存檔)
         if uploaded_files:
             for i, up_file in enumerate(uploaded_files):
                 if not up_file: continue
@@ -477,15 +475,16 @@ try:
 
                 if not data: continue
 
-                # 檔案大小限制 10MB
+                # 檔案大小限制 10MB 
                 size = len(data)
                 if size > MAX_IMAGE_BYTES:
                     mb = size / (1024 * 1024)
                     st.warning(f"📸 檔案「{up_file.name}」過大 ({mb:.1f} MB)，已略過。")
                     continue
 
-                # 檔名邏輯
+                # 產生暫存檔名
                 safe_class = str(new_entry.get('班級', 'unknown'))
+                # 這裡使用安全的檔名邏輯
                 logical_fname = f"{new_entry['日期']}_{safe_class}_{i}.jpg"
                 tmp_fname = f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}_{logical_fname}"
                 local_path = os.path.join(IMG_DIR, tmp_fname)
@@ -504,22 +503,29 @@ try:
             timestamp = datetime.now(TW_TZ).strftime("%Y%m%d%H%M%S")
             new_entry["紀錄ID"] = f"{timestamp}_{unique_suffix}"
 
+        # 準備資料封包
         payload = {
             "entry": new_entry,
             "image_paths": image_paths,
             "filenames": file_names,
         }
         
-        # 這裡會安全地寫入 SQLite
-        task_id = enqueue_task("main_entry", payload)
-        
+        # 寫入佇列 (這裡需要 try/except 包覆以防萬一)
         try:
-            st.cache_data.clear()
-        except Exception:
-            pass
-        
-        print(f"📥 main_entry 排入佇列 (Task ID: {task_id})")
-        return True
+            task_id = enqueue_task("main_entry", payload)
+            print(f"📥 main_entry 排入佇列 (Task ID: {task_id})")
+            
+            # 清除快取讓畫面更新
+            try:
+                st.cache_data.clear()
+            except:
+                pass
+            return True
+            
+        except Exception as e:
+            st.error(f"❌ 寫入佇列失敗: {e}")
+            # 如果這裡出錯，通常是 task_queue.db 被鎖住，重啟 App 通常可解
+            return False
 
 
     def save_appeal(entry, proof_file=None):
@@ -1216,6 +1222,7 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
+
 
 
 
