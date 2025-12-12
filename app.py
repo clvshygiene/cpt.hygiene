@@ -153,15 +153,15 @@ try:
 
     @st.cache_resource
     def get_queue_connection():
-        """取得 SQLite 連線並初始化 task_queue 資料表。"""
-        conn = sqlite3.connect(QUEUE_DB_PATH, check_same_thread=False)
+        # 設定 timeout=30 秒，讓多人同時寫入時會自動排隊等待，而不是直接報錯
+        conn = sqlite3.connect(QUEUE_DB_PATH, check_same_thread=False, timeout=30.0)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS task_queue (
                 id TEXT PRIMARY KEY,
                 task_type TEXT NOT NULL,
                 created_ts TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
-                status TEXT NOT NULL,          -- PENDING / IN_PROGRESS / RETRY / DONE / FAILED
+                status TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT
             )
@@ -1216,6 +1216,7 @@ def save_entry(new_entry, uploaded_files=None):
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
+
 
 
 
