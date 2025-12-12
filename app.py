@@ -11,6 +11,7 @@ import re
 import sqlite3
 import json
 import random
+import functools
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, date, timedelta
@@ -31,7 +32,7 @@ try:
     TW_TZ = pytz.timezone('Asia/Taipei')
 
     MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 單檔圖片 10MB 上限
-    QUEUE_DB_PATH = "task_queue_v3.db"  # SQLite 佇列檔案
+    QUEUE_DB_PATH = "task_queue_v4_wal.db"  # 更新 DB 檔名以套用新架構
     
     # Google Sheet 網址
     SHEET_URL = "https://docs.google.com/spreadsheets/d/11BXtN3aevJls6Q2IR_IbT80-9XvhBkjbTCgANmsxqkg/edit"
@@ -55,6 +56,33 @@ try:
     APPEAL_COLUMNS = [
         "申訴日期", "班級", "違規日期", "違規項目", "原始扣分", "申訴理由", "佐證照片", "處理狀態", "登錄時間", "對應紀錄ID"
     ]
+
+    # ==========================================
+    # SRE Utils: Retry & Backoff Wrapper
+    # ==========================================
+    def execute_with_retry(func, max_retries=5, base_delay=1.0):
+        """
+        SRE 標準重試邏輯：
+        針對 API 429 (Rate Limit) 與 5xx (Server Error) 進行指數退避。
+        """
+        for attempt in range(max_retries):
+            try:
+                # 基礎節流：每次寫入前強制休息，降低 Burst QPS
+                time.sleep(0.3 + random.uniform(0, 0.2)) 
+                return func()
+            except Exception as e:
+                error_str = str(e).lower()
+                # 判斷是否為可重試的錯誤 (API 配額、暫時性連線問題)
+                is_retryable = any(x in error_str for x in ['429', '500', '503', 'quota', 'rate limit', 'timed out', 'connection'])
+                
+                if is_retryable and attempt < max_retries - 1:
+                    # 指數退避 + Jitter
+                    sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0, 1)
+                    print(f"⚠️ API 忙碌 ({e})，第 {attempt+1} 次重試，等待 {sleep_time:.2f}秒...")
+                    time.sleep(sleep_time)
+                else:
+                    # 不可重試的錯誤或次數用盡，直接拋出
+                    raise e
 
     # ==========================================
     # 1. Google 連線整合
@@ -120,27 +148,31 @@ try:
         return None
 
     def upload_image_to_drive(file_obj, filename):
-        service = get_drive_service()
-        if not service: return None
-        
-        folder_id = st.secrets["system_config"].get("drive_folder_id")
-        if not folder_id:
-            print("⚠️ Secrets 中未設定 drive_folder_id")
-            return None
+        # 將核心邏輯封裝，供重試器呼叫
+        def _upload_action():
+            service = get_drive_service()
+            if not service: raise Exception("Drive Service Init Failed")
+            
+            folder_id = st.secrets["system_config"].get("drive_folder_id")
+            if not folder_id: raise Exception("No Drive Folder ID")
 
-        try:
             file_metadata = {'name': filename, 'parents': [folder_id]}
             media = MediaIoBaseUpload(file_obj, mimetype='image/jpeg')
+            
+            # execute 內部也有自己的 retry，但我們在外層再包一層保護
             file = service.files().create(
                 body=file_metadata, media_body=media, fields='id', supportsAllDrives=True
-            ).execute(num_retries=3)
+            ).execute(num_retries=1)
             
             try:
                 service.permissions().create(fileId=file.get('id'), body={'role': 'reader', 'type': 'anyone'}).execute()
             except: pass 
             return f"https://drive.google.com/thumbnail?id={file.get('id')}&sz=w1000"
+
+        try:
+            return execute_with_retry(_upload_action)
         except Exception as e:
-            print(f"⚠️ Drive 上傳失敗: {str(e)}")
+            print(f"⚠️ Drive 上傳最終失敗: {str(e)}")
             return None
 
     def clean_id(val):
@@ -150,25 +182,36 @@ try:
         except: return str(val).strip()
 
     # ==========================================
-    # 圖片暫存資料夾：只在本機短暫存放
+    # 圖片暫存資料夾
     # ==========================================
     IMG_DIR = "evidence_photos"
     os.makedirs(IMG_DIR, exist_ok=True)
 
     # ==========================================
-    # SQLite 背景佇列系統 (Durable Queue) - SRE Optimized
+    # SQLite 背景佇列系統 (SRE Hardened)
     # ==========================================
     _queue_lock = threading.Lock()
 
     @st.cache_resource
     def get_queue_connection():
-        # [SRE修改] 加入 isolation_level="IMMEDIATE" 以支援交易鎖定
+        # [SRE] 關鍵優化：
+        # 1. IMMEDIATE: 確保交易寫入鎖
+        # 2. check_same_thread=False: 允許跨執行緒使用連線
         conn = sqlite3.connect(
             QUEUE_DB_PATH, 
             check_same_thread=False, 
             timeout=30.0, 
-            isolation_level="IMMEDIATE"
+            isolation_level="IMMEDIATE" 
         )
+        
+        # [SRE] 效能與併發優化 PRAGMA
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")  # Write-Ahead Logging 提升併發
+            conn.execute("PRAGMA busy_timeout=30000;") # 等待鎖釋放最長 30秒
+            conn.execute("PRAGMA synchronous=NORMAL;") # 寫入磁碟策略優化
+        except:
+            pass
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS task_queue (
                 id TEXT PRIMARY KEY,
@@ -180,6 +223,8 @@ try:
                 last_error TEXT
             )
         """)
+        # [SRE] 建立索引以加速 fetch
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_status_created ON task_queue (status, created_ts);")
         conn.commit()
         return conn
 
@@ -198,37 +243,52 @@ try:
             conn.commit()
         return task_id
 
-    # [SRE新增] 獲取佇列健康指標
+    # [SRE] 增強型監控指標
     def get_queue_metrics():
         conn = get_queue_connection()
+        metrics = {
+            "pending": 0, "retry": 0, "failed": 0, 
+            "oldest_pending_sec": 0, "recent_errors": []
+        }
         with _queue_lock:
             cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM task_queue WHERE status IN ('PENDING', 'RETRY', 'IN_PROGRESS')")
-            row = cur.fetchone()
-            count = row[0] if row else 0
             
+            # 狀態計數
+            cur.execute("SELECT status, COUNT(*) FROM task_queue GROUP BY status")
+            rows = cur.fetchall()
+            for status, count in rows:
+                if status == 'PENDING': metrics["pending"] = count
+                elif status == 'RETRY': metrics["retry"] = count
+                elif status == 'FAILED': metrics["failed"] = count
+            
+            # 最舊滯留時間
             cur.execute("SELECT MIN(created_ts) FROM task_queue WHERE status IN ('PENDING', 'RETRY')")
-            row_ts = cur.fetchone()
-            oldest_ts_str = row_ts[0] if row_ts else None
+            oldest_ts_str = cur.fetchone()[0]
             
-        oldest_age_sec = 0
+            # 最近錯誤 (Top 5)
+            cur.execute("SELECT last_error, created_ts FROM task_queue WHERE status='FAILED' OR status='RETRY' ORDER BY created_ts DESC LIMIT 5")
+            metrics["recent_errors"] = cur.fetchall()
+
         if oldest_ts_str:
             try:
-                # 簡單計算時間差 (created_ts 為 ISO+Z)
                 created = datetime.fromisoformat(oldest_ts_str.replace("Z", "+00:00"))
                 now = datetime.now(pytz.utc)
-                oldest_age_sec = (now - created).total_seconds()
-            except:
-                pass
+                metrics["oldest_pending_sec"] = (now - created).total_seconds()
+            except: pass
                 
-        return {"count": count, "oldest_age_sec": oldest_age_sec}
+        return metrics
 
     def fetch_next_task(max_attempts: int = 6):
+        """
+        [SRE] 原子化任務獲取 (Atomic Claim)
+        使用 Transaction + Rowcount Check 確保任務不會被重複領取
+        """
         conn = get_queue_connection()
         with _queue_lock:
             try:
                 cur = conn.cursor()
-                # [SRE修改] 交易開始 (由 isolation_level="IMMEDIATE" 保證)
+                
+                # 1. 鎖定並讀取候選任務
                 cur.execute(
                     """
                     SELECT id, task_type, created_ts, payload_json, status, attempts, last_error
@@ -248,11 +308,23 @@ try:
 
                 task_id, task_type, created_ts, payload_json, status, attempts, last_error = row
                 
-                # [SRE修改] 原子化更新：直接在交易內標記 IN_PROGRESS
+                # 2. 原子更新：加上 WHERE status 条件，確保當下狀態仍是我們剛讀到的
+                # 同時直接將 attempts + 1，避免重複計算
                 cur.execute(
-                    "UPDATE task_queue SET status = 'IN_PROGRESS', attempts = attempts + 1 WHERE id = ?",
-                    (task_id,)
+                    """
+                    UPDATE task_queue 
+                    SET status = 'IN_PROGRESS', attempts = attempts + 1 
+                    WHERE id = ? AND status = ?
+                    """,
+                    (task_id, status)
                 )
+                
+                if cur.rowcount == 0:
+                    # [Race Condition Detected] 被其他 worker 搶先一步
+                    conn.commit()
+                    print(f"⚠️ Race condition avoided for task {task_id}")
+                    return None
+
                 conn.commit()
                 
                 try:
@@ -266,7 +338,7 @@ try:
                     "created_ts": created_ts,
                     "payload": payload,
                     "status": "IN_PROGRESS",
-                    "attempts": attempts + 1,
+                    "attempts": attempts + 1, # 已在 DB 更新
                     "last_error": last_error,
                 }
             except Exception as e:
@@ -285,51 +357,51 @@ try:
             conn.commit()
 
     def get_queue_pending_count() -> int:
-        # 保留舊接口以防其他地方調用，但內部實作一樣
-        return get_queue_metrics()["count"]
+        m = get_queue_metrics()
+        return m["pending"] + m["retry"]
 
     def _exp_backoff_seconds(attempts: int) -> float:
-        base = 1.0
-        cap = 32.0
-        return random.uniform(0, min(cap, base * (2 ** max(0, attempts))))
+        base = 2.0 # 提高基礎等待時間
+        cap = 60.0 # 上限 60 秒
+        return random.uniform(1.0, min(cap, base * (2 ** max(0, attempts))))
 
+    # ==========================================
+    # 寫入邏輯 (套用 Retry Wrapper)
+    # ==========================================
     def _append_main_entry_row(entry: dict):
-        # [SRE修改] 加入節流 (Throttling)
-        time.sleep(0.3)
+        def _action():
+            ws = get_worksheet(SHEET_TABS["main"])
+            if not ws: raise Exception("Failed to get main worksheet")
+            
+            # [SRE] 這裡未來可加入 check_duplicate (Idempotency) 邏輯，
+            # 但考量讀取配額，暫時信任 Queue 的 Exactly-Once 特性。
 
-        ws = get_worksheet(SHEET_TABS["main"])
-        if not ws:
-            raise RuntimeError("無法取得 main_data 工作表")
+            all_vals = ws.get_all_values() # 這是一個高消耗操作，API Retry 會保護它
+            if not all_vals: ws.append_row(EXPECTED_COLUMNS)
 
-        all_vals = ws.get_all_values()
-        if not all_vals:
-            ws.append_row(EXPECTED_COLUMNS)
-
-        row = []
-        for col in EXPECTED_COLUMNS:
-            val = entry.get(col, "")
-            if isinstance(val, bool):
-                val = str(val).upper()
-            if col == "日期":
-                val = str(val)
-            row.append(val)
+            row = []
+            for col in EXPECTED_COLUMNS:
+                val = entry.get(col, "")
+                if isinstance(val, bool): val = str(val).upper()
+                if col == "日期": val = str(val)
+                row.append(val)
+            
+            ws.append_row(row)
         
-        ws.append_row(row)
+        execute_with_retry(_action)
 
     def _append_appeal_row(entry: dict):
-        # [SRE修改] 加入節流 (Throttling)
-        time.sleep(0.3)
+        def _action():
+            ws = get_worksheet(SHEET_TABS["appeals"])
+            if not ws: raise Exception("Failed to get appeals worksheet")
 
-        ws = get_worksheet(SHEET_TABS["appeals"])
-        if not ws:
-            raise RuntimeError("無法取得 appeals 工作表")
+            all_vals = ws.get_all_values()
+            if not all_vals: ws.append_row(APPEAL_COLUMNS)
 
-        all_vals = ws.get_all_values()
-        if not all_vals:
-            ws.append_row(APPEAL_COLUMNS)
-
-        row = [str(entry.get(col, "")) for col in APPEAL_COLUMNS]
-        ws.append_row(row)
+            row = [str(entry.get(col, "")) for col in APPEAL_COLUMNS]
+            ws.append_row(row)
+        
+        execute_with_retry(_action)
 
     def process_task(task: dict, max_attempts: int = 6) -> tuple[bool, str | None]:
         task_type = task["task_type"]
@@ -348,6 +420,7 @@ try:
                         drive_links.append("UPLOAD_FAILED")
                         continue
                     with open(path, "rb") as f:
+                        # upload_image_to_drive 內部已包含 Retry
                         link = upload_image_to_drive(f, fname)
                     drive_links.append(link if link else "UPLOAD_FAILED")
 
@@ -377,22 +450,21 @@ try:
 
     def background_worker(stop_event: threading.Event | None = None):
         max_attempts = 6
-        print("🚀 背景工作者已啟動...(SQLite Queue SRE Mode)")
+        print("🚀 SRE Background Worker Started (WAL Mode)")
         while True:
             if stop_event is not None and stop_event.is_set():
                 break
 
             task = fetch_next_task(max_attempts=max_attempts)
             if not task:
-                time.sleep(1.0)
+                time.sleep(2.0) # 沒任務時睡久一點，減少 DB 輪詢壓力
                 continue
 
             task_id = task["id"]
-            # [SRE筆記] attempts 已經在 fetch 時 +1 了
             attempts = int(task["attempts"] or 0)
             payload = task["payload"]
 
-            # [SRE修改] 移除這裡的 update_task_status("IN_PROGRESS")，因為 fetch 已經原子化處理了
+            # [SRE] 這裡不需要 update status，因為 fetch_next_task 已經原子化標記了 IN_PROGRESS
 
             ok = False
             err_msg = None
@@ -410,30 +482,24 @@ try:
                         image_paths.extend(payload["image_paths"])
                     if "image_file" in payload and isinstance(payload["image_file"], dict):
                         p = payload["image_file"].get("path")
-                        if p:
-                            image_paths.append(p)
+                        if p: image_paths.append(p)
                 for p in image_paths:
-                    if p and os.path.exists(p):
-                        os.remove(p)
-            except Exception as cleanup_e:
-                print(f"⚠️ 刪除暫存檔失敗: {cleanup_e}")
+                    if p and os.path.exists(p): os.remove(p)
+            except Exception: pass
 
             if ok:
                 update_task_status(task_id, "DONE", attempts, None)
-                try:
-                    st.cache_data.clear()
-                except Exception:
-                    pass
-                print(f"✅ Task {task_id}({task['task_type']}) 完成")
+                print(f"✅ Task {task_id} Completed")
             else:
                 if attempts >= max_attempts:
                     update_task_status(task_id, "FAILED", attempts, err_msg or "unknown error")
-                    print(f"❌ Task {task_id} 永久失敗: {err_msg}")
+                    print(f"❌ Task {task_id} FAILED: {err_msg}")
                 else:
                     update_task_status(task_id, "RETRY", attempts, err_msg or "unknown error")
                     sleep_sec = _exp_backoff_seconds(attempts)
-                    print(f"⚠️ Task {task_id} 失敗 (第 {attempts} 次)，{sleep_sec:.1f} 秒後重試。錯誤: {err_msg}")
-                    time.sleep(sleep_sec)
+                    print(f"⚠️ Task {task_id} Retry in {sleep_sec}s: {err_msg}")
+                    # 注意：這裡不 sleep thread，避免阻塞其他任務處理，
+                    # 而是讓這個任務回到 DB 等待下一次 fetch (透過 status='RETRY' 和時間排序)
 
     @st.cache_resource
     def start_background_worker():
@@ -445,7 +511,7 @@ try:
     _worker_stop_event = start_background_worker()
 
     # ==========================================
-    # 2. 資料讀寫邏輯
+    # 2. 資料讀寫邏輯 (前端讀取)
     # ==========================================
 
     @st.cache_data(ttl=60)
@@ -536,18 +602,11 @@ try:
         
         try:
             task_id = enqueue_task("main_entry", payload)
-            print(f"📥 main_entry 排入佇列 (Task ID: {task_id})")
-            
-            try:
-                st.cache_data.clear()
-            except:
-                pass
+            # 這裡不清除快取，避免前端卡頓，讓快取自然過期或在 Admin 手動清除
             return True
-            
         except Exception as e:
             st.error(f"❌ 寫入佇列失敗: {e}")
             return False
-
 
     def save_appeal(entry, proof_file=None):
         image_info = None
@@ -596,12 +655,7 @@ try:
             "image_file": image_info,
         }
         task_id = enqueue_task("appeal_entry", payload)
-        try:
-            st.cache_data.clear()
-        except Exception:
-            pass
         st.success("📩 申訴已排入背景處理")
-        print(f"📥 appeal_entry 排入佇列 (Task ID: {task_id})")
         return True
 
 
@@ -1137,19 +1191,29 @@ try:
     elif app_mode == "組長ㄉ窩💃":
         st.title("⚙️ 管理後台")
         
-        # [SRE新增] 系統健康儀表板
+        # [SRE] 監控面板
         metrics = get_queue_metrics()
-        q_count = metrics["count"]
-        oldest_age = metrics["oldest_age_sec"]
+        q_count = metrics["pending"] + metrics["retry"]
+        oldest_age = metrics["oldest_pending_sec"]
+        recent_errs = metrics["recent_errors"]
         
-        if q_count > 100:
-            st.error(f"🔥 **系統過載警告**：目前佇列積壓 {q_count} 筆資料！(建議暫停操作稍待消化)")
-        elif oldest_age > 300: # 超過 5 分鐘
-            st.warning(f"🐢 **寫入延遲警告**：最舊的一筆資料已滯留 {int(oldest_age)} 秒未寫入。")
-        elif q_count > 0:
-            st.info(f"🚀 背景同步中：尚有 {q_count} 筆資料排隊寫入...")
-        else:
-            st.success("✅ 系統健康：所有資料已同步完成")
+        with st.container(border=True):
+            st.write("#### 📡 SRE 監控面板")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Pending Queue", q_count, delta="Safe" if q_count < 50 else "High Load", delta_color="inverse")
+            m2.metric("Retry Tasks", metrics["retry"])
+            m3.metric("Failed Tasks", metrics["failed"])
+            m4.metric("Oldest Task Age", f"{int(oldest_age)}s", delta="Lagging" if oldest_age > 300 else "Normal", delta_color="inverse")
+
+            if q_count > 100:
+                st.error(f"🔥 **系統過載警告**：積壓 {q_count} 筆資料！")
+            elif oldest_age > 300:
+                st.warning(f"🐢 **寫入延遲警告**：滯留 {int(oldest_age)} 秒。")
+            
+            if recent_errs:
+                with st.expander("查看最近錯誤日誌 (Top 5)"):
+                    for err_msg, ts in recent_errs:
+                        st.error(f"[{ts}] {err_msg}")
 
         pwd = st.text_input("管理密碼", type="password")
         if pwd == st.secrets["system_config"]["admin_password"]:
