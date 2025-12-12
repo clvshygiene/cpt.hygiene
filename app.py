@@ -1242,7 +1242,7 @@ try:
                 st.subheader("📧 每日違規通知")
                 target_date = st.date_input("選擇日期", today_tw)
                 if "mail_preview" not in st.session_state: st.session_state.mail_preview = None
-                if st.button("🔍 搜尋當日違規"):
+                if st.button("🔍 統整當日違規"):
                     df = load_main_data()
                     try:
                         df["日期Obj"] = pd.to_datetime(df["日期"], errors='coerce').dt.date
@@ -1271,12 +1271,12 @@ try:
 
                 if st.session_state.mail_preview is not None:
                     st.write("### 📨 寄送預覽清單"); st.dataframe(st.session_state.mail_preview)
-                    if st.button("🚀 確認大量寄出"):
+                    if st.button("🚀 一鍵寄出！"):
                         mail_queue_list = []
                         for _, row in st.session_state.mail_preview.iterrows():
                             if row["狀態"] == "準備寄送":
-                                subject = f"衛生評分通知 ({target_date}) - {row['班級']}"
-                                content = f"{row['導師姓名']} 老師您好：\n\n貴班今日({target_date}) 衛生評分總扣分為：{row['當日總扣分']} 分。\n請，謝謝。\n\n衛生組敬上"
+                                subject = f"衛生今日評分通知 ({target_date}) - {row['班級']}"
+                                content = f"老師您好：\n老師帶班辛苦了!\n\n依據今日({target_date}) 的評分記錄\n 衛生糾察總扣分為：{row['當日總扣分']} 分。\n再煩請老師提醒負責學生，一起來為學校的環境努力一下。\n\n學務處衛生組敬上"
                                 mail_queue_list.append({'email': row["收件信箱"], 'subject': subject, 'body': content})
                         
                         if mail_queue_list:
@@ -1371,3 +1371,4 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
+
