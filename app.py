@@ -897,16 +897,15 @@ try:
     st.sidebar.title("🏫 功能選單")
     app_mode = st.sidebar.radio("請選擇模式", ["我是糾察隊(評分)", "我是班上衛生股長", "衛生組後台"])
 
-    if st.sidebar.button("💥 強制重置系統(清除快取)"):
-        st.cache_data.clear()
-        st.success("記憶體已清除，請重新操作！"); st.rerun()
-
-    if st.sidebar.checkbox("顯示系統連線狀態", value=True):
-        if get_gspread_client(): st.sidebar.success("✅ Google Sheets 連線正常")
-        else: st.sidebar.error("❌ Sheets 連線失敗")
-        if "gcp_service_account" in st.secrets: st.sidebar.success("✅ GCP 憑證已讀取")
-        else: st.sidebar.error("⚠️ 未設定 GCP Service Account")
-
+    # --- 優化版：把除錯資訊藏起來，介面更乾淨 ---
+    with st.sidebar.expander("🔧 系統連線診斷", expanded=False):
+        if st.checkbox("顯示連線狀態", value=False):
+            if get_gspread_client(): st.success("✅ Sheets 連線正常")
+            else: st.error("❌ Sheets 連線失敗")
+            
+            if "gcp_service_account" in st.secrets: st.success("✅ 憑證已讀取")
+            else: st.error("⚠️ 未設定憑證")
+                
     # --- 模式1: 糾察評分 ---
     if app_mode == "我是糾察隊(評分)":
         st.title("📝 衛生糾察評分系統")
@@ -1347,6 +1346,7 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
+
 
 
 
