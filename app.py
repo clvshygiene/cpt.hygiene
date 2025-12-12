@@ -1163,9 +1163,9 @@ try:
                                             else: 
                                                 st.error("提交失敗")
                             elif total_raw > 0 and not appeal_status:
-                                st.caption("⏳ 已超過 3 天申訴期限。")
+                                st.caption("⏳ Sorry Bro，已超過 3 天申訴期限。")
                 else:
-                    st.info("🎉 最近沒有違規紀錄，保持得很好！")
+                    st.info("🎉 最近沒有違規紀錄，尼們班很讚！")
 
     # --- 模式3: 後台 ---
     elif app_mode == "組長ㄉ窩💃":
@@ -1371,6 +1371,7 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
+
 
 
 
