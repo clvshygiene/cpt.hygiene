@@ -133,7 +133,7 @@ try:
             media = MediaIoBaseUpload(file_obj, mimetype='image/jpeg')
             file = service.files().create(
                 body=file_metadata, media_body=media, fields='id', supportsAllDrives=True
-            ).execute()
+            ).execute(num_retries=3)
             
             try:
                 service.permissions().create(fileId=file.get('id'), body={'role': 'reader', 'type': 'anyone'}).execute()
@@ -1379,3 +1379,4 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())
+
