@@ -1030,7 +1030,7 @@ try:
                                 )
                                 st.toast(f"✅ 已排入儲存佇列：{selected_class}"); st.rerun()
 
-# --- 模式2: 衛生股長 (SRE 增強版: 加入申訴狀態回饋) ---
+    # --- 模式2: 衛生股長 (SRE 增強版: 加入申訴狀態回饋) ---
     elif app_mode == "我是班上衛生股長":
         st.title("🔎 班級查詢 & 違規申訴")
         df = load_main_data()
@@ -1070,6 +1070,7 @@ try:
                 if not c_df.empty:
                     st.subheader(f"📊 {cls} 近期紀錄與申訴狀態")
                     
+# --- 請替換 for 迴圈內的這段邏輯 ---
                     for idx, r in c_df.iterrows():
                         # 計算總分
                         total_raw = r['內掃原始分']+r['外掃原始分']+r['垃圾原始分']+r['晨間打掃原始分']
@@ -1079,14 +1080,26 @@ try:
                         record_id = str(r['紀錄ID']).strip()
                         appeal_status = appeal_map.get(record_id, None)
                         
-                        # 標題動態變化
+                        # 1. 處理狀態圖示
                         status_icon = ""
                         if appeal_status == "已核可": status_icon = "✅ [申訴成功] "
                         elif appeal_status == "已駁回": status_icon = "🚫 [申訴駁回] "
                         elif appeal_status == "待處理": status_icon = "⏳ [審核中] "
                         elif str(r['修正']) == "TRUE": status_icon = "🛠️ [已修正] "
 
-                        title_text = f"{status_icon}{r['日期']} - {r['評分項目']} (扣分: {total_raw}){phone_msg}"
+                        # 2. [New] 處理週次顯示 (SRE Update: 增加時間維度可觀測性)
+                        week_val = r.get('週次', 0)
+                        # 如果週次是 0 或空值，顯示 ?，否則顯示 [第X週]
+                        week_label = f"[第{week_val}週] " if week_val and str(week_val) != "0" else ""
+
+                        # 3. 組合標題：狀態 + 週次 + 日期 + 項目 + 分數
+                        title_text = f"{status_icon}{week_label}{r['日期']} - {r['評分項目']} (扣分: {total_raw}){phone_msg}"
+                        
+                        with st.expander(title_text):
+                            # ... (以下內容保持原本的顯示邏輯，不用動) ...
+                            if appeal_status == "已核可":
+                                st.success("🎉 恭喜！衛生組已核可您的申訴，本筆扣分已撤銷。")
+                            # ... (後面的程式碼直接保留即可) ...
                         
                         with st.expander(title_text):
                             # 1. 顯示詳細狀態 (Feedback Loop)
@@ -1358,6 +1371,7 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
+
 
 
 
