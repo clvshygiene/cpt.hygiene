@@ -963,7 +963,7 @@ try:
                                     save_entry({**base, "班級": row["班級"], "評分項目": role, "垃圾原始分": len(vios), "備註": f"{trash_cat}-{'、'.join(vios)}", "違規細項": trash_cat})
                                     cnt += 1
                             st.success(f"已排入背景處理： {cnt} 班" if cnt else "無違規"); st.rerun()
-else:
+                else:
                     st.markdown("### 🏫 選擇受檢班級")
                     
                     # [SRE Fix] 1. 為 radio 加上 key，防止 State Lost
@@ -1277,6 +1277,7 @@ else:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
+
 
 
 
