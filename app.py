@@ -1019,59 +1019,129 @@ try:
                                 )
                                 st.toast(f"✅ 已排入儲存佇列：{selected_class}"); st.rerun()
 
-    # --- 模式2: 衛生股長 ---
+# --- 模式2: 衛生股長 (SRE 增強版: 加入申訴狀態回饋) ---
     elif app_mode == "我是班上衛生股長":
         st.title("🔎 班級查詢 & 違規申訴")
         df = load_main_data()
+        
+        # [SRE Add] 預先讀取申訴資料，建立 lookup table 以提升效能
+        appeals_df = load_appeals()
+        appeal_map = {} # Key: 對應紀錄ID, Value: 處理狀態
+        if not appeals_df.empty:
+            for _, a_row in appeals_df.iterrows():
+                # 建立映射：紀錄ID -> 處理狀態
+                rid = str(a_row.get("對應紀錄ID", "")).strip()
+                if rid:
+                    appeal_map[rid] = a_row.get("處理狀態", "待處理")
+
         if not df.empty:
             st.write("請依照步驟選擇：")
+            
+            # 使用修正後的排序邏輯
+            # 這裡重新呼叫一次 load_sorted_classes 確保選單正確
+            # 注意：這裡直接用全域變數 structured_classes 即可
+            
             g = st.radio("步驟 1：選擇年級", grades, horizontal=True)
             class_options = [c["name"] for c in structured_classes if c["grade"] == g]
-            cls = st.radio("步驟 2：選擇班級", class_options, horizontal=True)
-            st.divider()
-            c_df = df[df["班級"] == cls].sort_values("登錄時間", ascending=False)
-            three_days_ago = date.today() - timedelta(days=3)
             
-            if not c_df.empty:
-                st.subheader(f"📊 {cls}近期紀錄")
-                for idx, r in c_df.iterrows():
-                    total_raw = r['內掃原始分']+r['外掃原始分']+r['垃圾原始分']+r['晨間打掃原始分']
-                    phone_msg = f" | 📱手機: {r['手機人數']}" if r['手機人數'] > 0 else ""
-                    with st.expander(f"{r['日期']} - {r['評分項目']} (扣分: {total_raw}){phone_msg}"):
-                        st.write(f"📝 說明: {r['備註']}"); st.caption(f"檢查人員: {r['檢查人員']}")
-                        raw_photo_path = str(r.get("照片路徑", "")).strip()
-                        if raw_photo_path and raw_photo_path.lower() != "nan":
-                            path_list = [p.strip() for p in raw_photo_path.split(";") if p.strip()]
-                            valid_photos = [p for p in path_list if p != "UPLOAD_FAILED" and (p.startswith("http") or os.path.exists(p))]
-                            if valid_photos:
-                                captions = [f"違規照片 ({i+1})" for i in range(len(valid_photos))]
-                                st.image(valid_photos, caption=captions, width=300)
-                            elif "UPLOAD_FAILED" in path_list: st.warning("⚠️ 照片上傳失敗")
+            if not class_options:
+                st.warning("查無此年級班級")
+                cls = None
+            else:
+                cls = st.radio("步驟 2：選擇班級", class_options, horizontal=True)
 
-                        if total_raw > 2 and r['晨間打掃原始分'] == 0:
-                            st.info("💡系統提示：單項每日扣分上限為 2 分 (手機、晨掃除外)，最終成績將由後台自動計算上限。")
+            st.divider()
+            
+            if cls:
+                c_df = df[df["班級"] == cls].sort_values("登錄時間", ascending=False)
+                three_days_ago = date.today() - timedelta(days=3)
+                
+                if not c_df.empty:
+                    st.subheader(f"📊 {cls} 近期紀錄與申訴狀態")
+                    
+                    for idx, r in c_df.iterrows():
+                        # 計算總分
+                        total_raw = r['內掃原始分']+r['外掃原始分']+r['垃圾原始分']+r['晨間打掃原始分']
+                        phone_msg = f" | 📱手機: {r['手機人數']}" if r['手機人數'] > 0 else ""
+                        
+                        # [SRE Feature] 檢查這筆紀錄有沒有被申訴過
+                        record_id = str(r['紀錄ID']).strip()
+                        appeal_status = appeal_map.get(record_id, None)
+                        
+                        # 標題動態變化
+                        status_icon = ""
+                        if appeal_status == "已核可": status_icon = "✅ [申訴成功] "
+                        elif appeal_status == "已駁回": status_icon = "🚫 [申訴駁回] "
+                        elif appeal_status == "待處理": status_icon = "⏳ [審核中] "
+                        elif str(r['修正']) == "TRUE": status_icon = "🛠️ [已修正] "
 
-                        record_date_obj = pd.to_datetime(r['日期']).date() if isinstance(r['日期'], str) else r['日期']
-                        if record_date_obj >= three_days_ago and (total_raw > 0 or r['手機人數'] > 0):
-                            st.markdown("---"); st.markdown("#### 🚨 我要申訴")
-                            form_key = f"appeal_form_{r['紀錄ID']}_{idx}"
-                            with st.form(form_key):
-                                reason = st.text_area("申訴理由", height=80, placeholder="詳細說明...")
-                                proof_file = st.file_uploader("上傳佐證 (必填)", type=["jpg", "png", "jpeg"], key=f"file_{idx}")
-                                if st.form_submit_button("提交申訴"):
-                                    if not reason or not proof_file: st.error("❌ 請填寫理由並上傳照片")
-                                    else:
-                                        appeal_entry = {
-                                            "申訴日期": str(date.today()), "班級": cls, "違規日期": str(r["日期"]),
-                                            "違規項目": f"{r['評分項目']} ({r['備註']})", "原始扣分": str(total_raw),
-                                            "申訴理由": reason, "處理狀態": "待處理",
-                                            "登錄時間": datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S"),
-                                            "對應紀錄ID": r['紀錄ID']
-                                        }
-                                        if save_appeal(appeal_entry, proof_file): st.success("✅ 申訴已提交！"); st.rerun()
-                                        else: st.error("提交失敗")
-                        elif total_raw > 0: st.caption("⏳ 已超過 3 天申訴期限。")
-            else: st.info("無紀錄")
+                        title_text = f"{status_icon}{r['日期']} - {r['評分項目']} (扣分: {total_raw}){phone_msg}"
+                        
+                        with st.expander(title_text):
+                            # 1. 顯示詳細狀態 (Feedback Loop)
+                            if appeal_status == "已核可":
+                                st.success("🎉 恭喜！衛生組已核可您的申訴，本筆扣分已撤銷。")
+                            elif appeal_status == "已駁回":
+                                st.error("🛑 很遺憾，您的申訴已被駁回，維持原判。")
+                            elif appeal_status == "待處理":
+                                st.warning("⏳ 申訴案件目前正在排隊審核中，請耐心等候...")
+
+                            # 2. 顯示原始資訊
+                            st.write(f"📝 說明: {r['備註']}")
+                            st.caption(f"檢查人員: {r['檢查人員']}")
+                            
+                            # 顯示照片
+                            raw_photo_path = str(r.get("照片路徑", "")).strip()
+                            if raw_photo_path and raw_photo_path.lower() != "nan":
+                                path_list = [p.strip() for p in raw_photo_path.split(";") if p.strip()]
+                                valid_photos = [p for p in path_list if p != "UPLOAD_FAILED" and (p.startswith("http") or os.path.exists(p))]
+                                if valid_photos:
+                                    captions = [f"違規照片 ({i+1})" for i in range(len(valid_photos))]
+                                    st.image(valid_photos, caption=captions, width=300)
+                                elif "UPLOAD_FAILED" in path_list: st.warning("⚠️ 照片上傳失敗")
+
+                            if total_raw > 2 and r['晨間打掃原始分'] == 0:
+                                st.info("💡系統提示：單項每日扣分上限為 2 分 (手機、晨掃除外)，最終成績將由後台自動計算上限。")
+
+                            # 3. 申訴表單 (只有「沒申訴過」且「有扣分」且「期限內」才顯示)
+                            # 如果已經申訴過 (不論結果)，就不再顯示申訴按鈕，避免重複轟炸
+                            record_date_obj = pd.to_datetime(r['日期']).date() if isinstance(r['日期'], str) else r['日期']
+                            
+                            if appeal_status:
+                                # 已經有申訴紀錄，就只顯示狀態，不給按鈕
+                                pass 
+                            elif record_date_obj >= three_days_ago and (total_raw > 0 or r['手機人數'] > 0):
+                                st.markdown("---")
+                                st.markdown("#### 🚨 我要申訴")
+                                form_key = f"appeal_form_{r['紀錄ID']}_{idx}"
+                                with st.form(form_key):
+                                    reason = st.text_area("申訴理由", height=80, placeholder="詳細說明...")
+                                    proof_file = st.file_uploader("上傳佐證 (必填)", type=["jpg", "png", "jpeg"], key=f"file_{idx}")
+                                    if st.form_submit_button("提交申訴"):
+                                        if not reason or not proof_file: 
+                                            st.error("❌ 請填寫理由並上傳照片")
+                                        else:
+                                            appeal_entry = {
+                                                "申訴日期": str(date.today()), 
+                                                "班級": cls, 
+                                                "違規日期": str(r["日期"]),
+                                                "違規項目": f"{r['評分項目']} ({r['備註']})", 
+                                                "原始扣分": str(total_raw),
+                                                "申訴理由": reason, 
+                                                "處理狀態": "待處理",
+                                                "登錄時間": datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+                                                "對應紀錄ID": r['紀錄ID']
+                                            }
+                                            if save_appeal(appeal_entry, proof_file): 
+                                                st.success("✅ 申訴已提交！請重新整理頁面查看狀態。")
+                                                time.sleep(1.5)
+                                                st.rerun()
+                                            else: 
+                                                st.error("提交失敗")
+                            elif total_raw > 0 and not appeal_status:
+                                st.caption("⏳ 已超過 3 天申訴期限。")
+                else:
+                    st.info("🎉 最近沒有違規紀錄，保持得很好！")
 
     # --- 模式3: 後台 ---
     elif app_mode == "衛生組後台":
@@ -1277,6 +1347,7 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())  # 寫到 log 就好
+
 
 
 
