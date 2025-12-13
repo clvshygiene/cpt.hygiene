@@ -20,9 +20,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
-
-# ---- Queue DB path (SQLite) ----
-QUEUE_DB_PATH = os.getenv("QUEUE_DB_PATH", "/tmp/task_queue.db")
+from PIL import Image
 
 # --- 1. 網頁設定 ---
 st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
@@ -33,6 +31,54 @@ try:
     # 0. 基礎設定與時區
     # ==========================================
     TW_TZ = pytz.timezone('Asia/Taipei')
+
+def compress_image_bytes(raw: bytes, max_side: int = 1600, quality: int = 75) -> bytes:
+    """
+    Shrink & recompress images before uploading to Drive.
+    - Converts to RGB JPEG
+    - Resizes long side to max_side
+    - Uses JPEG quality for size/speed tradeoff
+    """
+    im = Image.open(io.BytesIO(raw))
+    im = im.convert("RGB")
+    w, h = im.size
+    scale = min(1.0, max_side / max(w, h))
+    if scale < 1.0:
+        im = im.resize((int(w * scale), int(h * scale)))
+    out = io.BytesIO()
+    im.save(out, format="JPEG", quality=quality, optimize=True)
+    return out.getvalue()
+
+
+    MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 單檔圖片 10MB 上限
+    QUEUE_DB_PATH = "task_queue_v4_wal.db"
+    
+    # Google Sheet 網址
+    SHEET_URL = "https://docs.google.com/spreadsheets/d/11BXtN3aevJls6Q2IR_IbT80-9XvhBkjbTCgANmsxqkg/edit"
+    
+    SHEET_TABS = {
+        "main": "main_data", 
+        "settings": "settings",
+        "roster": "roster",
+        "inspectors": "inspectors",
+        "duty": "duty",
+        "teachers": "teachers",
+        "appeals": "appeals"
+    }
+
+    EXPECTED_COLUMNS = [
+        "日期", "週次", "班級", "評分項目", "檢查人員",
+        "內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數",
+        "備註", "違規細項", "照片路徑", "登錄時間", "修正", "晨掃未到者", "紀錄ID"
+    ]
+
+    APPEAL_COLUMNS = [
+        "申訴日期", "班級", "違規日期", "違規項目", "原始扣分", "申訴理由", "佐證照片", "處理狀態", "登錄時間", "對應紀錄ID"
+    ]
+
+    # ==========================================
+    # SRE Utils: Retry & Backoff Wrapper
+    # ==========================================
     def execute_with_retry(func, max_retries=5, base_delay=1.0):
         for attempt in range(max_retries):
             try:
@@ -99,7 +145,7 @@ try:
             try:
                 try: return sheet.worksheet(tab_name)
                 except gspread.WorksheetNotFound:
-                    cols = 24 if tab_name != "appeals" else 15
+                    cols = 20 if tab_name != "appeals" else 15
                     ws = sheet.add_worksheet(title=tab_name, rows=100, cols=cols)
                     if tab_name == "appeals": ws.append_row(APPEAL_COLUMNS)
                     return ws
@@ -113,23 +159,7 @@ try:
         return None
 
     def upload_image_to_drive(file_obj, filename):
-        def _upload_action():
-            service = get_drive_service()
-            if not service: raise Exception("Drive Service Init Failed")
-            
-            folder_id = st.secrets["system_config"].get("drive_folder_id")
-            if not folder_id: raise Exception("No Drive Folder ID")
-
-            file_metadata = {'name': filename, 'parents': [folder_id]}
-            media = MediaIoBaseUpload(file_obj, mimetype='image/jpeg')
-            
-            file = service.files().create(
-                body=file_metadata, media_body=media, fields='id', supportsAllDrives=True
-            ).execute(num_retries=1)
-            
-            try:
-                service.permissions().create(fileId=file.get('id'), body={'role': 'reader', 'type': 'anyone'}).execute()
-            except: pass 
+except: pass 
             return f"https://drive.google.com/thumbnail?id={file.get('id')}&sz=w1000"
 
         try:
@@ -155,23 +185,37 @@ try:
     # ==========================================
     _queue_lock = threading.Lock()
 
-def get_queue_connection():
-    # Do NOT use Streamlit caching here because this is called from background threads.
-    # Use /tmp by default on Streamlit Community Cloud.
-    conn = sqlite3.connect(QUEUE_DB_PATH, check_same_thread=False)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS task_queue (
-            id TEXT PRIMARY KEY,
-            task_type TEXT,
-            payload TEXT,
-            created_ts TEXT,
-            status TEXT,
-            attempts INTEGER,
-            last_error TEXT
+    @st.cache_resource
+    def get_queue_connection():
+        conn = sqlite3.connect(
+            QUEUE_DB_PATH, 
+            check_same_thread=False, 
+            timeout=30.0, 
+            isolation_level="IMMEDIATE" 
         )
-    """)
-    conn.commit()
-    return conn
+        
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=30000;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+        except:
+            pass
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_queue (
+                id TEXT PRIMARY KEY,
+                task_type TEXT NOT NULL,
+                created_ts TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_status_created ON task_queue (status, created_ts);")
+        conn.commit()
+        return conn
+
     def enqueue_task(task_type: str, payload: dict) -> str:
         conn = get_queue_connection()
         task_id = str(uuid.uuid4())
@@ -212,37 +256,6 @@ def get_queue_connection():
                 metrics["oldest_pending_sec"] = (now - created).total_seconds()
             except: pass
         return metrics
-    def list_queue_tasks_by_status(status: str, limit: int = 200):
-        conn = get_queue_connection()
-        with _queue_lock:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT id, task_type, created_ts, status, attempts, last_error
-                FROM task_queue
-                WHERE status = ?
-                ORDER BY created_ts DESC
-                LIMIT ?
-                """,
-                (status, limit),
-            )
-            rows = cur.fetchall()
-            conn.commit()
-        return [{"id": r[0], "task_type": r[1], "created_ts": r[2], "status": r[3], "attempts": r[4], "last_error": r[5]} for r in rows]
-
-    def retry_task(task_id: str):
-        conn = get_queue_connection()
-        with _queue_lock:
-            conn.execute("UPDATE task_queue SET status='RETRY', attempts=0, last_error=NULL WHERE id=?", (task_id,))
-            conn.commit()
-        return True
-
-    def retry_all_failed(limit: int = 200):
-        tasks = list_queue_tasks_by_status("FAILED", limit=limit)
-        for t in tasks:
-            retry_task(t["id"])
-        return len(tasks)
-
 
     def fetch_next_task(max_attempts: int = 6):
         conn = get_queue_connection()
@@ -522,129 +535,91 @@ def get_queue_connection():
         
         return df[EXPECTED_COLUMNS]
 
-    def save_entry(new_entry, uploaded_files=None):
-        now_ts = time.time()
-        last_ts = st.session_state.get("_last_submit_ts", 0.0)
-        if now_ts - last_ts < 10:
-            st.warning("請稍候 10 秒再送出下一筆，以避免重複送出。")
-            return False
-        st.session_state["_last_submit_ts"] = now_ts
+    
+def save_entry(new_entry, uploaded_files=None):
+    # Strict mode + fast mode:
+    # - Photos MUST upload to Drive successfully; otherwise this entry is NOT accepted.
+    # - Max 4 photos per submission.
+    # - Pre-compress images before upload.
+    # - Upload in small parallelism (2) to reduce total wait without triggering 429 storms.
 
-        if "日期" in new_entry and new_entry["日期"]:
-            new_entry["日期"] = str(new_entry["日期"])
+    if "日期" in new_entry and new_entry["日期"]:
+        new_entry["日期"] = str(new_entry["日期"])
 
-        drive_links = []
-        files_list = [f for f in (uploaded_files or []) if f]
-        if len(files_list) > 4:
-            st.error("❌ 一次最多只能上傳 4 張照片，請刪減後再送出。")
-            return False
+    drive_links = []
 
-        jobs = []
-        for i, up_file in enumerate(files_list):
-            try:
-                up_file.seek(0); 
-                raw = up_file.read()
-            except Exception as e:
-                st.error(f"❌ 讀取上傳檔失敗: {e}"); 
-                return False
-            if not raw:
-                st.error("❌ 有照片檔案是空的，請重新選取後再送出。"); 
-                return False
-            data = raw  # compression disabled on Streamlit Cloud
-            if len(data) > MAX_IMAGE_BYTES:
-                mb = len(data)/(1024*1024)
-                st.error(f"❌ 檔案「{getattr(up_file,'name','photo')}」過大 ({mb:.1f} MB)。請壓縮到 10MB 以下再上傳。")
-                return False
+    files_list = []
+    if uploaded_files:
+        files_list = [f for f in uploaded_files if f]
 
-            safe_class = str(new_entry.get("班級", "unknown"))
-            logical_fname = f"{new_entry.get('日期','')}_{safe_class}_{i}.jpg"
-            unique_prefix = f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
-            drive_fname = f"{unique_prefix}_{logical_fname}"
-            jobs.append((data, drive_fname))
+    if len(files_list) > 4:
+        st.error("❌ 一次最多只能上傳 4 張照片，請刪減後再送出。")
+        return False
 
-        def _upload_one(job):
-            data, drive_fname = job
-            return upload_image_to_drive(io.BytesIO(data), drive_fname)
-
-        t0=time.time()
-        if jobs:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            with st.spinner("照片上傳中，請稍候…"):
-                with ThreadPoolExecutor(max_workers=2) as ex:
-                    futures=[ex.submit(_upload_one, job) for job in jobs]
-                    for f in as_completed(futures):
-                        link=f.result()
-                        if not link:
-                            st.error("❌ 照片上傳雲端失敗（已自動重試多次）。\n為避免「有扣分但沒有證據」，本筆紀錄不會送出；請稍後再試。")
-                            return False
-                        drive_links.append(link)
-
-        new_entry["照片張數"]=len(drive_links)
-        new_entry["上傳耗時ms"]=int((time.time()-t0)*1000)
-        if drive_links:
-            new_entry["照片路徑"]=";".join(drive_links)
-
-        if "紀錄ID" not in new_entry or not new_entry["紀錄ID"]:
-            ts=datetime.now(TW_TZ).strftime("%Y%m%d%H%M%S")
-            new_entry["紀錄ID"]=f"{ts}_{uuid.uuid4().hex[:6]}"
-
-        payload={"entry": new_entry, "image_paths": [], "filenames": []}
+    jobs = []
+    for i, up_file in enumerate(files_list):
         try:
-            enqueue_task("main_entry", payload); return True
+            up_file.seek(0)
+            raw = up_file.read()
         except Exception as e:
-            st.error(f"❌ 寫入佇列失敗: {e}"); return False
-
-        image_paths = []
-        file_names = []
-
-        if uploaded_files:
-            for i, up_file in enumerate(uploaded_files):
-                if not up_file: continue
-                try:
-                    up_file.seek(0)
-                    data = up_file.read()
-                except Exception as e:
-                    print(f"⚠️ 讀取上傳檔失敗: {e}")
-                    continue
-
-                if not data: continue
-
-                size = len(data)
-                if size > MAX_IMAGE_BYTES:
-                    mb = size / (1024 * 1024)
-                    st.warning(f"📸 檔案「{up_file.name}」過大 ({mb:.1f} MB)，已略過。")
-                    continue
-
-                safe_class = str(new_entry.get('班級', 'unknown'))
-                logical_fname = f"{new_entry['日期']}_{safe_class}_{i}.jpg"
-                tmp_fname = f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}_{logical_fname}"
-                local_path = os.path.join(IMG_DIR, tmp_fname)
-
-                try:
-                    with open(local_path, "wb") as f:
-                        f.write(data)
-                    image_paths.append(local_path)
-                    file_names.append(logical_fname)
-                except Exception as e:
-                    print(f"⚠️ 寫入暫存檔失敗: {e}")
-
-        if "紀錄ID" not in new_entry or not new_entry["紀錄ID"]:
-            unique_suffix = uuid.uuid4().hex[:6]
-            timestamp = datetime.now(TW_TZ).strftime("%Y%m%d%H%M%S")
-            new_entry["紀錄ID"] = f"{timestamp}_{unique_suffix}"
-
-        payload = {
-            "entry": new_entry,
-            "image_paths": image_paths,
-            "filenames": file_names,
-        }
-        
-        try:
-            task_id = enqueue_task("main_entry", payload)
-            return True
-        except Exception as e:
-            st.error(f"❌ 寫入佇列失敗: {e}")
+            st.error(f"❌ 讀取上傳檔失敗: {e}")
             return False
+
+        if not raw:
+            st.error("❌ 有照片檔案是空的，請重新選取後再送出。")
+            return False
+
+        try:
+            data = compress_image_bytes(raw, max_side=1600, quality=75)
+        except Exception:
+            data = raw
+
+        size = len(data)
+        if size > MAX_IMAGE_BYTES:
+            mb = size / (1024 * 1024)
+            st.error(f"❌ 檔案「{getattr(up_file, 'name', 'photo')}」過大 ({mb:.1f} MB)。請壓縮到 10MB 以下再上傳。")
+            return False
+
+        safe_class = str(new_entry.get("班級", "unknown"))
+        logical_fname = f"{new_entry.get('日期', '')}_{safe_class}_{i}.jpg"
+        unique_prefix = f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        drive_fname = f"{unique_prefix}_{logical_fname}"
+        jobs.append((data, drive_fname))
+
+    def _upload_one(job):
+        data, drive_fname = job
+        return upload_image_to_drive(io.BytesIO(data), drive_fname)
+
+    if jobs:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futures = [ex.submit(_upload_one, job) for job in jobs]
+            for f in as_completed(futures):
+                link = f.result()
+                if not link:
+                    st.error(
+                        "❌ 照片上傳雲端失敗（已自動重試多次）。\n"
+                        "為避免「有扣分但沒有證據」，本筆紀錄不會送出；請稍後再試。"
+                    )
+                    return False
+                drive_links.append(link)
+
+    if drive_links:
+        new_entry["照片路徑"] = ";".join(drive_links)
+
+    if "紀錄ID" not in new_entry or not new_entry["紀錄ID"]:
+        unique_suffix = uuid.uuid4().hex[:6]
+        timestamp = datetime.now(TW_TZ).strftime("%Y%m%d%H%M%S")
+        new_entry["紀錄ID"] = f"{timestamp}_{unique_suffix}"
+
+    payload = {"entry": new_entry, "image_paths": [], "filenames": []}
+
+    try:
+        enqueue_task("main_entry", payload)
+        return True
+    except Exception as e:
+        st.error(f"❌ 寫入佇列失敗: {e}")
+        return False
 
     def save_appeal(entry, proof_file=None):
         image_info = None
@@ -1091,16 +1066,17 @@ def get_queue_connection():
                         if check_duplicate_record(main_df, input_date, inspector_name, role, selected_class):
                                 st.warning(f"⚠️ 注意：您今天已經評過「{selected_class}」了！")
                         st.info(f"📍 正在評分：**{selected_class}**")
-                        
-                        # --- Immediate per-session scored marker (doesn't rely on Sheets write-back latency) ---
+                                                # --- Immediate per-session scored marker (doesn't rely on Sheets write-back latency) ---
                         day_key = f"{str(input_date)}|{inspector_name}|{role}"
                         if "scored_map" not in st.session_state:
                             st.session_state["scored_map"] = {}
                         scored_today = st.session_state["scored_map"].setdefault(day_key, set())
+
                         if selected_class in scored_today:
                             st.success(f"✅ 今日「{selected_class}」已評分（本次登入期間）")
 
                         form_id = f"scoring_form_{str(input_date)}_{inspector_name}_{role}_{selected_class}"
+
                         with st.form(form_id, clear_on_submit=True):
                             in_s = 0
                             out_s = 0
@@ -1123,6 +1099,7 @@ def get_queue_connection():
                                     ph_c = st.number_input("手機人數 (無上限)", min_value=0, value=0, step=1, key=phone_key)
                                 else:
                                     note = "【優良】"
+
                             elif role == "外掃檢查":
                                 result = st.radio("結果", ["❌ 違規", "✨ 乾淨"], horizontal=True, key=result_key)
                                 if result == "❌ 違規":
@@ -1290,8 +1267,8 @@ def get_queue_connection():
 
         pwd = st.text_input("管理密碼", type="password")
         if pwd == st.secrets["system_config"]["admin_password"]:
-            monitor_tab, retry_tab, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-                "👀 進度監控", "🔁 失敗重試", "📊 成績總表", "📝 扣分明細", "📧 寄送通知", 
+            monitor_tab, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+                "👀 進度監控", "📊 成績總表", "📝 扣分明細", "📧 寄送通知", 
                 "📣 申訴審核", "⚙️ 系統設定", "📄 名單更新", "🧹 晨掃點名"
             ])
             
@@ -1387,67 +1364,6 @@ def get_queue_connection():
                     with st.expander("查看已完成名單"):
                         for p in mobile_inspectors:
                             if p["done"]: st.write(f"✅ {p['name']}")
-
-            with retry_tab:
-
-                st.subheader("🔁 失敗重試 / 任務監控")
-
-                st.caption("查看 Queue 內 FAILED 任務，並可一鍵重試（會重設 attempts=0 並改回 RETRY）。")
-
-                c1, c2, c3 = st.columns([1,1,2])
-
-                limit = c1.number_input("顯示筆數上限", min_value=50, max_value=500, value=200, step=50, key="retry_limit")
-
-                if c2.button("🔄 重新整理", key="retry_refresh"):
-
-                    st.rerun()
-
-                if c3.button("🚀 一鍵重試全部 FAILED", key="retry_all_failed"):
-
-                    n = retry_all_failed(limit=int(limit))
-
-                    st.success(f"已重試 {n} 筆 FAILED 任務")
-
-                    st.rerun()
-
-
-                failed = list_queue_tasks_by_status("FAILED", limit=int(limit))
-
-                retrying = list_queue_tasks_by_status("RETRY", limit=50)
-
-                st.write(f"FAILED: {len(failed)} / RETRY(最近50): {len(retrying)}")
-
-
-                if not failed:
-
-                    st.success("目前沒有 FAILED 任務。")
-
-                else:
-
-                    for t in failed:
-
-                        with st.container(border=True):
-
-                            st.write(f"**Task ID**: `{t['id']}`")
-
-                            st.write(f"**Type**: {t['task_type']}  |  **Attempts**: {t['attempts']}  |  **Created**: {t['created_ts']}")
-
-                            if t.get("last_error"):
-
-                                st.code(str(t["last_error"])[:1200])
-
-                            b1, b2 = st.columns([1,5])
-
-                            if b1.button("重試", key=f"retry_{t['id']}"):
-
-                                retry_task(t["id"])
-
-                                st.success("已重試（狀態改為 RETRY, attempts=0）")
-
-                                st.rerun()
-
-                            b2.caption("重試後會由背景 worker 重新處理；若仍失敗，請檢查 Google API 配額/連線或資料格式。")
-
 
             with tab1: # 成績總表
                 st.subheader("成績總表")
