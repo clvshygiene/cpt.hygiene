@@ -560,12 +560,7 @@ try:
             if not raw:
                 st.error("❌ 有照片檔案是空的，請重新選取後再送出。"); 
                 return False
-            try:
-                data = raw  # compression disabled on Streamlit Cloud
-                data = raw
-                # (raw, max_side=1600, quality=75)
-            except Exception:
-                data = raw
+            data = raw  # compression disabled on Streamlit Cloud
             if len(data) > MAX_IMAGE_BYTES:
                 mb = len(data)/(1024*1024)
                 st.error(f"❌ 檔案「{getattr(up_file,'name','photo')}」過大 ({mb:.1f} MB)。請壓縮到 10MB 以下再上傳。")
