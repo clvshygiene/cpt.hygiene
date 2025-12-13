@@ -951,7 +951,7 @@ try:
         st.title("📝 衛生糾察評分系統")
         if "team_logged_in" not in st.session_state: st.session_state["team_logged_in"] = False
         
-        # [SRE UX] 狀態記憶：用來顯示剛剛評完哪一班
+        # [SRE State] 初始化狀態記憶
         if "last_submitted_class" not in st.session_state:
             st.session_state["last_submitted_class"] = None
         
@@ -1011,10 +1011,6 @@ try:
                 else:
                     st.markdown("### 🏫 選擇受檢班級")
                     
-                    # [SRE UX] 狀態反饋：在這裡顯示剛剛完成的班級
-                    if st.session_state.get("last_submitted_class"):
-                        st.success(f"✅ **{st.session_state.last_submitted_class}** 評分已儲存！請繼續點選下一班。")
-
                     if assigned_classes:
                         radio_key = f"radio_assigned_{inspector_name}"
                         selected_class = st.radio(
@@ -1038,40 +1034,60 @@ try:
                             )
             
                     if selected_class:
-                        st.markdown(f"👉 目前鎖定評分對象： **<span style='color:red;font-size:1.2em'>{selected_class}</span>**", unsafe_allow_html=True)
-                        if check_duplicate_record(main_df, input_date, inspector_name, role, selected_class):
-                                st.warning(f"⚠️ 注意：您今天已經評過「{selected_class}」了！")
-                        st.info(f"📍 正在評分：**{selected_class}**")
+                        st.divider() # 視覺分隔
                         
-                        # [SRE Note] 使用 form 來處理輸入，clear_on_submit=True 會自動清空欄位
+                        # [SRE Fix 1] 將成功訊息移到這裡（表單正上方），確保使用者一定看得到
+                        if st.session_state.get("last_submitted_class"):
+                            # 顯示綠色大框框
+                            st.info(f"✅ 上一班 **{st.session_state.last_submitted_class}** 評分已成功送出！")
+                            # 可以在這裡加入判斷，如果上一班就是現在這班，提示更明顯
+                            if st.session_state.last_submitted_class == selected_class:
+                                st.warning(f"⚠️ 注意：您剛剛才評過 **{selected_class}**，請確認是否要重複評分？")
+
+                        st.markdown(f"#### 👉 正在評分： <span style='color:#e05858;font-size:1.3em'>{selected_class}</span>", unsafe_allow_html=True)
+                        
+                        # 重複評分檢查
+                        if check_duplicate_record(main_df, input_date, inspector_name, role, selected_class):
+                            st.warning(f"⚠️ 系統紀錄顯示：您今天已經評過「{selected_class}」了！")
+                        
                         with st.form("scoring_form", clear_on_submit=True):
                             in_s = 0; out_s = 0; ph_c = 0; note = ""
+                            
+                            # [SRE Fix 2] 加上 key=f"...{selected_class}"
+                            # 這是解決「切換班級後欄位消失」的關鍵。
+                            # 讓 Streamlit 把每一班的「結果」按鈕視為獨立元件，切換班級時強制重置為預設值（第一個選項）。
+                            radio_key_dynamic = f"status_radio_{selected_class}_{role}"
+                            
                             if role == "內掃檢查":
-                                if st.radio("結果", ["❌ 違規", "✨ 乾淨"], horizontal=True) == "❌ 違規":
-                                    in_s = st.number_input("內掃扣分 (上限2分)", 0)
-                                    note = st.text_input("說明", placeholder="黑板未擦"); ph_c = st.number_input("手機人數 (無上限)", 0)
+                                # 預設選項放在第一個 ["❌ 違規", "✨ 乾淨"]，這樣切換新班級時預設會展開扣分欄位，避免誤會
+                                if st.radio("檢查結果", ["❌ 違規", "✨ 乾淨"], horizontal=True, key=radio_key_dynamic) == "❌ 違規":
+                                    in_s = st.number_input("內掃扣分 (上限2分)", 0, key=f"in_s_{selected_class}")
+                                    note = st.text_input("說明", placeholder="例如：黑板未擦", key=f"note_{selected_class}")
+                                    ph_c = st.number_input("手機人數 (無上限)", 0, key=f"ph_{selected_class}")
                                 else: note = "【優良】"
                             elif role == "外掃檢查":
-                                if st.radio("結果", ["❌ 違規", "✨ 乾淨"], horizontal=True) == "❌ 違規":
-                                    out_s = st.number_input("外掃扣分 (上限2分)", 0)
-                                    note = st.text_input("說明", placeholder="走廊垃圾"); ph_c = st.number_input("手機人數 (無上限)", 0)
+                                if st.radio("檢查結果", ["❌ 違規", "✨ 乾淨"], horizontal=True, key=radio_key_dynamic) == "❌ 違規":
+                                    out_s = st.number_input("外掃扣分 (上限2分)", 0, key=f"out_s_{selected_class}")
+                                    note = st.text_input("說明", placeholder="例如：走廊有垃圾", key=f"note_{selected_class}")
+                                    ph_c = st.number_input("手機人數 (無上限)", 0, key=f"ph_{selected_class}")
                                 else: note = "【優良】"
 
-                            is_fix = st.checkbox("🚩 修正單")
-                            files = st.file_uploader("照片(有扣分則必填，自動上傳雲端)", accept_multiple_files=True)
+                            is_fix = st.checkbox("🚩 這是修正單 (複檢通過請勾選)", key=f"fix_{selected_class}")
+                            files = st.file_uploader("📸 違規照片 (若有扣分則必填)", accept_multiple_files=True, key=f"file_{selected_class}")
                             
-                            if st.form_submit_button("送出"):
-                                # [SRE Logic] 資料完整性檢查：有扣分就必須有照片
+                            st.write("") # 間距
+                            if st.form_submit_button("🚀 送出評分", use_container_width=True):
+                                # [SRE Logic] 強制照片檢查閘道
                                 total_deduction = in_s + out_s
                                 if total_deduction > 0 and not files:
-                                    st.error("🛑 【資料不完整】有扣分但未上傳照片！系統拒絕收件。請補上照片佐證後再送出。")
-                                    st.stop() # 強制中斷，不准存檔
+                                    st.error("🛑 【資料不完整】有扣分但未上傳照片！系統拒絕收件。")
+                                    st.stop() 
 
                                 save_entry(
                                     {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": selected_class, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note},
                                     uploaded_files=files
                                 )
-                                # [SRE UX] 更新狀態，讓 Rerun 後能顯示回饋
+                                # 更新狀態並刷新
                                 st.session_state["last_submitted_class"] = selected_class
                                 st.rerun()
 
