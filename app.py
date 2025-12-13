@@ -533,43 +533,59 @@ try:
         return df[EXPECTED_COLUMNS]
 
     def save_entry(new_entry, uploaded_files=None):
+        # Strict mode:
+        # - Photos MUST be uploaded to Google Drive successfully, otherwise this entry is NOT accepted.
+        # - Max 4 photos per submission (as requested).
         if "日期" in new_entry and new_entry["日期"]:
             new_entry["日期"] = str(new_entry["日期"])
 
-        image_paths = []
-        file_names = []
+        drive_links = []
 
         if uploaded_files:
-            for i, up_file in enumerate(uploaded_files):
-                if not up_file: continue
+            files_list = [f for f in uploaded_files if f]
+            if len(files_list) > 4:
+                st.error("❌ 一次最多只能上傳 4 張照片，請刪減後再送出。")
+                return False
+
+            for i, up_file in enumerate(files_list):
                 try:
                     up_file.seek(0)
                     data = up_file.read()
                 except Exception as e:
-                    print(f"⚠️ 讀取上傳檔失敗: {e}")
-                    continue
+                    st.error(f"❌ 讀取上傳檔失敗: {e}")
+                    return False
 
-                if not data: continue
+                if not data:
+                    st.error("❌ 有照片檔案是空的，請重新選取後再送出。")
+                    return False
 
                 size = len(data)
                 if size > MAX_IMAGE_BYTES:
                     mb = size / (1024 * 1024)
-                    st.warning(f"📸 檔案「{up_file.name}」過大 ({mb:.1f} MB)，已略過。")
-                    continue
+                    st.error(f"❌ 檔案「{up_file.name}」過大 ({mb:.1f} MB)。請壓縮到 10MB 以下再上傳。")
+                    return False
 
-                safe_class = str(new_entry.get('班級', 'unknown'))
-                logical_fname = f"{new_entry['日期']}_{safe_class}_{i}.jpg"
-                tmp_fname = f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}_{logical_fname}"
-                local_path = os.path.join(IMG_DIR, tmp_fname)
+                safe_class = str(new_entry.get("班級", "unknown"))
+                logical_fname = f"{new_entry.get('日期', '')}_{safe_class}_{i}.jpg"
+                unique_prefix = f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+                drive_fname = f"{unique_prefix}_{logical_fname}"
 
-                try:
-                    with open(local_path, "wb") as f:
-                        f.write(data)
-                    image_paths.append(local_path)
-                    file_names.append(logical_fname)
-                except Exception as e:
-                    print(f"⚠️ 寫入暫存檔失敗: {e}")
+                # upload_image_to_drive already wraps execute_with_retry; fail-fast if still cannot upload
+                link = upload_image_to_drive(io.BytesIO(data), drive_fname)
+                if not link:
+                    st.error(
+                        "❌ 照片上傳雲端失敗（已自動重試多次）。
+"
+                        "為避免「有扣分但沒有證據」，本筆紀錄不會送出；請稍後再試。"
+                    )
+                    return False
 
+                drive_links.append(link)
+
+        if drive_links:
+            new_entry["照片路徑"] = ";".join(drive_links)
+
+        # Ensure record id exists
         if "紀錄ID" not in new_entry or not new_entry["紀錄ID"]:
             unique_suffix = uuid.uuid4().hex[:6]
             timestamp = datetime.now(TW_TZ).strftime("%Y%m%d%H%M%S")
@@ -577,12 +593,13 @@ try:
 
         payload = {
             "entry": new_entry,
-            "image_paths": image_paths,
-            "filenames": file_names,
+            # strict mode: no local temp files to upload later
+            "image_paths": [],
+            "filenames": [],
         }
-        
+
         try:
-            task_id = enqueue_task("main_entry", payload)
+            enqueue_task("main_entry", payload)
             return True
         except Exception as e:
             st.error(f"❌ 寫入佇列失敗: {e}")
@@ -1033,28 +1050,65 @@ try:
                         if check_duplicate_record(main_df, input_date, inspector_name, role, selected_class):
                                 st.warning(f"⚠️ 注意：您今天已經評過「{selected_class}」了！")
                         st.info(f"📍 正在評分：**{selected_class}**")
-                        with st.form("scoring_form", clear_on_submit=True):
-                            in_s = 0; out_s = 0; ph_c = 0; note = ""
-                            if role == "內掃檢查":
-                                if st.radio("結果", ["❌ 違規", "✨ 乾淨"], horizontal=True) == "❌ 違規":
-                                    in_s = st.number_input("內掃扣分 (上限2分)", 0)
-                                    note = st.text_input("說明", placeholder="黑板未擦"); ph_c = st.number_input("手機人數 (無上限)", 0)
-                                else: note = "【優良】"
-                            elif role == "外掃檢查":
-                                if st.radio("結果", ["❌ 違規", "✨ 乾淨"], horizontal=True) == "❌ 違規":
-                                    out_s = st.number_input("外掃扣分 (上限2分)", 0)
-                                    note = st.text_input("說明", placeholder="走廊垃圾"); ph_c = st.number_input("手機人數 (無上限)", 0)
-                                else: note = "【優良】"
+                                                # --- Immediate per-session scored marker (doesn't rely on Sheets write-back latency) ---
+                        day_key = f"{str(input_date)}|{inspector_name}|{role}"
+                        if "scored_map" not in st.session_state:
+                            st.session_state["scored_map"] = {}
+                        scored_today = st.session_state["scored_map"].setdefault(day_key, set())
 
-                            is_fix = st.checkbox("🚩 修正單")
-                            files = st.file_uploader("照片(自動上傳雲端)", accept_multiple_files=True)
+                        if selected_class in scored_today:
+                            st.success(f"✅ 今日「{selected_class}」已評分（本次登入期間）")
+
+                        form_id = f"scoring_form_{str(input_date)}_{inspector_name}_{role}_{selected_class}"
+
+                        with st.form(form_id, clear_on_submit=True):
+                            in_s = 0
+                            out_s = 0
+                            ph_c = 0
+                            note = ""
+
+                            result_key = f"result_{form_id}"
+                            note_key = f"note_{form_id}"
+                            phone_key = f"phone_{form_id}"
+                            in_key = f"in_{form_id}"
+                            out_key = f"out_{form_id}"
+                            fix_key = f"fix_{form_id}"
+                            files_key = f"files_{form_id}"
+
+                            if role == "內掃檢查":
+                                result = st.radio("結果", ["❌ 違規", "✨ 乾淨"], horizontal=True, key=result_key)
+                                if result == "❌ 違規":
+                                    in_s = st.number_input("內掃扣分 (上限2分)", min_value=0, max_value=2, value=0, step=1, key=in_key)
+                                    note = st.text_input("說明", placeholder="黑板未擦", key=note_key)
+                                    ph_c = st.number_input("手機人數 (無上限)", min_value=0, value=0, step=1, key=phone_key)
+                                else:
+                                    note = "【優良】"
+
+                            elif role == "外掃檢查":
+                                result = st.radio("結果", ["❌ 違規", "✨ 乾淨"], horizontal=True, key=result_key)
+                                if result == "❌ 違規":
+                                    out_s = st.number_input("外掃扣分 (上限2分)", min_value=0, max_value=2, value=0, step=1, key=out_key)
+                                    note = st.text_input("說明", placeholder="走廊垃圾", key=note_key)
+                                    ph_c = st.number_input("手機人數 (無上限)", min_value=0, value=0, step=1, key=phone_key)
+                                else:
+                                    note = "【優良】"
+
+                            is_fix = st.checkbox("🚩 修正單", key=fix_key)
+                            files = st.file_uploader("照片(自動上傳雲端)", accept_multiple_files=True, type=["jpg", "jpeg", "png"], key=files_key)
+
                             if st.form_submit_button("送出"):
-                                save_entry(
-                                    {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": selected_class, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note},
-                                    uploaded_files=files
-                                )
-                                st.toast(f"✅ 已排入儲存佇列：{selected_class}")
-                                st.rerun()
+                                if files and len(files) > 4:
+                                    st.error("❌ 一次最多只能上傳 4 張照片，請刪減後再送出。")
+                                else:
+                                    ok = save_entry(
+                                        {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"),
+                                         "修正": is_fix, "班級": selected_class, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note},
+                                        uploaded_files=files
+                                    )
+                                    if ok:
+                                        scored_today.add(selected_class)
+                                        st.toast(f"✅ 已成功送出：{selected_class}（照片已上傳雲端）")
+                                        st.rerun()
 
     # --- 模式2: 衛生股長 ---
     elif app_mode == "班級負責人🥸":
