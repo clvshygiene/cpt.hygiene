@@ -374,6 +374,7 @@ def fetch_next_task(max_attempts: int = 6):
             task_id, task_type, created_ts, payload_json, status, attempts = row
             new_attempts = attempts + 1
             
+            # [SRE Fix] 防禦性更新
             cur.execute(
                 "UPDATE task_queue SET status = 'RUNNING', attempts = ? WHERE id = ? AND status IN ('PENDING', 'RETRY')",
                 (new_attempts, task_id)
@@ -513,7 +514,6 @@ def background_worker(stop_event: threading.Event | None = None):
     recover_stale_tasks()
     
     # [SRE] 背景 Worker 仍然使用 ThreadPool 是安全的，因為它們不涉及 Streamlit Context
-    # 但為了最保險，我們這裡也改成 2，確保不會太吃資源
     max_attempts = 6
     MAX_WORKERS = 2 
     print(f"🚀 背景工作者啟動 (Workers: {MAX_WORKERS})...")
