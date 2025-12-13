@@ -126,7 +126,7 @@ try:
         return None
 
     def upload_image_to_drive(file_obj, filename):
-except: pass 
+
             return f"https://drive.google.com/thumbnail?id={file.get('id')}&sz=w1000"
 
         try:
