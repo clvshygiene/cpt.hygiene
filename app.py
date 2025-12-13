@@ -12,6 +12,7 @@ import sqlite3
 import json
 import random
 import concurrent.futures
+import tempfile
 from datetime import datetime, date, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -22,7 +23,6 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
-from PIL import Image
 
 # --- 1. 網頁設定 ---
 st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
@@ -32,8 +32,11 @@ st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page
 # ==========================================
 TW_TZ = pytz.timezone('Asia/Taipei')
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 單檔圖片 10MB 上限
-QUEUE_DB_PATH = "task_queue_v4_wal.db"
-IMG_DIR = "evidence_photos"
+
+# [SRE] 使用系統暫存目錄，適應 Streamlit Cloud Ephemeral 環境
+TEMP_DIR = tempfile.gettempdir()
+QUEUE_DB_PATH = os.path.join(TEMP_DIR, "task_queue_v8_final.db") # Version updated
+IMG_DIR = os.path.join(TEMP_DIR, "evidence_photos")
 os.makedirs(IMG_DIR, exist_ok=True)
 
 # Google Sheet 網址
@@ -65,21 +68,9 @@ APPEAL_COLUMNS = [
 
 def compress_image_bytes(raw: bytes, max_side: int = 1600, quality: int = 75) -> bytes:
     """
-    壓縮並調整圖片大小，減少傳輸量與儲存空間。
+    [SRE] Pass-through 模式，避免 PIL C-extension 在雲端環境 Crash。
     """
-    try:
-        im = Image.open(io.BytesIO(raw))
-        im = im.convert("RGB") # 強制轉為 RGB 避免 PNG 透明層問題
-        w, h = im.size
-        scale = min(1.0, max_side / max(w, h))
-        if scale < 1.0:
-            im = im.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
-        out = io.BytesIO()
-        im.save(out, format="JPEG", quality=quality, optimize=True)
-        return out.getvalue()
-    except Exception as e:
-        print(f"⚠️ 圖片壓縮失敗，使用原圖: {e}")
-        return raw
+    return raw
 
 def clean_id(val):
     try:
@@ -89,7 +80,7 @@ def clean_id(val):
 
 def execute_with_retry(func, max_retries=5, base_delay=1.0):
     """
-    SRE Pattern: 指數退避重試機制 (Exponential Backoff)
+    SRE Pattern: 指數退避重試機制
     """
     for attempt in range(max_retries):
         try:
@@ -170,15 +161,11 @@ def get_worksheet(tab_name):
     return None
 
 def upload_image_to_drive(file_obj, filename):
-    """
-    上傳單張圖片至 Google Drive
-    """
     service = get_drive_service()
     if not service: 
         print("❌ Drive Service Not Available")
         return None
     
-    # 檢查是否設定了資料夾 ID
     folder_id = None
     if "system_config" in st.secrets and "drive_folder_id" in st.secrets["system_config"]:
         folder_id = st.secrets["system_config"]["drive_folder_id"]
@@ -189,9 +176,9 @@ def upload_image_to_drive(file_obj, filename):
             metadata['parents'] = [folder_id]
             
         media = MediaIoBaseUpload(file_obj, mimetype='image/jpeg', resumable=True)
-        file = service.files().create(body=metadata, media_body=media, fields='id').execute()
-        # 產生縮圖連結 (非公開，需登入)
-        return f"https://drive.google.com/thumbnail?id={file.get('id')}&sz=w1000"
+        # [SRE] 使用 webViewLink 以獲得穩定的預覽連結
+        file = service.files().create(body=metadata, media_body=media, fields='id,webViewLink').execute()
+        return file.get('webViewLink') or f"https://drive.google.com/file/d/{file.get('id')}/view"
 
     try:
         return execute_with_retry(_upload_action)
@@ -200,29 +187,17 @@ def upload_image_to_drive(file_obj, filename):
         return None
 
 def upload_images_parallel(files_list, entry_data):
-    """
-    [SRE Strict Mode] 前景並行上傳
-    目的：確保照片一定上傳成功，才會回傳連結。只要有一張失敗，就全部擋下來。
-    """
     if not files_list:
-        return [], True  # 沒有照片，視為成功
+        return [], True
 
     upload_results = [None] * len(files_list)
-    
-    # 準備上傳任務
     tasks = []
+    
     for i, up_file in enumerate(files_list):
-        # 1. 重設指標與讀取
         up_file.seek(0)
         raw = up_file.read()
-        
-        # 2. 壓縮 (避免佔用頻寬)
-        try:
-            data = compress_image_bytes(raw, max_side=1600, quality=75)
-        except:
-            data = raw
+        data = compress_image_bytes(raw) # Pass-through
 
-        # 3. 命名
         safe_class = str(entry_data.get("班級", "unknown"))
         logical_fname = f"{entry_data.get('日期', '')}_{safe_class}_{i}.jpg"
         unique_prefix = f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
@@ -230,9 +205,8 @@ def upload_images_parallel(files_list, entry_data):
         
         tasks.append((io.BytesIO(data), drive_filename, i))
 
-    # 4. 並行執行上傳 (最多同時 4 緒)
-    # 這裡會稍微卡住 UI 幾秒鐘，但能保證資料完整性
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    # [SRE] 前台並行數限制 2，避免 429
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         future_to_index = {
             executor.submit(upload_image_to_drive, f_obj, fname): idx 
             for f_obj, fname, idx in tasks
@@ -247,98 +221,168 @@ def upload_images_parallel(files_list, entry_data):
                 print(f"上傳失敗: {e}")
                 upload_results[idx] = None
 
-    # 5. 驗證結果
-    # 只要有任何一張照片回傳 None (失敗)，整筆交易就認定失敗
     if any(link is None for link in upload_results):
         return [], False
     
     return upload_results, True
 
 # ==========================================
-# 3. SQLite 背景佇列系統 (SRE Hardened)
+# 3. SQLite 背景佇列系統 (SRE Hardened v4 - Production Safe)
 # ==========================================
-_queue_lock = threading.Lock()
 
-@st.cache_resource
-def get_queue_connection():
-    conn = sqlite3.connect(
-        QUEUE_DB_PATH, 
-        check_same_thread=False, 
-        timeout=30.0, 
-        isolation_level="IMMEDIATE" 
-    )
-    
+_db_lock = threading.Lock()
+
+# [SRE Fix] 移除全域連線實例。改為每次呼叫建立新連線。
+# 理由：跨執行緒共用 SQLite Connection 對象在 Python 中是不安全的 (即使有 Lock 也容易踩到 Transaction 狀態不一致)。
+# SQLite 開檔速度極快，對此應用場景來說，每次 connect 是最安全的解法。
+def get_new_db_connection():
     try:
+        conn = sqlite3.connect(
+            QUEUE_DB_PATH, 
+            check_same_thread=False, 
+            timeout=30.0, 
+            isolation_level=None # [SRE] 手動控制 Transaction
+        )
+        # 設定 WAL 模式與 Timeout (每次連線都確保設定)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA busy_timeout=30000;")
         conn.execute("PRAGMA synchronous=NORMAL;")
-    except:
-        pass
+        return conn
+    except Exception as e:
+        print(f"[CRITICAL] DB Connect Error: {e}")
+        return None
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS task_queue (
-            id TEXT PRIMARY KEY,
-            task_type TEXT NOT NULL,
-            created_ts TEXT NOT NULL,
-            payload_json TEXT NOT NULL,
-            status TEXT NOT NULL,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            last_error TEXT
-        )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_status_created ON task_queue (status, created_ts);")
-    conn.commit()
-    return conn
+def init_db_if_needed():
+    """初始化資料庫表格"""
+    with _db_lock:
+        conn = get_new_db_connection()
+        if conn:
+            try:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS task_queue (
+                        id TEXT PRIMARY KEY,
+                        task_type TEXT NOT NULL,
+                        created_ts TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        last_error TEXT
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_status_created ON task_queue (status, created_ts);")
+                conn.close()
+            except Exception as e:
+                print(f"[INIT ERROR] {e}")
+
+# 在 import 時初始化一次 Schema 即可
+init_db_if_needed()
+
+def recover_stale_tasks():
+    """
+    [SRE Fix] 殭屍任務回收機制
+    當 Worker 啟動時，檢查是否有 'RUNNING' 狀態的任務。
+    如果有，代表上次 Worker 意外崩潰，將其重置為 'RETRY' 以便重新執行。
+    """
+    with _db_lock:
+        conn = get_new_db_connection()
+        if not conn: return
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE task_queue SET status='RETRY', last_error='Worker Restarted Recovery', attempts=attempts WHERE status='RUNNING'"
+            )
+            count = cur.rowcount
+            conn.commit()
+            if count > 0:
+                print(f"♻️  已復原 {count} 筆殭屍任務 (RUNNING -> RETRY)")
+        except Exception as e:
+            print(f"[RECOVERY ERROR] {e}")
+        finally:
+            conn.close()
 
 def enqueue_task(task_type: str, payload: dict) -> str:
-    conn = get_queue_connection()
+    # Lazy Start
+    ensure_worker_started()
+    
     task_id = str(uuid.uuid4())
     created_ts = datetime.utcnow().isoformat() + "Z"
     payload_json = json.dumps(payload, ensure_ascii=False)
 
-    with _queue_lock:
-        conn.execute(
-            "INSERT INTO task_queue (id, task_type, created_ts, payload_json, status, attempts, last_error) "
-            "VALUES (?, ?, ?, ?, 'PENDING', 0, NULL)",
-            (task_id, task_type, created_ts, payload_json)
-        )
-        conn.commit()
-    return task_id
+    with _db_lock:
+        conn = get_new_db_connection()
+        if not conn: return "DB_ERROR"
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO task_queue (id, task_type, created_ts, payload_json, status, attempts, last_error) "
+                "VALUES (?, ?, ?, ?, 'PENDING', 0, NULL)",
+                (task_id, task_type, created_ts, payload_json)
+            )
+            conn.commit()
+            return task_id
+        except Exception as e:
+            try: conn.rollback()
+            except: pass
+            print(f"[ERROR] Enqueue Failed: {e}")
+            return "DB_ERROR"
+        finally:
+            conn.close()
 
 def get_queue_metrics():
-    conn = get_queue_connection()
-    metrics = {"pending": 0, "retry": 0, "failed": 0, "oldest_pending_sec": 0, "recent_errors": []}
-    with _queue_lock:
-        cur = conn.cursor()
-        cur.execute("SELECT status, COUNT(*) FROM task_queue GROUP BY status")
-        rows = cur.fetchall()
-        for status, count in rows:
-            if status == 'PENDING': metrics["pending"] = count
-            elif status == 'RETRY': metrics["retry"] = count
-            elif status == 'FAILED': metrics["failed"] = count
-        
-        cur.execute("SELECT MIN(created_ts) FROM task_queue WHERE status IN ('PENDING', 'RETRY')")
-        oldest_ts_str = cur.fetchone()[0]
-        
-        cur.execute("SELECT last_error, created_ts FROM task_queue WHERE status='FAILED' OR status='RETRY' ORDER BY created_ts DESC LIMIT 5")
-        metrics["recent_errors"] = cur.fetchall()
-
-    if oldest_ts_str:
+    metrics = {"pending": 0, "retry": 0, "failed": 0, "running": 0, "oldest_pending_sec": 0, "recent_errors": []}
+    with _db_lock:
+        conn = get_new_db_connection()
+        if not conn: return metrics
         try:
-            created = datetime.fromisoformat(oldest_ts_str.replace("Z", "+00:00"))
-            now = datetime.now(pytz.utc)
-            metrics["oldest_pending_sec"] = (now - created).total_seconds()
-        except: pass
+            cur = conn.cursor()
+            cur.execute("SELECT status, COUNT(*) FROM task_queue GROUP BY status")
+            rows = cur.fetchall()
+            for status, count in rows:
+                if status == 'PENDING': metrics["pending"] = count
+                elif status == 'RETRY': metrics["retry"] = count
+                elif status == 'FAILED': metrics["failed"] = count
+                elif status == 'RUNNING': metrics["running"] = count
+            
+            # [SRE Fix] 增加監控 RUNNING 的滯留時間，這對 Debug 很有用
+            cur.execute("SELECT MIN(created_ts) FROM task_queue WHERE status IN ('PENDING', 'RETRY', 'RUNNING')")
+            row = cur.fetchone()
+            oldest_ts_str = row[0] if row else None
+            
+            cur.execute("SELECT last_error, created_ts FROM task_queue WHERE status='FAILED' OR status='RETRY' ORDER BY created_ts DESC LIMIT 5")
+            metrics["recent_errors"] = cur.fetchall()
+            
+            if oldest_ts_str:
+                try:
+                    created = datetime.fromisoformat(oldest_ts_str.replace("Z", "+00:00"))
+                    now = datetime.now(pytz.utc)
+                    metrics["oldest_pending_sec"] = (now - created).total_seconds()
+                except: pass
+        except Exception as e: 
+            print(f"[WARN] Metrics Error: {e}")
+        finally:
+            conn.close()
     return metrics
 
 def fetch_next_task(max_attempts: int = 6):
-    conn = get_queue_connection()
-    with _queue_lock:
+    """
+    [SRE Atomic Claim - Final Defensive Version]
+    1. BEGIN IMMEDIATE
+    2. SELECT ID
+    3. UPDATE status=RUNNING WHERE ID=? AND status IN ('PENDING', 'RETRY')
+    4. Check rowcount (Defensive)
+    5. COMMIT
+    """
+    with _db_lock:
+        conn = get_new_db_connection()
+        if not conn: return None
         try:
+            conn.execute("BEGIN IMMEDIATE")
             cur = conn.cursor()
+            
             cur.execute(
                 """
-                SELECT id, task_type, created_ts, payload_json, status, attempts, last_error
+                SELECT id, task_type, created_ts, payload_json, status, attempts
                 FROM task_queue
                 WHERE status IN ('PENDING', 'RETRY')
                 AND attempts < ?
@@ -353,17 +397,21 @@ def fetch_next_task(max_attempts: int = 6):
                 conn.commit()
                 return None
 
-            task_id, task_type, created_ts, payload_json, status, attempts, last_error = row
+            task_id, task_type, created_ts, payload_json, status, attempts = row
+            new_attempts = attempts + 1
             
+            # [SRE Fix] 防禦性更新：再次確認狀態是否符合，避免極端 Race Condition
             cur.execute(
-                "UPDATE task_queue SET status = 'IN_PROGRESS', attempts = attempts + 1 WHERE id = ? AND status = ?",
-                (task_id, status)
+                "UPDATE task_queue SET status = 'RUNNING', attempts = ? WHERE id = ? AND status IN ('PENDING', 'RETRY')",
+                (new_attempts, task_id)
             )
             
             if cur.rowcount == 0:
-                conn.commit()
+                # 狀態被其他線程改變了 (雖然有 Lock 不太可能，但這是 Best Practice)
+                conn.rollback()
+                print(f"[WARN] Task {task_id} claim failed (state changed)")
                 return None
-
+            
             conn.commit()
             
             try: payload = json.loads(payload_json)
@@ -374,23 +422,33 @@ def fetch_next_task(max_attempts: int = 6):
                 "task_type": task_type,
                 "created_ts": created_ts,
                 "payload": payload,
-                "status": "IN_PROGRESS",
-                "attempts": attempts + 1,
-                "last_error": last_error,
+                "attempts": new_attempts,
             }
         except Exception as e:
             try: conn.rollback()
             except: pass
+            print(f"[ERROR] Fetch Task Error: {e}")
             return None
+        finally:
+            conn.close()
 
-def update_task_status(task_id: str, status: str, attempts: int, last_error: str | None):
-    conn = get_queue_connection()
-    with _queue_lock:
-        conn.execute(
-            "UPDATE task_queue SET status = ?, attempts = ?, last_error = ? WHERE id = ?",
-            (status, attempts, last_error, task_id),
-        )
-        conn.commit()
+def update_task_status(task_id: str, status: str, last_error: str | None):
+    with _db_lock:
+        conn = get_new_db_connection()
+        if not conn: return
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE task_queue SET status = ?, last_error = ? WHERE id = ?",
+                (status, last_error, task_id),
+            )
+            conn.commit()
+        except Exception as e: 
+            try: conn.rollback()
+            except: pass
+            print(f"[ERROR] Update Status Failed ({task_id}): {e}")
+        finally:
+            conn.close()
 
 # --- Worker Logic ---
 
@@ -423,20 +481,17 @@ def _append_appeal_row(entry: dict):
         ws.append_row(row)
     execute_with_retry(_action)
 
-def process_task(task: dict, max_attempts: int = 6) -> tuple[bool, str | None]:
+def process_task(task: dict) -> tuple[bool, str | None]:
     task_type = task["task_type"]
     payload = task["payload"]
     entry = payload.get("entry", {}) or {}
 
     try:
         if task_type == "main_entry":
-            # [SRE 修正] 這裡不再處理照片上傳，只負責寫入 Sheet
-            # 因為 save_entry 已經保證照片上傳成功才會進來這裡
             _append_main_entry_row(entry)
             return True, None
 
         elif task_type == "appeal_entry":
-            # 申訴照片依然維持背景上傳 (若也需要嚴格模式可比照辦理)
             image_info = payload.get("image_file")
             if image_info and image_info.get("path") and os.path.exists(image_info["path"]):
                 with open(image_info["path"], "rb") as f:
@@ -447,7 +502,6 @@ def process_task(task: dict, max_attempts: int = 6) -> tuple[bool, str | None]:
 
             _append_appeal_row(entry)
             return True, None
-
         else:
             return True, None
 
@@ -456,18 +510,17 @@ def process_task(task: dict, max_attempts: int = 6) -> tuple[bool, str | None]:
 
 def process_task_wrapper(task, max_attempts):
     task_id = task["id"]
-    attempts = int(task["attempts"] or 0)
+    attempts = task["attempts"] 
     payload = task["payload"]
     
     ok = False
     err_msg = None
     try:
-        ok, err_msg = process_task(task, max_attempts=max_attempts)
+        ok, err_msg = process_task(task)
     except Exception as e:
         err_msg = f"UNHANDLED: {e}\n{traceback.format_exc()}"
         ok = False
 
-    # 清理暫存檔案 (主要針對申訴功能)
     try:
         image_paths = []
         if isinstance(payload, dict):
@@ -478,17 +531,19 @@ def process_task_wrapper(task, max_attempts):
     except: pass
 
     if ok:
-        update_task_status(task_id, "DONE", attempts, None)
-        print(f"✅ Task {task_id} 完成 (Thread)")
+        update_task_status(task_id, "DONE", None)
+        print(f"✅ Task {task_id} 完成")
     else:
-        if attempts >= max_attempts:
-            update_task_status(task_id, "FAILED", attempts, err_msg or "unknown")
-        else:
-            update_task_status(task_id, "RETRY", attempts, err_msg or "unknown")
+        status = "FAILED" if attempts >= max_attempts else "RETRY"
+        print(f"⚠️ Task {task_id} 失敗 ({attempts}/{max_attempts}): {err_msg}")
+        update_task_status(task_id, status, err_msg or "unknown")
 
 def background_worker(stop_event: threading.Event | None = None):
+    # [SRE Fix] 啟動時先復原殭屍任務
+    recover_stale_tasks()
+    
     max_attempts = 6
-    MAX_WORKERS = 4
+    MAX_WORKERS = 2 
     print(f"🚀 背景工作者啟動 (Workers: {MAX_WORKERS})...")
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -498,12 +553,11 @@ def background_worker(stop_event: threading.Event | None = None):
             if stop_event is not None and stop_event.is_set():
                 break
 
-            # 清理已完成的 Future
             done_futures = [f for f in futures if f.done()]
             for f in done_futures:
                 futures.remove(f)
                 try: f.result() 
-                except Exception as e: print(f"Thread Error: {e}")
+                except Exception as e: print(f"[ERROR] Thread Future Error: {e}")
 
             if len(futures) >= MAX_WORKERS:
                 time.sleep(0.5)
@@ -511,35 +565,26 @@ def background_worker(stop_event: threading.Event | None = None):
 
             task = fetch_next_task(max_attempts=max_attempts)
             if not task:
-                time.sleep(1.5) # [SRE] 增加空閒時的等待時間
+                time.sleep(2.0) 
                 continue
 
-            print(f"⚡ 任務 {task['id']} 已分派給執行緒池")
+            print(f"⚡ 任務 {task['id']} (Try: {task['attempts']}) 執行中")
             future = executor.submit(process_task_wrapper, task, max_attempts)
             futures.append(future)
 
 # --- Phoenix Keeper (不死鳥機制) ---
-@st.cache_resource
-def get_worker_manager():
-    return {"thread": None, "stop_event": None}
+_worker_lock = threading.Lock()
+_worker_thread = None
+_worker_stop_event = None
 
 def ensure_worker_started():
-    manager = get_worker_manager()
-    t = manager.get("thread")
-    
-    if t is None or not t.is_alive():
-        print("❤️‍🔥 偵測到背景工作者心跳停止，正在執行 CPR 重啟程序...")
-        stop_event = threading.Event()
-        t = threading.Thread(target=background_worker, args=(stop_event,), daemon=True)
-        t.start()
-        manager["thread"] = t
-        manager["stop_event"] = stop_event
-        print("✅ 背景工作者已復活！")
-    
-    return manager["stop_event"]
-
-# 啟動背景工作
-_worker_stop_event = ensure_worker_started()
+    global _worker_thread, _worker_stop_event
+    with _worker_lock:
+        if _worker_thread is None or not _worker_thread.is_alive():
+            print("❤️‍🔥 啟動/重啟背景工作者...")
+            _worker_stop_event = threading.Event()
+            _worker_thread = threading.Thread(target=background_worker, args=(_worker_stop_event,), daemon=True)
+            _worker_thread.start()
 
 # ==========================================
 # 4. 資料讀取邏輯 (Frontend)
@@ -583,11 +628,6 @@ def load_main_data():
     return df[EXPECTED_COLUMNS]
 
 def save_entry(new_entry, uploaded_files=None):
-    """
-    [嚴格模式] 存檔邏輯
-    1. 上傳照片 (前景阻斷式，確保成功)
-    2. 寫入 Queue (背景處理 Sheet)
-    """
     if "日期" in new_entry and new_entry["日期"]:
         new_entry["日期"] = str(new_entry["日期"])
 
@@ -599,9 +639,9 @@ def save_entry(new_entry, uploaded_files=None):
 
     drive_links = []
     
-    # [關鍵邏輯] 如果有照片，執行「同步阻擋式」上傳
+    # 嚴格模式：前景上傳
     if files_list:
-        with st.spinner("☁️ 正在上傳照片並驗證證據，請稍候..."):
+        with st.spinner("☁️ 正在上傳照片並驗證證據..."):
             links, success = upload_images_parallel(files_list, new_entry)
         
         if not success:
@@ -618,11 +658,13 @@ def save_entry(new_entry, uploaded_files=None):
         timestamp = datetime.now(TW_TZ).strftime("%Y%m%d%H%M%S")
         new_entry["紀錄ID"] = f"{timestamp}_{unique_suffix}"
 
-    # 只將文字資料放入佇列
     payload = {"entry": new_entry}
 
     try:
-        enqueue_task("main_entry", payload)
+        res = enqueue_task("main_entry", payload)
+        if res == "DB_ERROR":
+            st.error("❌ 本地資料庫錯誤，請重新整理頁面。")
+            return False
         return True
     except Exception as e:
         st.error(f"❌ 寫入佇列失敗: {e}")
@@ -642,7 +684,8 @@ def save_appeal(entry, proof_file=None):
         if not data:
             st.error("❌ 佐證照片為空檔案")
             return False
-
+        
+        # 存到系統暫存區
         logical_fname = f"Appeal_{entry.get('班級', '')}_{datetime.now(TW_TZ).strftime('%H%M%S')}.jpg"
         tmp_fname = f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}_{logical_fname}"
         local_path = os.path.join(IMG_DIR, tmp_fname)
@@ -1247,6 +1290,9 @@ elif app_mode == "班級負責人🥸":
 elif app_mode == "組長ㄉ窩💃":
     st.title("⚙️ 管理後台")
     
+    # 確保 Worker 啟動以更新狀態
+    ensure_worker_started()
+    
     # [SRE] 監控面板
     metrics = get_queue_metrics()
     q_count = metrics["pending"] + metrics["retry"]
@@ -1257,7 +1303,7 @@ elif app_mode == "組長ㄉ窩💃":
         st.write("#### 📡 SRE 監控面板")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Pending Queue", q_count, delta="Safe" if q_count < 50 else "High Load", delta_color="inverse")
-        m2.metric("Retry Tasks", metrics["retry"])
+        m2.metric("Running Tasks", metrics["running"])
         m3.metric("Failed Tasks", metrics["failed"])
         m4.metric("Oldest Task Age", f"{int(oldest_age)}s", delta="Lagging" if oldest_age > 300 else "Normal", delta_color="inverse")
 
