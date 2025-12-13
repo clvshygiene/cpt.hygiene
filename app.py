@@ -951,6 +951,10 @@ try:
         st.title("📝 衛生糾察評分系統")
         if "team_logged_in" not in st.session_state: st.session_state["team_logged_in"] = False
         
+        # [SRE UX] 狀態記憶：用來顯示剛剛評完哪一班
+        if "last_submitted_class" not in st.session_state:
+            st.session_state["last_submitted_class"] = None
+        
         if not st.session_state["team_logged_in"]:
             with st.expander("🔐 身份驗證", expanded=True):
                 input_code = st.text_input("請輸入隊伍通行碼", type="password")
@@ -1006,6 +1010,11 @@ try:
                             st.success(f"已排入背景處理： {cnt} 班" if cnt else "無違規"); st.rerun()
                 else:
                     st.markdown("### 🏫 選擇受檢班級")
+                    
+                    # [SRE UX] 狀態反饋：在這裡顯示剛剛完成的班級
+                    if st.session_state.get("last_submitted_class"):
+                        st.success(f"✅ **{st.session_state.last_submitted_class}** 評分已儲存！請繼續點選下一班。")
+
                     if assigned_classes:
                         radio_key = f"radio_assigned_{inspector_name}"
                         selected_class = st.radio(
@@ -1033,6 +1042,8 @@ try:
                         if check_duplicate_record(main_df, input_date, inspector_name, role, selected_class):
                                 st.warning(f"⚠️ 注意：您今天已經評過「{selected_class}」了！")
                         st.info(f"📍 正在評分：**{selected_class}**")
+                        
+                        # [SRE Note] 使用 form 來處理輸入，clear_on_submit=True 會自動清空欄位
                         with st.form("scoring_form", clear_on_submit=True):
                             in_s = 0; out_s = 0; ph_c = 0; note = ""
                             if role == "內掃檢查":
@@ -1047,13 +1058,21 @@ try:
                                 else: note = "【優良】"
 
                             is_fix = st.checkbox("🚩 修正單")
-                            files = st.file_uploader("照片(自動上傳雲端)", accept_multiple_files=True)
+                            files = st.file_uploader("照片(有扣分則必填，自動上傳雲端)", accept_multiple_files=True)
+                            
                             if st.form_submit_button("送出"):
+                                # [SRE Logic] 資料完整性檢查：有扣分就必須有照片
+                                total_deduction = in_s + out_s
+                                if total_deduction > 0 and not files:
+                                    st.error("🛑 【資料不完整】有扣分但未上傳照片！系統拒絕收件。請補上照片佐證後再送出。")
+                                    st.stop() # 強制中斷，不准存檔
+
                                 save_entry(
                                     {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": selected_class, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note},
                                     uploaded_files=files
                                 )
-                                st.toast(f"✅ 已排入儲存佇列：{selected_class}")
+                                # [SRE UX] 更新狀態，讓 Rerun 後能顯示回饋
+                                st.session_state["last_submitted_class"] = selected_class
                                 st.rerun()
 
     # --- 模式2: 衛生股長 ---
