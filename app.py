@@ -552,11 +552,14 @@ try:
         jobs = []
         for i, up_file in enumerate(files_list):
             try:
-                up_file.seek(0); raw = up_file.read()
+                up_file.seek(0); 
+                raw = up_file.read()
             except Exception as e:
-                st.error(f"❌ 讀取上傳檔失敗: {e}"); return False
+                st.error(f"❌ 讀取上傳檔失敗: {e}"); 
+                return False
             if not raw:
-                st.error("❌ 有照片檔案是空的，請重新選取後再送出。"); return False
+                st.error("❌ 有照片檔案是空的，請重新選取後再送出。"); 
+                return False
             try:
                 data = raw  # compression disabled on Streamlit Cloud
         data = raw
