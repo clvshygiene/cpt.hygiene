@@ -20,6 +20,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+from PIL import Image
 
 # --- 1. 網頁設定 ---
 st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
@@ -30,6 +31,24 @@ try:
     # 0. 基礎設定與時區
     # ==========================================
     TW_TZ = pytz.timezone('Asia/Taipei')
+
+def compress_image_bytes(raw: bytes, max_side: int = 1600, quality: int = 75) -> bytes:
+    """
+    Shrink & recompress images before uploading to Drive.
+    - Converts to RGB JPEG
+    - Resizes long side to max_side
+    - Uses JPEG quality for size/speed tradeoff
+    """
+    im = Image.open(io.BytesIO(raw))
+    im = im.convert("RGB")
+    w, h = im.size
+    scale = min(1.0, max_side / max(w, h))
+    if scale < 1.0:
+        im = im.resize((int(w * scale), int(h * scale)))
+    out = io.BytesIO()
+    im.save(out, format="JPEG", quality=quality, optimize=True)
+    return out.getvalue()
+
 
     MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 單檔圖片 10MB 上限
     QUEUE_DB_PATH = "task_queue_v4_wal.db"
@@ -140,23 +159,7 @@ try:
         return None
 
     def upload_image_to_drive(file_obj, filename):
-        def _upload_action():
-            service = get_drive_service()
-            if not service: raise Exception("Drive Service Init Failed")
-            
-            folder_id = st.secrets["system_config"].get("drive_folder_id")
-            if not folder_id: raise Exception("No Drive Folder ID")
-
-            file_metadata = {'name': filename, 'parents': [folder_id]}
-            media = MediaIoBaseUpload(file_obj, mimetype='image/jpeg')
-            
-            file = service.files().create(
-                body=file_metadata, media_body=media, fields='id', supportsAllDrives=True
-            ).execute(num_retries=1)
-            
-            try:
-                service.permissions().create(fileId=file.get('id'), body={'role': 'reader', 'type': 'anyone'}).execute()
-            except: pass 
+except: pass 
             return f"https://drive.google.com/thumbnail?id={file.get('id')}&sz=w1000"
 
         try:
@@ -532,77 +535,91 @@ try:
         
         return df[EXPECTED_COLUMNS]
 
-    def save_entry(new_entry, uploaded_files=None):
-        # Strict mode:
-        # - Photos MUST be uploaded to Google Drive successfully, otherwise this entry is NOT accepted.
-        # - Max 4 photos per submission (as requested).
-        if "日期" in new_entry and new_entry["日期"]:
-            new_entry["日期"] = str(new_entry["日期"])
+    
+def save_entry(new_entry, uploaded_files=None):
+    # Strict mode + fast mode:
+    # - Photos MUST upload to Drive successfully; otherwise this entry is NOT accepted.
+    # - Max 4 photos per submission.
+    # - Pre-compress images before upload.
+    # - Upload in small parallelism (2) to reduce total wait without triggering 429 storms.
 
-        drive_links = []
+    if "日期" in new_entry and new_entry["日期"]:
+        new_entry["日期"] = str(new_entry["日期"])
 
-        if uploaded_files:
-            files_list = [f for f in uploaded_files if f]
-            if len(files_list) > 4:
-                st.error("❌ 一次最多只能上傳 4 張照片，請刪減後再送出。")
-                return False
+    drive_links = []
 
-            for i, up_file in enumerate(files_list):
-                try:
-                    up_file.seek(0)
-                    data = up_file.read()
-                except Exception as e:
-                    st.error(f"❌ 讀取上傳檔失敗: {e}")
-                    return False
+    files_list = []
+    if uploaded_files:
+        files_list = [f for f in uploaded_files if f]
 
-                if not data:
-                    st.error("❌ 有照片檔案是空的，請重新選取後再送出。")
-                    return False
+    if len(files_list) > 4:
+        st.error("❌ 一次最多只能上傳 4 張照片，請刪減後再送出。")
+        return False
 
-                size = len(data)
-                if size > MAX_IMAGE_BYTES:
-                    mb = size / (1024 * 1024)
-                    st.error(f"❌ 檔案「{up_file.name}」過大 ({mb:.1f} MB)。請壓縮到 10MB 以下再上傳。")
-                    return False
+    jobs = []
+    for i, up_file in enumerate(files_list):
+        try:
+            up_file.seek(0)
+            raw = up_file.read()
+        except Exception as e:
+            st.error(f"❌ 讀取上傳檔失敗: {e}")
+            return False
 
-                safe_class = str(new_entry.get("班級", "unknown"))
-                logical_fname = f"{new_entry.get('日期', '')}_{safe_class}_{i}.jpg"
-                unique_prefix = f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
-                drive_fname = f"{unique_prefix}_{logical_fname}"
+        if not raw:
+            st.error("❌ 有照片檔案是空的，請重新選取後再送出。")
+            return False
 
-                # upload_image_to_drive already wraps execute_with_retry; fail-fast if still cannot upload
-                link = upload_image_to_drive(io.BytesIO(data), drive_fname)
-                if not link:          
+        try:
+            data = compress_image_bytes(raw, max_side=1600, quality=75)
+        except Exception:
+            data = raw
+
+        size = len(data)
+        if size > MAX_IMAGE_BYTES:
+            mb = size / (1024 * 1024)
+            st.error(f"❌ 檔案「{getattr(up_file, 'name', 'photo')}」過大 ({mb:.1f} MB)。請壓縮到 10MB 以下再上傳。")
+            return False
+
+        safe_class = str(new_entry.get("班級", "unknown"))
+        logical_fname = f"{new_entry.get('日期', '')}_{safe_class}_{i}.jpg"
+        unique_prefix = f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        drive_fname = f"{unique_prefix}_{logical_fname}"
+        jobs.append((data, drive_fname))
+
+    def _upload_one(job):
+        data, drive_fname = job
+        return upload_image_to_drive(io.BytesIO(data), drive_fname)
+
+    if jobs:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futures = [ex.submit(_upload_one, job) for job in jobs]
+            for f in as_completed(futures):
+                link = f.result()
+                if not link:
                     st.error(
                         "❌ 照片上傳雲端失敗（已自動重試多次）。\n"
                         "為避免「有扣分但沒有證據」，本筆紀錄不會送出；請稍後再試。"
                     )
                     return False
-
                 drive_links.append(link)
 
-        if drive_links:
-            new_entry["照片路徑"] = ";".join(drive_links)
+    if drive_links:
+        new_entry["照片路徑"] = ";".join(drive_links)
 
-        # Ensure record id exists
-        if "紀錄ID" not in new_entry or not new_entry["紀錄ID"]:
-            unique_suffix = uuid.uuid4().hex[:6]
-            timestamp = datetime.now(TW_TZ).strftime("%Y%m%d%H%M%S")
-            new_entry["紀錄ID"] = f"{timestamp}_{unique_suffix}"
+    if "紀錄ID" not in new_entry or not new_entry["紀錄ID"]:
+        unique_suffix = uuid.uuid4().hex[:6]
+        timestamp = datetime.now(TW_TZ).strftime("%Y%m%d%H%M%S")
+        new_entry["紀錄ID"] = f"{timestamp}_{unique_suffix}"
 
-        payload = {
-            "entry": new_entry,
-            # strict mode: no local temp files to upload later
-            "image_paths": [],
-            "filenames": [],
-        }
+    payload = {"entry": new_entry, "image_paths": [], "filenames": []}
 
-        try:
-            enqueue_task("main_entry", payload)
-            return True
-        except Exception as e:
-            st.error(f"❌ 寫入佇列失敗: {e}")
-            return False
+    try:
+        enqueue_task("main_entry", payload)
+        return True
+    except Exception as e:
+        st.error(f"❌ 寫入佇列失敗: {e}")
+        return False
 
     def save_appeal(entry, proof_file=None):
         image_info = None
@@ -1534,4 +1551,3 @@ try:
 except Exception as e:
     st.error("❌ 系統發生未預期錯誤，請通知管理員。")
     print(traceback.format_exc())
-
