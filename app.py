@@ -573,11 +573,11 @@ try:
                 # upload_image_to_drive already wraps execute_with_retry; fail-fast if still cannot upload
                 link = upload_image_to_drive(io.BytesIO(data), drive_fname)
                 if not link:
-                    st.error(
-                        "❌ 照片上傳雲端失敗（已自動重試多次）。
-"
-                        "為避免「有扣分但沒有證據」，本筆紀錄不會送出；請稍後再試。"
-                    )
+                    
+                st.error(
+                    "❌ 照片上傳雲端失敗（已自動重試多次）。\n"
+                    "為避免「有扣分但沒有證據」，本筆紀錄不會送出；請稍後再試。"
+                )
                     return False
 
                 drive_links.append(link)
