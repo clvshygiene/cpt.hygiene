@@ -11,7 +11,6 @@ import re
 import sqlite3
 import json
 import random
-import concurrent.futures
 import tempfile
 from datetime import datetime, date, timedelta
 from email.mime.text import MIMEText
@@ -24,6 +23,9 @@ from oauth2client.service_account import ServiceAccountCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
+# [SRE Fix] 移除 PIL，避免在某些 Linux 環境下引發 Segfault
+# from PIL import Image  <-- REMOVED
+
 # --- 1. 網頁設定 ---
 st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
 
@@ -35,7 +37,7 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 單檔圖片 10MB 上限
 
 # [SRE] 使用系統暫存目錄
 TEMP_DIR = tempfile.gettempdir()
-QUEUE_DB_PATH = os.path.join(TEMP_DIR, "task_queue_v9_threadsafe.db") # Version updated
+QUEUE_DB_PATH = os.path.join(TEMP_DIR, "task_queue_v10_serial.db") # Version updated
 IMG_DIR = os.path.join(TEMP_DIR, "evidence_photos")
 os.makedirs(IMG_DIR, exist_ok=True)
 
@@ -66,9 +68,6 @@ APPEAL_COLUMNS = [
 # 1. 工具函式 (Utils)
 # ==========================================
 
-def compress_image_bytes(raw: bytes, max_side: int = 1600, quality: int = 75) -> bytes:
-    return raw
-
 def clean_id(val):
     try:
         if pd.isna(val) or val == "": return ""
@@ -91,10 +90,9 @@ def execute_with_retry(func, max_retries=5, base_delay=1.0):
                 raise e
 
 # ==========================================
-# 2. Google API 連線 (Thread-Safe Fix)
+# 2. Google API 連線
 # ==========================================
 
-# [SRE Fix] 這是原本的 Cache 版本，給 UI 顯示用 (讀取 Sheet)
 @st.cache_resource
 def get_credentials_cached():
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
@@ -122,8 +120,8 @@ def get_spreadsheet_object():
         st.error(f"❌ 無法開啟試算表: {e}")
         return None
 
-# [SRE Fix] 這是「無快取」版本，專門給 Thread 使用
-# 避免在 Thread 中呼叫 st.cache_resource 導致 Missing ScriptRunContext
+# [SRE] 為了避免 Thread 混亂，這裡不使用 Cache，每次都建立新的 client
+# 雖然消耗一點點效能，但能避免 Context 遺失錯誤
 def get_drive_service_raw():
     try:
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
@@ -159,7 +157,7 @@ def get_worksheet(tab_name):
     return None
 
 def upload_image_to_drive(file_obj, filename):
-    # [SRE Fix] 這裡改用 raw service，不使用 Streamlit Cache
+    # 使用 raw service
     service = get_drive_service_raw()
     if not service: 
         print("❌ Drive Service Not Available (Raw)")
@@ -184,48 +182,46 @@ def upload_image_to_drive(file_obj, filename):
         print(f"⚠️ Drive 上傳最終失敗: {str(e)}")
         return None
 
-def upload_images_parallel(files_list, entry_data):
+def upload_images_serial(files_list, entry_data):
+    """
+    [SRE Fix] 序列化上傳模式 (Serial Mode)
+    目的：解決 ThreadPool 導致的 Segmentation Fault。
+    犧牲一點速度，換取 100% 穩定性。
+    """
     if not files_list:
         return [], True
 
-    upload_results = [None] * len(files_list)
-    tasks = []
+    uploaded_links = []
     
     for i, up_file in enumerate(files_list):
-        up_file.seek(0)
-        raw = up_file.read()
-        data = compress_image_bytes(raw)
+        try:
+            # 1. 讀取
+            up_file.seek(0)
+            raw = up_file.read()
+            
+            # 2. 準備檔名
+            safe_class = str(entry_data.get("班級", "unknown"))
+            logical_fname = f"{entry_data.get('日期', '')}_{safe_class}_{i}.jpg"
+            unique_prefix = f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+            drive_filename = f"{unique_prefix}_{logical_fname}"
+            
+            # 3. 同步上傳 (Blocking Call)
+            link = upload_image_to_drive(io.BytesIO(raw), drive_filename)
+            
+            if link:
+                uploaded_links.append(link)
+            else:
+                # 只要有一張失敗，就中斷並回報失敗
+                return [], False
+                
+        except Exception as e:
+            print(f"[UPLOAD ERROR] {e}")
+            return [], False
 
-        safe_class = str(entry_data.get("班級", "unknown"))
-        logical_fname = f"{entry_data.get('日期', '')}_{safe_class}_{i}.jpg"
-        unique_prefix = f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
-        drive_filename = f"{unique_prefix}_{logical_fname}"
-        
-        tasks.append((io.BytesIO(data), drive_filename, i))
-
-    # [SRE] 並行數限制 2
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        future_to_index = {
-            executor.submit(upload_image_to_drive, f_obj, fname): idx 
-            for f_obj, fname, idx in tasks
-        }
-        
-        for future in concurrent.futures.as_completed(future_to_index):
-            idx = future_to_index[future]
-            try:
-                link = future.result()
-                upload_results[idx] = link
-            except Exception as e:
-                print(f"上傳失敗: {e}")
-                upload_results[idx] = None
-
-    if any(link is None for link in upload_results):
-        return [], False
-    
-    return upload_results, True
+    return uploaded_links, True
 
 # ==========================================
-# 3. SQLite 背景佇列系統 (SRE Hardened v4 - Production Safe)
+# 3. SQLite 背景佇列系統 (SRE Hardened v4)
 # ==========================================
 
 _db_lock = threading.Lock()
@@ -515,6 +511,7 @@ def process_task_wrapper(task, max_attempts):
 def background_worker(stop_event: threading.Event | None = None):
     recover_stale_tasks()
     
+    # [SRE] 背景 Worker 仍然使用 ThreadPool 是安全的，因為它們不涉及 Streamlit Context
     max_attempts = 6
     MAX_WORKERS = 2 
     print(f"🚀 背景工作者啟動 (Workers: {MAX_WORKERS})...")
@@ -612,13 +609,13 @@ def save_entry(new_entry, uploaded_files=None):
 
     drive_links = []
     
-    # 嚴格模式：前景上傳
+    # [SRE Fix] 改用序列化上傳，防止 Segfault
     if files_list:
         with st.spinner("☁️ 正在上傳照片並驗證證據..."):
-            links, success = upload_images_parallel(files_list, new_entry)
+            links, success = upload_images_serial(files_list, new_entry)
         
         if not success:
-            st.error("🛑 **上傳失敗，評分未送出！**\n\n系統偵測到照片上傳雲端失敗，為了避免「有扣分無證據」的爭議，本筆紀錄已被系統攔截。\n請檢查網路連線後重試。")
+            st.error("🛑 **上傳失敗，評分未送出！**\n\n系統偵測到照片上傳雲端失敗。請檢查網路連線後重試。")
             return False
         
         drive_links = links
