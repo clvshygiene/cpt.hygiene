@@ -171,7 +171,7 @@ def get_worksheet(tab_name):
 
 def upload_image_to_drive(file_obj, filename):
     """
-    [Fixed] 修復後的上傳函式
+    上傳單張圖片至 Google Drive
     """
     service = get_drive_service()
     if not service: 
@@ -198,6 +198,61 @@ def upload_image_to_drive(file_obj, filename):
     except Exception as e:
         print(f"⚠️ Drive 上傳最終失敗: {str(e)}")
         return None
+
+def upload_images_parallel(files_list, entry_data):
+    """
+    [SRE Strict Mode] 前景並行上傳
+    目的：確保照片一定上傳成功，才會回傳連結。只要有一張失敗，就全部擋下來。
+    """
+    if not files_list:
+        return [], True  # 沒有照片，視為成功
+
+    upload_results = [None] * len(files_list)
+    
+    # 準備上傳任務
+    tasks = []
+    for i, up_file in enumerate(files_list):
+        # 1. 重設指標與讀取
+        up_file.seek(0)
+        raw = up_file.read()
+        
+        # 2. 壓縮 (避免佔用頻寬)
+        try:
+            data = compress_image_bytes(raw, max_side=1600, quality=75)
+        except:
+            data = raw
+
+        # 3. 命名
+        safe_class = str(entry_data.get("班級", "unknown"))
+        logical_fname = f"{entry_data.get('日期', '')}_{safe_class}_{i}.jpg"
+        unique_prefix = f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        drive_filename = f"{unique_prefix}_{logical_fname}"
+        
+        tasks.append((io.BytesIO(data), drive_filename, i))
+
+    # 4. 並行執行上傳 (最多同時 4 緒)
+    # 這裡會稍微卡住 UI 幾秒鐘，但能保證資料完整性
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_index = {
+            executor.submit(upload_image_to_drive, f_obj, fname): idx 
+            for f_obj, fname, idx in tasks
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_index):
+            idx = future_to_index[future]
+            try:
+                link = future.result()
+                upload_results[idx] = link
+            except Exception as e:
+                print(f"上傳失敗: {e}")
+                upload_results[idx] = None
+
+    # 5. 驗證結果
+    # 只要有任何一張照片回傳 None (失敗)，整筆交易就認定失敗
+    if any(link is None for link in upload_results):
+        return [], False
+    
+    return upload_results, True
 
 # ==========================================
 # 3. SQLite 背景佇列系統 (SRE Hardened)
@@ -344,7 +399,6 @@ def _append_main_entry_row(entry: dict):
         ws = get_worksheet(SHEET_TABS["main"])
         if not ws: raise Exception("Failed to get main worksheet")
         
-        # 簡單檢查表頭
         all_vals = ws.get_all_values()
         if not all_vals: ws.append_row(EXPECTED_COLUMNS)
 
@@ -376,25 +430,13 @@ def process_task(task: dict, max_attempts: int = 6) -> tuple[bool, str | None]:
 
     try:
         if task_type == "main_entry":
-            image_paths = payload.get("image_paths", []) or []
-            filenames = payload.get("filenames", []) or []
-            drive_links = []
-
-            for path, fname in zip(image_paths, filenames):
-                if not path or not os.path.exists(path):
-                    drive_links.append("UPLOAD_FAILED")
-                    continue
-                with open(path, "rb") as f:
-                    link = upload_image_to_drive(f, fname)
-                drive_links.append(link if link else "UPLOAD_FAILED")
-
-            if drive_links:
-                entry["照片路徑"] = ";".join(drive_links)
-
+            # [SRE 修正] 這裡不再處理照片上傳，只負責寫入 Sheet
+            # 因為 save_entry 已經保證照片上傳成功才會進來這裡
             _append_main_entry_row(entry)
             return True, None
 
         elif task_type == "appeal_entry":
+            # 申訴照片依然維持背景上傳 (若也需要嚴格模式可比照辦理)
             image_info = payload.get("image_file")
             if image_info and image_info.get("path") and os.path.exists(image_info["path"]):
                 with open(image_info["path"], "rb") as f:
@@ -425,11 +467,10 @@ def process_task_wrapper(task, max_attempts):
         err_msg = f"UNHANDLED: {e}\n{traceback.format_exc()}"
         ok = False
 
-    # 清理暫存檔案
+    # 清理暫存檔案 (主要針對申訴功能)
     try:
         image_paths = []
         if isinstance(payload, dict):
-            if "image_paths" in payload: image_paths.extend(payload["image_paths"])
             if "image_file" in payload and "path" in payload["image_file"]:
                 image_paths.append(payload["image_file"]["path"])
         for p in image_paths:
@@ -470,7 +511,7 @@ def background_worker(stop_event: threading.Event | None = None):
 
             task = fetch_next_task(max_attempts=max_attempts)
             if not task:
-                time.sleep(1.5) # [SRE] 增加空閒時的等待時間，減少 Busy Loop
+                time.sleep(1.5) # [SRE] 增加空閒時的等待時間
                 continue
 
             print(f"⚡ 任務 {task['id']} 已分派給執行緒池")
@@ -510,7 +551,6 @@ def load_main_data():
     if not ws:
         return pd.DataFrame(columns=EXPECTED_COLUMNS)
     try:
-        # [SRE] 未來優化點：當資料量 > 2000 筆時，建議只讀取最近 N 筆
         data = ws.get_all_records()
         df = pd.DataFrame(data)
         if df.empty:
@@ -543,12 +583,13 @@ def load_main_data():
     return df[EXPECTED_COLUMNS]
 
 def save_entry(new_entry, uploaded_files=None):
+    """
+    [嚴格模式] 存檔邏輯
+    1. 上傳照片 (前景阻斷式，確保成功)
+    2. 寫入 Queue (背景處理 Sheet)
+    """
     if "日期" in new_entry and new_entry["日期"]:
         new_entry["日期"] = str(new_entry["日期"])
-
-    # 處理圖片暫存
-    local_image_paths = []
-    filenames = []
 
     files_list = [f for f in uploaded_files if f] if uploaded_files else []
 
@@ -556,48 +597,29 @@ def save_entry(new_entry, uploaded_files=None):
         st.error("❌ 一次最多只能上傳 4 張照片，請刪減後再送出。")
         return False
 
-    # 先儲存到本地暫存，讓背景 Worker 慢慢上傳
-    for i, up_file in enumerate(files_list):
-        try:
-            up_file.seek(0)
-            raw = up_file.read()
-        except Exception as e:
-            st.error(f"❌ 讀取上傳檔失敗: {e}")
-            return False
-
-        if not raw:
-            st.error("❌ 有照片檔案是空的，請重新選取後再送出。")
-            return False
-
-        # 壓縮
-        try:
-            data = compress_image_bytes(raw, max_side=1600, quality=75)
-        except Exception:
-            data = raw
-
-        # 檢查大小
-        if len(data) > MAX_IMAGE_BYTES:
-            st.error(f"❌ 檔案過大。請壓縮到 10MB 以下再上傳。")
-            return False
-
-        safe_class = str(new_entry.get("班級", "unknown"))
-        logical_fname = f"{new_entry.get('日期', '')}_{safe_class}_{i}.jpg"
-        unique_prefix = f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
-        tmp_filename = f"{unique_prefix}_{logical_fname}"
-        tmp_path = os.path.join(IMG_DIR, tmp_filename)
+    drive_links = []
+    
+    # [關鍵邏輯] 如果有照片，執行「同步阻擋式」上傳
+    if files_list:
+        with st.spinner("☁️ 正在上傳照片並驗證證據，請稍候..."):
+            links, success = upload_images_parallel(files_list, new_entry)
         
-        with open(tmp_path, "wb") as f:
-            f.write(data)
-            
-        local_image_paths.append(tmp_path)
-        filenames.append(tmp_filename)
+        if not success:
+            st.error("🛑 **上傳失敗，評分未送出！**\n\n系統偵測到照片上傳雲端失敗，為了避免「有扣分無證據」的爭議，本筆紀錄已被系統攔截。\n請檢查網路連線後重試。")
+            return False
+        
+        drive_links = links
+
+    if drive_links:
+        new_entry["照片路徑"] = ";".join(drive_links)
 
     if "紀錄ID" not in new_entry or not new_entry["紀錄ID"]:
         unique_suffix = uuid.uuid4().hex[:6]
         timestamp = datetime.now(TW_TZ).strftime("%Y%m%d%H%M%S")
         new_entry["紀錄ID"] = f"{timestamp}_{unique_suffix}"
 
-    payload = {"entry": new_entry, "image_paths": local_image_paths, "filenames": filenames}
+    # 只將文字資料放入佇列
+    payload = {"entry": new_entry}
 
     try:
         enqueue_task("main_entry", payload)
