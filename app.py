@@ -20,6 +20,10 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+
+# ---- Queue DB path (SQLite) ----
+QUEUE_DB_PATH = os.getenv("QUEUE_DB_PATH", "/tmp/task_queue.db")
+
 # --- 1. 網頁設定 ---
 st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
 
@@ -151,37 +155,23 @@ try:
     # ==========================================
     _queue_lock = threading.Lock()
 
-    @st.cache_resource
-    def get_queue_connection():
-        conn = sqlite3.connect(
-            QUEUE_DB_PATH, 
-            check_same_thread=False, 
-            timeout=30.0, 
-            isolation_level="IMMEDIATE" 
+def get_queue_connection():
+    # Do NOT use Streamlit caching here because this is called from background threads.
+    # Use /tmp by default on Streamlit Community Cloud.
+    conn = sqlite3.connect(QUEUE_DB_PATH, check_same_thread=False)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS task_queue (
+            id TEXT PRIMARY KEY,
+            task_type TEXT,
+            payload TEXT,
+            created_ts TEXT,
+            status TEXT,
+            attempts INTEGER,
+            last_error TEXT
         )
-        
-        try:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA busy_timeout=30000;")
-            conn.execute("PRAGMA synchronous=NORMAL;")
-        except:
-            pass
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS task_queue (
-                id TEXT PRIMARY KEY,
-                task_type TEXT NOT NULL,
-                created_ts TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                status TEXT NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_status_created ON task_queue (status, created_ts);")
-        conn.commit()
-        return conn
-
+    """)
+    conn.commit()
+    return conn
     def enqueue_task(task_type: str, payload: dict) -> str:
         conn = get_queue_connection()
         task_id = str(uuid.uuid4())
