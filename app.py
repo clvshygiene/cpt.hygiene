@@ -422,3 +422,4 @@ elif app_mode == "資料查詢":
     st.title("📊 資料查詢")
     df = load_main_data()
     st.dataframe(df)
+
