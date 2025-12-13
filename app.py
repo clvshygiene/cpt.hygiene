@@ -562,8 +562,8 @@ try:
                 return False
             try:
                 data = raw  # compression disabled on Streamlit Cloud
-        data = raw
-        # (raw, max_side=1600, quality=75)
+                data = raw
+                # (raw, max_side=1600, quality=75)
             except Exception:
                 data = raw
             if len(data) > MAX_IMAGE_BYTES:
