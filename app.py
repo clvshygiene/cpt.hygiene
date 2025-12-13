@@ -33,9 +33,9 @@ st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page
 TW_TZ = pytz.timezone('Asia/Taipei')
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 單檔圖片 10MB 上限
 
-# [SRE] 使用系統暫存目錄，適應 Streamlit Cloud Ephemeral 環境
+# [SRE] 使用系統暫存目錄
 TEMP_DIR = tempfile.gettempdir()
-QUEUE_DB_PATH = os.path.join(TEMP_DIR, "task_queue_v8_final.db") # Version updated
+QUEUE_DB_PATH = os.path.join(TEMP_DIR, "task_queue_v9_threadsafe.db") # Version updated
 IMG_DIR = os.path.join(TEMP_DIR, "evidence_photos")
 os.makedirs(IMG_DIR, exist_ok=True)
 
@@ -67,9 +67,6 @@ APPEAL_COLUMNS = [
 # ==========================================
 
 def compress_image_bytes(raw: bytes, max_side: int = 1600, quality: int = 75) -> bytes:
-    """
-    [SRE] Pass-through 模式，避免 PIL C-extension 在雲端環境 Crash。
-    """
     return raw
 
 def clean_id(val):
@@ -79,9 +76,6 @@ def clean_id(val):
     except: return str(val).strip()
 
 def execute_with_retry(func, max_retries=5, base_delay=1.0):
-    """
-    SRE Pattern: 指數退避重試機制
-    """
     for attempt in range(max_retries):
         try:
             return func()
@@ -97,14 +91,14 @@ def execute_with_retry(func, max_retries=5, base_delay=1.0):
                 raise e
 
 # ==========================================
-# 2. Google API 連線整合
+# 2. Google API 連線 (Thread-Safe Fix)
 # ==========================================
 
+# [SRE Fix] 這是原本的 Cache 版本，給 UI 顯示用 (讀取 Sheet)
 @st.cache_resource
-def get_credentials():
+def get_credentials_cached():
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
     if "gcp_service_account" not in st.secrets:
-        st.error("❌ 找不到 secrets 設定 (gcp_service_account)")
         return None
     creds_dict = dict(st.secrets["gcp_service_account"])
     return ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
@@ -112,21 +106,11 @@ def get_credentials():
 @st.cache_resource
 def get_gspread_client():
     try:
-        creds = get_credentials()
+        creds = get_credentials_cached()
         if not creds: return None
         return gspread.authorize(creds)
     except Exception as e:
         st.error(f"❌ Google Sheet 連線失敗: {e}")
-        return None
-
-@st.cache_resource
-def get_drive_service():
-    try:
-        creds = get_credentials()
-        if not creds: return None
-        return build('drive', 'v3', credentials=creds, cache_discovery=False)
-    except Exception as e:
-        st.warning(f"⚠️ Google Drive 連線失敗: {e}")
         return None
 
 @st.cache_resource(ttl=3600)
@@ -136,6 +120,20 @@ def get_spreadsheet_object():
     try: return client.open_by_url(SHEET_URL)
     except Exception as e: 
         st.error(f"❌ 無法開啟試算表: {e}")
+        return None
+
+# [SRE Fix] 這是「無快取」版本，專門給 Thread 使用
+# 避免在 Thread 中呼叫 st.cache_resource 導致 Missing ScriptRunContext
+def get_drive_service_raw():
+    try:
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        if "gcp_service_account" not in st.secrets:
+            return None
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        return build('drive', 'v3', credentials=creds, cache_discovery=False)
+    except Exception as e:
+        print(f"Drive Service Error: {e}")
         return None
 
 def get_worksheet(tab_name):
@@ -161,9 +159,10 @@ def get_worksheet(tab_name):
     return None
 
 def upload_image_to_drive(file_obj, filename):
-    service = get_drive_service()
+    # [SRE Fix] 這裡改用 raw service，不使用 Streamlit Cache
+    service = get_drive_service_raw()
     if not service: 
-        print("❌ Drive Service Not Available")
+        print("❌ Drive Service Not Available (Raw)")
         return None
     
     folder_id = None
@@ -176,7 +175,6 @@ def upload_image_to_drive(file_obj, filename):
             metadata['parents'] = [folder_id]
             
         media = MediaIoBaseUpload(file_obj, mimetype='image/jpeg', resumable=True)
-        # [SRE] 使用 webViewLink 以獲得穩定的預覽連結
         file = service.files().create(body=metadata, media_body=media, fields='id,webViewLink').execute()
         return file.get('webViewLink') or f"https://drive.google.com/file/d/{file.get('id')}/view"
 
@@ -196,7 +194,7 @@ def upload_images_parallel(files_list, entry_data):
     for i, up_file in enumerate(files_list):
         up_file.seek(0)
         raw = up_file.read()
-        data = compress_image_bytes(raw) # Pass-through
+        data = compress_image_bytes(raw)
 
         safe_class = str(entry_data.get("班級", "unknown"))
         logical_fname = f"{entry_data.get('日期', '')}_{safe_class}_{i}.jpg"
@@ -205,7 +203,7 @@ def upload_images_parallel(files_list, entry_data):
         
         tasks.append((io.BytesIO(data), drive_filename, i))
 
-    # [SRE] 前台並行數限制 2，避免 429
+    # [SRE] 並行數限制 2
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         future_to_index = {
             executor.submit(upload_image_to_drive, f_obj, fname): idx 
@@ -232,18 +230,14 @@ def upload_images_parallel(files_list, entry_data):
 
 _db_lock = threading.Lock()
 
-# [SRE Fix] 移除全域連線實例。改為每次呼叫建立新連線。
-# 理由：跨執行緒共用 SQLite Connection 對象在 Python 中是不安全的 (即使有 Lock 也容易踩到 Transaction 狀態不一致)。
-# SQLite 開檔速度極快，對此應用場景來說，每次 connect 是最安全的解法。
 def get_new_db_connection():
     try:
         conn = sqlite3.connect(
             QUEUE_DB_PATH, 
             check_same_thread=False, 
             timeout=30.0, 
-            isolation_level=None # [SRE] 手動控制 Transaction
+            isolation_level=None
         )
-        # 設定 WAL 模式與 Timeout (每次連線都確保設定)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA busy_timeout=30000;")
         conn.execute("PRAGMA synchronous=NORMAL;")
@@ -253,7 +247,6 @@ def get_new_db_connection():
         return None
 
 def init_db_if_needed():
-    """初始化資料庫表格"""
     with _db_lock:
         conn = get_new_db_connection()
         if conn:
@@ -274,15 +267,9 @@ def init_db_if_needed():
             except Exception as e:
                 print(f"[INIT ERROR] {e}")
 
-# 在 import 時初始化一次 Schema 即可
 init_db_if_needed()
 
 def recover_stale_tasks():
-    """
-    [SRE Fix] 殭屍任務回收機制
-    當 Worker 啟動時，檢查是否有 'RUNNING' 狀態的任務。
-    如果有，代表上次 Worker 意外崩潰，將其重置為 'RETRY' 以便重新執行。
-    """
     with _db_lock:
         conn = get_new_db_connection()
         if not conn: return
@@ -295,14 +282,13 @@ def recover_stale_tasks():
             count = cur.rowcount
             conn.commit()
             if count > 0:
-                print(f"♻️  已復原 {count} 筆殭屍任務 (RUNNING -> RETRY)")
+                print(f"♻️  已復原 {count} 筆殭屍任務")
         except Exception as e:
             print(f"[RECOVERY ERROR] {e}")
         finally:
             conn.close()
 
 def enqueue_task(task_type: str, payload: dict) -> str:
-    # Lazy Start
     ensure_worker_started()
     
     task_id = str(uuid.uuid4())
@@ -344,7 +330,6 @@ def get_queue_metrics():
                 elif status == 'FAILED': metrics["failed"] = count
                 elif status == 'RUNNING': metrics["running"] = count
             
-            # [SRE Fix] 增加監控 RUNNING 的滯留時間，這對 Debug 很有用
             cur.execute("SELECT MIN(created_ts) FROM task_queue WHERE status IN ('PENDING', 'RETRY', 'RUNNING')")
             row = cur.fetchone()
             oldest_ts_str = row[0] if row else None
@@ -365,14 +350,6 @@ def get_queue_metrics():
     return metrics
 
 def fetch_next_task(max_attempts: int = 6):
-    """
-    [SRE Atomic Claim - Final Defensive Version]
-    1. BEGIN IMMEDIATE
-    2. SELECT ID
-    3. UPDATE status=RUNNING WHERE ID=? AND status IN ('PENDING', 'RETRY')
-    4. Check rowcount (Defensive)
-    5. COMMIT
-    """
     with _db_lock:
         conn = get_new_db_connection()
         if not conn: return None
@@ -400,16 +377,13 @@ def fetch_next_task(max_attempts: int = 6):
             task_id, task_type, created_ts, payload_json, status, attempts = row
             new_attempts = attempts + 1
             
-            # [SRE Fix] 防禦性更新：再次確認狀態是否符合，避免極端 Race Condition
             cur.execute(
                 "UPDATE task_queue SET status = 'RUNNING', attempts = ? WHERE id = ? AND status IN ('PENDING', 'RETRY')",
                 (new_attempts, task_id)
             )
             
             if cur.rowcount == 0:
-                # 狀態被其他線程改變了 (雖然有 Lock 不太可能，但這是 Best Practice)
                 conn.rollback()
-                print(f"[WARN] Task {task_id} claim failed (state changed)")
                 return None
             
             conn.commit()
@@ -535,11 +509,10 @@ def process_task_wrapper(task, max_attempts):
         print(f"✅ Task {task_id} 完成")
     else:
         status = "FAILED" if attempts >= max_attempts else "RETRY"
-        print(f"⚠️ Task {task_id} 失敗 ({attempts}/{max_attempts}): {err_msg}")
+        print(f"⚠️ Task {task_id} 失敗: {err_msg}")
         update_task_status(task_id, status, err_msg or "unknown")
 
 def background_worker(stop_event: threading.Event | None = None):
-    # [SRE Fix] 啟動時先復原殭屍任務
     recover_stale_tasks()
     
     max_attempts = 6
@@ -572,7 +545,7 @@ def background_worker(stop_event: threading.Event | None = None):
             future = executor.submit(process_task_wrapper, task, max_attempts)
             futures.append(future)
 
-# --- Phoenix Keeper (不死鳥機制) ---
+# --- Phoenix Keeper ---
 _worker_lock = threading.Lock()
 _worker_thread = None
 _worker_stop_event = None
@@ -685,7 +658,6 @@ def save_appeal(entry, proof_file=None):
             st.error("❌ 佐證照片為空檔案")
             return False
         
-        # 存到系統暫存區
         logical_fname = f"Appeal_{entry.get('班級', '')}_{datetime.now(TW_TZ).strftime('%H%M%S')}.jpg"
         tmp_fname = f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}_{logical_fname}"
         local_path = os.path.join(IMG_DIR, tmp_fname)
