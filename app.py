@@ -20,8 +20,6 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
-from PIL import Image
-
 # --- 1. 網頁設定 ---
 st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
 
@@ -31,49 +29,6 @@ try:
     # 0. 基礎設定與時區
     # ==========================================
     TW_TZ = pytz.timezone('Asia/Taipei')
-
-    def compress_image_bytes(raw: bytes, max_side: int = 1600, quality: int = 75) -> bytes:
-        """Shrink & recompress images before uploading to Drive."""
-        im = Image.open(io.BytesIO(raw))
-        im = im.convert("RGB")
-        w, h = im.size
-        scale = min(1.0, max_side / max(w, h))
-        if scale < 1.0:
-            im = im.resize((int(w * scale), int(h * scale)))
-        out = io.BytesIO()
-        im.save(out, format="JPEG", quality=quality, optimize=True)
-        return out.getvalue()
-
-
-    MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 單檔圖片 10MB 上限
-    QUEUE_DB_PATH = "task_queue_v4_wal.db"
-    
-    # Google Sheet 網址
-    SHEET_URL = "https://docs.google.com/spreadsheets/d/11BXtN3aevJls6Q2IR_IbT80-9XvhBkjbTCgANmsxqkg/edit"
-    
-    SHEET_TABS = {
-        "main": "main_data", 
-        "settings": "settings",
-        "roster": "roster",
-        "inspectors": "inspectors",
-        "duty": "duty",
-        "teachers": "teachers",
-        "appeals": "appeals"
-    }
-
-    EXPECTED_COLUMNS = [
-        "日期", "週次", "班級", "評分項目", "檢查人員",
-        "內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數",
-        "備註", "違規細項", "照片路徑", "登錄時間", "修正", "晨掃未到者", "紀錄ID"
-    ]
-
-    APPEAL_COLUMNS = [
-        "申訴日期", "班級", "違規日期", "違規項目", "原始扣分", "申訴理由", "佐證照片", "處理狀態", "登錄時間", "對應紀錄ID"
-    ]
-
-    # ==========================================
-    # SRE Utils: Retry & Backoff Wrapper
-    # ==========================================
     def execute_with_retry(func, max_retries=5, base_delay=1.0):
         for attempt in range(max_retries):
             try:
@@ -603,7 +558,9 @@ try:
             if not raw:
                 st.error("❌ 有照片檔案是空的，請重新選取後再送出。"); return False
             try:
-                data = compress_image_bytes(raw, max_side=1600, quality=75)
+                data = raw  # compression disabled on Streamlit Cloud
+        data = raw
+        # (raw, max_side=1600, quality=75)
             except Exception:
                 data = raw
             if len(data) > MAX_IMAGE_BYTES:
