@@ -1476,7 +1476,7 @@ try:
                         st.dataframe(final_report, column_config={
                             "總成績": st.column_config.ProgressColumn("總成績", format="%d", min_value=60, max_value=90),
                             "總扣分": st.column_config.NumberColumn("總扣分", format="%d 分")
-                        }, width="stretch"=True)
+                        }, width="stretch")
                         csv = final_report.to_csv(index=False).encode('utf-8-sig')
                         st.download_button("📥 下載 (CSV)", csv, f"report_weeks_{selected_weeks}.csv")
                     else: st.info("請選擇週次")
