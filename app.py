@@ -498,35 +498,63 @@ try:
     # 2. 資料讀寫邏輯 (前端)
     # ==========================================
 
-    @st.cache_data(ttl=60)
+@st.cache_data(ttl=60)
     def load_main_data():
         ws = get_worksheet(SHEET_TABS["main"])
         if not ws:
             return pd.DataFrame(columns=EXPECTED_COLUMNS)
         try:
-            data = ws.get_all_records()
-            df = pd.DataFrame(data)
+            # --- [修改開始] 只讀取最後 1000 筆資料 (加上標題列) ---
+            
+            # 1. 為了省流量，我們先只抓第一欄(日期)來確認目前總共有幾列
+            #    注意：這不會消耗太多記憶體，因為只抓一欄
+            date_col = ws.col_values(1) 
+            total_rows = len(date_col)
+            
+            # 2. 設定我們要抓的範圍：最後 1000 筆
+            #    如果總行數少於 1000，就從第 2 列開始抓 (第1列是標題)
+            FETCH_COUNT = 800 
+            start_row = max(2, total_rows - FETCH_COUNT + 1)
+            
+            if total_rows < 2:
+                # 如果只有標題或全空
+                return pd.DataFrame(columns=EXPECTED_COLUMNS)
+
+            # 3. 抓取標題 (永遠是第 1 列)
+            headers = EXPECTED_COLUMNS # 我們直接用程式設定好的欄位，比較穩
+
+            # 4. 抓取資料 (從 start_row 到 total_rows)
+            #    假設你的資料最寬到第 19 欄 (S欄)，這裡設大一點到 Z 比較保險
+            data_range = f"A{start_row}:Z{total_rows}"
+            raw_data = ws.get(data_range)
+
+            # 5. 轉成 DataFrame
+            df = pd.DataFrame(raw_data, columns=headers[:len(raw_data[0])] if raw_data else headers)
+            
+            # --- [修改結束] ---
+
             if df.empty:
                 return pd.DataFrame(columns=EXPECTED_COLUMNS)
 
+            # 補齊可能缺少的欄位 (防呆)
             for col in EXPECTED_COLUMNS:
                 if col not in df.columns:
                     df[col] = ""
+
+            # ... (以下原本的資料整理邏輯保持不變，例如轉數字、轉字串) ...
+            
+            # [記得加上剛才教你的防崩潰修正]
+            text_cols = ["備註", "違規細項", "班級", "檢查人員", "修正", "晨掃未到者"]
+            for col in text_cols:
+                if col in df.columns:
+                    df[col] = df[col].fillna("").astype(str)
 
             if "紀錄ID" not in df.columns:
                 df["紀錄ID"] = df.index.astype(str)
             else:
                 df["紀錄ID"] = df["紀錄ID"].astype(str)
-
-            if "照片路徑" in df.columns:
-                df["照片路徑"] = df["照片路徑"].fillna("").astype(str)
-
-            text_cols = ["備註", "違規細項", "班級", "檢查人員", "修正", "晨掃未到者"]
-            for col in text_cols:
-                if col in df.columns:
-                    # 把 NaN 變成空字串，並強制轉為 str 型別
-                    df[col] = df[col].fillna("").astype(str)
-
+            
+            # 數字轉型
             numeric_cols = ["內掃原始分", "外掃原始分", "垃圾原始分", "晨間打掃原始分", "手機人數"]
             for col in numeric_cols:
                 if col in df.columns:
