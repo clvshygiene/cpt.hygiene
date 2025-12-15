@@ -15,6 +15,7 @@ import concurrent.futures
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, date, timedelta
+from datetime import timezone
 import pytz
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -217,7 +218,7 @@ try:
     def enqueue_task(task_type: str, payload: dict) -> str:
         conn = get_queue_connection()
         task_id = str(uuid.uuid4())
-        created_ts = datetime.utcnow().isoformat() + "Z"
+        created_ts = datetime.now(timezone.utc).isoformat()
         payload_json = json.dumps(payload, ensure_ascii=False)
 
         with _queue_lock:
@@ -434,7 +435,7 @@ try:
 
     def background_worker(stop_event: threading.Event | None = None):
         max_attempts = 6
-        MAX_WORKERS = 4
+        MAX_WORKERS = 1
         print(f"🚀 極速版背景工作者啟動 (Workers: {MAX_WORKERS})...")
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -998,7 +999,7 @@ try:
                     trash_cat = st.radio("違規項目", ["一般垃圾", "紙類", "網袋", "其他回收"], horizontal=True)
                     with st.form("trash_form"):
                         t_data = [{"班級": c, "無簽名": False, "無分類": False} for c in all_classes]
-                        edited_t_df = st.data_editor(pd.DataFrame(t_data), hide_index=True, height=400, use_container_width=True)
+                        edited_t_df = st.data_editor(pd.DataFrame(t_data), hide_index=True, height=400, width="stretch")
                         if st.form_submit_button("送出"):
                             base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": False}
                             cnt = 0
@@ -1078,7 +1079,7 @@ try:
                             files = st.file_uploader("📸 違規照片 (若有扣分則必填)", accept_multiple_files=True, key=f"file_{selected_class}")
                             
                             st.write("") # 間距
-                            if st.form_submit_button("🚀 送出評分", use_container_width=True):
+                            if st.form_submit_button("🚀 送出評分", width="stretch"):
                                 # [SRE Logic] 強制照片檢查閘道
                                 total_deduction = in_s + out_s
                                 if total_deduction > 0 and not files:
@@ -1361,7 +1362,7 @@ try:
                         st.dataframe(final_report, column_config={
                             "總成績": st.column_config.ProgressColumn("總成績", format="%d", min_value=60, max_value=90),
                             "總扣分": st.column_config.NumberColumn("總扣分", format="%d 分")
-                        }, use_container_width=True)
+                        }, width="stretch")
                         csv = final_report.to_csv(index=False).encode('utf-8-sig')
                         st.download_button("📥 下載 (CSV)", csv, f"report_weeks_{selected_weeks}.csv")
                     else: st.info("請選擇週次")
@@ -1379,7 +1380,7 @@ try:
                         detail_df = detail_df[detail_df["該筆扣分"] > 0]
                         display_cols = ["日期", "班級", "評分項目", "該筆扣分", "備註", "檢查人員", "違規細項", "紀錄ID"]
                         detail_df = detail_df[display_cols].sort_values(["日期", "班級"])
-                        st.dataframe(detail_df, use_container_width=True)
+                        st.dataframe(detail_df, width="stretch")
                         csv_detail = detail_df.to_csv(index=False).encode('utf-8-sig')
                         st.download_button("📥 下載 (CSV)", csv_detail, f"detail_log_{s_weeks}.csv")
                     else: st.info("請選擇週次")
@@ -1500,7 +1501,7 @@ try:
                 if status == "success":
                     st.write(f"應到: {len(duty_list)} 人")
                     with st.form("m_form"):
-                        edited = st.data_editor(pd.DataFrame(duty_list), hide_index=True, use_container_width=True)
+                        edited = st.data_editor(pd.DataFrame(duty_list), hide_index=True, width="stretch")
                         score = st.number_input("扣分", min_value=1, value=1)
                         if st.form_submit_button("送出"):
                             base = {"日期": m_date, "週次": m_week, "檢查人員": "衛生組", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": False}
