@@ -498,7 +498,7 @@ try:
     # 2. 資料讀寫邏輯 (前端)
     # ==========================================
 
-@st.cache_data(ttl=60)
+    @st.cache_data(ttl=60)
     def load_main_data():
         ws = get_worksheet(SHEET_TABS["main"])
         if not ws:
