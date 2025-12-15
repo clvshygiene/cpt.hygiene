@@ -521,6 +521,12 @@ try:
             if "照片路徑" in df.columns:
                 df["照片路徑"] = df["照片路徑"].fillna("").astype(str)
 
+            text_cols = ["備註", "違規細項", "班級", "檢查人員", "修正", "晨掃未到者"]
+            for col in text_cols:
+                if col in df.columns:
+                    # 把 NaN 變成空字串，並強制轉為 str 型別
+                    df[col] = df[col].fillna("").astype(str)
+
             numeric_cols = ["內掃原始分", "外掃原始分", "垃圾原始分", "晨間打掃原始分", "手機人數"]
             for col in numeric_cols:
                 if col in df.columns:
