@@ -20,6 +20,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 # --- 1. 網頁設定 ---
 st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
@@ -479,6 +480,7 @@ try:
             
             # 重啟 Worker
             t = threading.Thread(target=background_worker, args=(stop_event,), daemon=True)
+            add_script_run_ctx(t)
             t.start()
             
             # 更新 Manager 狀態
