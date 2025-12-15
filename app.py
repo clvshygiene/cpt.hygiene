@@ -1213,7 +1213,7 @@ try:
         recent_errs = metrics["recent_errors"]
         
         with st.container(border=True):
-            st.write("#### 📡 SRE 監控面板")
+            st.write("#### 📡監控面板📡")
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Pending Queue", q_count, delta="Safe" if q_count < 50 else "High Load", delta_color="inverse")
             m2.metric("Retry Tasks", metrics["retry"])
