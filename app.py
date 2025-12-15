@@ -569,6 +569,45 @@ try:
         
         return df[EXPECTED_COLUMNS]
 
+    def load_full_semester_data_for_export():
+        """
+        [SRE] 期末結算專用：一次讀取 Google Sheet 所有資料。
+        """
+        ws = get_worksheet(SHEET_TABS["main"])
+        if not ws:
+            return pd.DataFrame(columns=EXPECTED_COLUMNS)
+    
+        try:
+            # 這裡使用 get_all_records 讀取全部
+            data = ws.get_all_records()
+            df = pd.DataFrame(data)
+        
+            if df.empty:
+                return pd.DataFrame(columns=EXPECTED_COLUMNS)
+
+            # 補齊欄位
+            for col in EXPECTED_COLUMNS:
+                if col not in df.columns:
+                    df[col] = ""
+
+            # 強制轉字串
+            text_cols = ["備註", "違規細項", "班級", "檢查人員", "修正", "晨掃未到者", "照片路徑", "紀錄ID"]
+            for col in text_cols:
+                if col in df.columns:
+                    df[col] = df[col].fillna("").astype(str)
+
+            # 強制轉數字
+            numeric_cols = ["內掃原始分", "外掃原始分", "垃圾原始分", "晨間打掃原始分", "手機人數", "週次"]
+            for col in numeric_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+
+            return df[EXPECTED_COLUMNS]
+
+        except Exception as e:
+            st.error(f"全量讀取失敗: {e}")
+            return pd.DataFrame()
+    
     def save_entry(new_entry, uploaded_files=None):
         if "日期" in new_entry and new_entry["日期"]:
             new_entry["日期"] = str(new_entry["日期"])
@@ -1368,7 +1407,48 @@ try:
                             if p["done"]: st.write(f"✅ {p['name']}")
 
             with tab1: # 成績總表
-                st.subheader("成績總表")
+                st.subheader("📊 成績總表")
+                
+                # --- [新增] 期末結算專區 ---
+                with st.expander("🏆 期末結算專區 (點擊展開)", expanded=False):
+                    st.warning("⚠️ 注意：此功能會讀取整個學期的所有資料，速度較慢。請勿在多人使用時點擊。")
+                    if st.button("🚀 產生全學期總成績結算表"):
+                        with st.spinner("正在從雲端下載整學期資料... (這可能需要 30 秒)..."):
+                            full_df = load_full_semester_data_for_export()
+                            
+                            if not full_df.empty:
+                                # 計算成績
+                                full_df["內掃結算"] = full_df["內掃原始分"].apply(lambda x: min(x, 2))
+                                full_df["外掃結算"] = full_df["外掃原始分"].apply(lambda x: min(x, 2))
+                                full_df["垃圾結算"] = full_df["垃圾原始分"].apply(lambda x: min(x, 2))
+                                full_df["每日總扣分"] = (full_df["內掃結算"] + full_df["外掃結算"] + 
+                                                      full_df["垃圾結算"] + full_df["晨間打掃原始分"] + full_df["手機人數"])
+                                
+                                violation_report = full_df.groupby("班級").agg({
+                                    "內掃結算": "sum", "外掃結算": "sum", "垃圾結算": "sum",
+                                    "晨間打掃原始分": "sum", "手機人數": "sum", "每日總扣分": "sum"
+                                }).reset_index()
+                                violation_report.columns = ["班級", "內掃扣分", "外掃扣分", "垃圾扣分", "晨掃扣分", "手機扣分", "總扣分"]
+                                
+                                all_classes_df = pd.DataFrame(all_classes, columns=["班級"])
+                                final_report = pd.merge(all_classes_df, violation_report, on="班級", how="left").fillna(0)
+                                final_report["總成績"] = 90 - final_report["總扣分"]
+                                final_report = final_report.sort_values("總成績", ascending=False)
+                                
+                                st.success(f"✅ 計算完成！共讀取 {len(full_df)} 筆紀錄。")
+                                st.write("前 5 名預覽：")
+                                st.dataframe(final_report.head(5))
+                                
+                                csv = final_report.to_csv(index=False).encode('utf-8-sig')
+                                st.download_button("📥 下載全學期總成績單 (CSV)", csv, "Full_Semester_Report.csv")
+                                st.info("💡 下載完成後，建議重新整理網頁以釋放記憶體。")
+                            else:
+                                st.error("❌ 讀取不到資料")
+                
+                st.divider()
+                st.write("📋 **週次區間查詢 (僅顯示近期資料)**")
+                
+                # --- 原本的日常查詢邏輯 ---
                 df = load_main_data()
                 all_classes_df = pd.DataFrame(all_classes, columns=["班級"])
                 if not df.empty:
@@ -1396,7 +1476,7 @@ try:
                         st.dataframe(final_report, column_config={
                             "總成績": st.column_config.ProgressColumn("總成績", format="%d", min_value=60, max_value=90),
                             "總扣分": st.column_config.NumberColumn("總扣分", format="%d 分")
-                        }, width="stretch")
+                        }, use_container_width=True)
                         csv = final_report.to_csv(index=False).encode('utf-8-sig')
                         st.download_button("📥 下載 (CSV)", csv, f"report_weeks_{selected_weeks}.csv")
                     else: st.info("請選擇週次")
