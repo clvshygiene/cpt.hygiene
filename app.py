@@ -1149,8 +1149,8 @@ try:
                                     area_opts = ["", "走廊", "陽台", "黑板", "地板", "懸掛", "窗戶"]
                                     bad_opts = ["", "髒亂", "有垃圾", "頭髮圈圈", "有廚餘", "有蜘蛛網", "沒拖地"]
 
-                                    sel_b = c1.selectbox("大樓", b_opts, key=f"b_{selected_class}_{role}")
-                                    sel_f = c2.selectbox("樓層", f_opts, key=f"f_{selected_class}_{role}")
+                                    sel_b = c1.selectbox("區塊", area_opts, key=f"b_{selected_class}_{role}")
+                                    sel_f = c2.selectbox("狀況", bad_opts, key=f"f_{selected_class}_{role}")
                                     
                                     manual_note = st.text_input("📝 補充說明", placeholder="例如：黑板未擦", key=f"note_{selected_class}_{role}")
                                     parts = [x for x in [sel_b, sel_f, sel_a, sel_bad, manual_note] if x]
