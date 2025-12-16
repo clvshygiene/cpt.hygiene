@@ -1127,7 +1127,10 @@ try:
                             st.warning(f"⚠️ 系統紀錄顯示：您今天已經評過「{selected_class}」了！")
                         
                         with st.form("scoring_form", clear_on_submit=True):
-                            in_s = 0; out_s = 0; ph_c = 0; note = ""
+                            in_s = 0
+                            out_s = 0
+                            ph_c = 0
+                            note = ""
                             
                             # [SRE Fix 2] 加上 key=f"...{selected_class}"
                             # 這是解決「切換班級後欄位消失」的關鍵。
@@ -1141,6 +1144,7 @@ try:
                                     note = st.text_input("說明", placeholder="例如：黑板未擦", key=f"note_{selected_class}")
                                     ph_c = st.number_input("手機人數 (無上限)", 0, key=f"ph_{selected_class}")
                                 else: note = "【優良】"
+                                    
                             elif role == "外掃檢查":
                                 if st.radio("檢查結果", ["❌ 違規", "✨ 乾淨"], horizontal=True, key=radio_key_dynamic) == "❌ 違規":
                                     out_s = st.number_input("外掃扣分 (上限2分)", 0, key=f"out_s_{selected_class}")
@@ -1160,10 +1164,13 @@ try:
                                     ph_c = st.number_input("手機人數 (無上限)", 0, key=f"ph_{selected_class}")
                                 else: note = "【優良】"
 
+                            st.write("") # 間距
+
                             is_fix = st.checkbox("🚩 這是修正單 (複檢通過請勾選)", key=f"fix_{selected_class}")
                             files = st.file_uploader("📸 違規照片 (若有扣分則必填)", accept_multiple_files=True, key=f"file_{selected_class}")
-                            
+
                             st.write("") # 間距
+                            
                             if st.form_submit_button("🚀 送出評分", width="stretch"):
                                 # [SRE Logic] 強制照片檢查閘道
                                 total_deduction = in_s + out_s
