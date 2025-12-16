@@ -1144,17 +1144,13 @@ try:
                                     
                                     # --- 內掃地點選擇器 ---
                                     st.write("📍 快速輸入小幫手")
-                                    c1, c2, c3, c4 = st.columns(4)
+                                    c1, c2 = st.columns(2)
                                     # 定義內掃專用選項
-                                    b_opts = ["", "誠信樓", "勤學樓", "敬業樓", "樸實樓", "行政大樓", "活動中心"]
-                                    f_opts = ["", "1F", "2F", "3F", "4F", "5F", "B1", "外掃區"]
-                                    area_opts = ["", "走廊", "樓梯", "廁所", "洗手台", "教室", "玄關", "公共區"]
-                                    bad_opts = ["", "髒亂", "有垃圾", "積水", "有灰塵", "未刷洗", "堆放雜物", "未分類"]
+                                    area_opts = ["", "走廊", "陽台", "黑板", "地板", "懸掛", "窗戶"]
+                                    bad_opts = ["", "髒亂", "有垃圾", "頭髮圈圈", "有廚餘", "有蜘蛛網", "沒拖地"]
 
                                     sel_b = c1.selectbox("大樓", b_opts, key=f"b_{selected_class}_{role}")
                                     sel_f = c2.selectbox("樓層", f_opts, key=f"f_{selected_class}_{role}")
-                                    sel_a = c3.selectbox("區域", area_opts, key=f"a_{selected_class}_{role}")
-                                    sel_bad = c4.selectbox("狀況", bad_opts, key=f"bad_{selected_class}_{role}")
                                     
                                     manual_note = st.text_input("📝 補充說明", placeholder="例如：黑板未擦", key=f"note_{selected_class}_{role}")
                                     parts = [x for x in [sel_b, sel_f, sel_a, sel_bad, manual_note] if x]
@@ -1179,7 +1175,7 @@ try:
                                     b_opts = ["", "誠信樓A棟", "誠信樓B棟", "勤學樓靠柏油路", "勤學樓靠資收場", "敬業樓", "樸實樓", "操場", "資收場"]
                                     f_opts = ["", "1樓", "2樓", "3樓", "4樓", "5樓", "6樓"]
                                     area_opts = ["", "走廊", "樓梯", "廁所", "露臺", "天花板"] 
-                                    bad_opts = ["", "很髒", "沒掃", "沒拖", "有蜘蛛網", "有灰塵", "有人工垃圾"]
+                                    bad_opts = ["", "很髒", "沒掃", "沒拖", "有蜘蛛網", "有灰塵", "有人工垃圾", "頭髮圈圈", "大便殘渣"]
 
                                     sel_b = c1.selectbox("大樓", b_opts, key=f"b_{selected_class}_{role}")
                                     sel_f = c2.selectbox("樓層", f_opts, key=f"f_{selected_class}_{role}")
@@ -1199,7 +1195,7 @@ try:
                             # ==========================
                             st.write("---") 
                             
-                            is_fix = st.checkbox("🚩 這是修正單 (複檢通過請勾選)", key=f"fix_{selected_class}")
+                            is_fix = st.checkbox("🚩 這是修正單 (上一筆輸錯，這筆重key才要按)", key=f"fix_{selected_class}")
                             files = st.file_uploader("📸 違規照片 (若有扣分則必填)", accept_multiple_files=True, key=f"file_{selected_class}")
                             
                             st.write("") 
