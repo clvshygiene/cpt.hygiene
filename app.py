@@ -1127,62 +1127,107 @@ try:
                             st.warning(f"⚠️ 系統紀錄顯示：您今天已經評過「{selected_class}」了！")
                         
                         with st.form("scoring_form", clear_on_submit=True):
+                            # 1. 【防呆】先將變數初始化，避免等等沒選到時報錯
                             in_s = 0
                             out_s = 0
                             ph_c = 0
                             note = ""
-                            
-                            # [SRE Fix 2] 加上 key=f"...{selected_class}"
-                            # 這是解決「切換班級後欄位消失」的關鍵。
-                            # 讓 Streamlit 把每一班的「結果」按鈕視為獨立元件，切換班級時強制重置為預設值（第一個選項）。
-                            radio_key_dynamic = f"status_radio_{selected_class}_{role}"
-                            
+
+                            # ==========================
+                            #  A. 內掃檢查邏輯
+                            # ==========================
                             if role == "內掃檢查":
-                                # 預設選項放在第一個 ["❌ 違規", "✨ 乾淨"]，這樣切換新班級時預設會展開扣分欄位，避免誤會
+                                radio_key_dynamic = f"status_radio_{selected_class}_{role}"
+                                # 預設選項放在第一個
                                 if st.radio("檢查結果", ["❌ 違規", "✨ 乾淨"], horizontal=True, key=radio_key_dynamic) == "❌ 違規":
                                     in_s = st.number_input("內掃扣分 (上限2分)", 0, key=f"in_s_{selected_class}")
-                                    note = st.text_input("說明", placeholder="例如：黑板未擦", key=f"note_{selected_class}")
-                                    ph_c = st.number_input("手機人數 (無上限)", 0, key=f"ph_{selected_class}")
-                                else: note = "【優良】"
                                     
-                            elif role == "外掃檢查":
-                                if st.radio("檢查結果", ["❌ 違規", "✨ 乾淨"], horizontal=True, key=radio_key_dynamic) == "❌ 違規":
-                                    out_s = st.number_input("外掃扣分 (上限2分)", 0, key=f"out_s_{selected_class}")
-                                    st.write("📍快速輸入小幫手")
-                                    b_opts = ["", "誠信樓A棟", "誠信樓B棟", "勤學樓靠柏油路", "勤學樓靠資收場", "敬業樓", "樸實樓", "操場", "資收場"]
-                                    f_opts = ["", "1樓", "2樓", "3樓", "4樓", "5樓", "6樓"]
-                                    area_opt = ["", "走廊", "樓梯", "廁所", "露臺", "天花板"]
-                                    bad_opts = ["", "很髒", "沒掃", "沒拖", "有蜘蛛網", "有灰塵", "有人工垃圾"]
+                                    # --- 內掃地點選擇器 ---
+                                    st.write("📍 快速輸入小幫手")
                                     c1, c2, c3, c4 = st.columns(4)
+                                    # 定義內掃專用選項
+                                    b_opts = ["", "誠信樓", "勤學樓", "敬業樓", "樸實樓", "行政大樓", "活動中心"]
+                                    f_opts = ["", "1F", "2F", "3F", "4F", "5F", "B1", "外掃區"]
+                                    area_opts = ["", "走廊", "樓梯", "廁所", "洗手台", "教室", "玄關", "公共區"]
+                                    bad_opts = ["", "髒亂", "有垃圾", "積水", "有灰塵", "未刷洗", "堆放雜物", "未分類"]
+
                                     sel_b = c1.selectbox("大樓", b_opts, key=f"b_{selected_class}_{role}")
                                     sel_f = c2.selectbox("樓層", f_opts, key=f"f_{selected_class}_{role}")
                                     sel_a = c3.selectbox("區域", area_opts, key=f"a_{selected_class}_{role}")
                                     sel_bad = c4.selectbox("狀況", bad_opts, key=f"bad_{selected_class}_{role}")
+                                    
+                                    manual_note = st.text_input("📝 補充說明", placeholder="例如：黑板未擦", key=f"note_{selected_class}_{role}")
+                                    parts = [x for x in [sel_b, sel_f, sel_a, sel_bad, manual_note] if x]
+                                    note = " ".join(parts)
+                                    
+                                    ph_c = st.number_input("手機人數 (無上限)", 0, key=f"ph_{selected_class}")
+                                else:
+                                    note = "【優良】"
+
+                            # ==========================
+                            #  B. 外掃檢查邏輯
+                            # ==========================
+                            elif role == "外掃檢查":
+                                radio_key_dynamic = f"status_radio_{selected_class}_{role}"
+                                if st.radio("檢查結果", ["❌ 違規", "✨ 乾淨"], horizontal=True, key=radio_key_dynamic) == "❌ 違規":
+                                    out_s = st.number_input("外掃扣分 (上限2分)", 0, key=f"out_s_{selected_class}")
+                                    
+                                    # --- 外掃地點選擇器 ---
+                                    st.write("📍 快速輸入小幫手")
+                                    c1, c2, c3, c4 = st.columns(4)
+                                    # 定義外掃專用選項
+                                    b_opts = ["", "誠信樓A棟", "誠信樓B棟", "勤學樓靠柏油路", "勤學樓靠資收場", "敬業樓", "樸實樓", "操場", "資收場"]
+                                    f_opts = ["", "1樓", "2樓", "3樓", "4樓", "5樓", "6樓"]
+                                    area_opts = ["", "走廊", "樓梯", "廁所", "露臺", "天花板"] 
+                                    bad_opts = ["", "很髒", "沒掃", "沒拖", "有蜘蛛網", "有灰塵", "有人工垃圾"]
+
+                                    sel_b = c1.selectbox("大樓", b_opts, key=f"b_{selected_class}_{role}")
+                                    sel_f = c2.selectbox("樓層", f_opts, key=f"f_{selected_class}_{role}")
+                                    sel_a = c3.selectbox("區域", area_opts, key=f"a_{selected_class}_{role}")
+                                    sel_bad = c4.selectbox("狀況", bad_opts, key=f"bad_{selected_class}_{role}")
+                                    
                                     manual_note = st.text_input("📝 補充說明", placeholder="例如：靠近飲水機", key=f"note_{selected_class}_{role}")
                                     parts = [x for x in [sel_b, sel_f, sel_a, sel_bad, manual_note] if x]
                                     note = " ".join(parts)
+                                    
                                     ph_c = st.number_input("手機人數 (無上限)", 0, key=f"ph_{selected_class}")
-                                else: note = "【優良】"
+                                else:
+                                    note = "【優良】"
 
-                            st.write("") # 間距
-
+                            # ==========================
+                            #  C. 共用區塊 (這裡一定要靠左，不能縮進去！)
+                            # ==========================
+                            st.write("---") 
+                            
                             is_fix = st.checkbox("🚩 這是修正單 (複檢通過請勾選)", key=f"fix_{selected_class}")
                             files = st.file_uploader("📸 違規照片 (若有扣分則必填)", accept_multiple_files=True, key=f"file_{selected_class}")
-
-                            st.write("") # 間距
                             
+                            st.write("") 
+
+                            # 送出按鈕 (這裡也要靠左！)
                             if st.form_submit_button("🚀 送出評分", width="stretch"):
-                                # [SRE Logic] 強制照片檢查閘道
                                 total_deduction = in_s + out_s
+                                
                                 if total_deduction > 0 and not files:
                                     st.error("🛑 【資料不完整】有扣分但未上傳照片！系統拒絕收件。")
                                     st.stop() 
 
                                 save_entry(
-                                    {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": selected_class, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note},
+                                    {
+                                        "日期": input_date, 
+                                        "週次": week_num, 
+                                        "檢查人員": inspector_name, 
+                                        "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), 
+                                        "修正": is_fix, 
+                                        "班級": selected_class, 
+                                        "評分項目": role, 
+                                        "內掃原始分": in_s, 
+                                        "外掃原始分": out_s, 
+                                        "手機人數": ph_c, 
+                                        "備註": note 
+                                    },
                                     uploaded_files=files
                                 )
-                                # 更新狀態並刷新
                                 st.session_state["last_submitted_class"] = selected_class
                                 st.rerun()
 
