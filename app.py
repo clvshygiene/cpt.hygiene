@@ -1144,7 +1144,19 @@ try:
                             elif role == "外掃檢查":
                                 if st.radio("檢查結果", ["❌ 違規", "✨ 乾淨"], horizontal=True, key=radio_key_dynamic) == "❌ 違規":
                                     out_s = st.number_input("外掃扣分 (上限2分)", 0, key=f"out_s_{selected_class}")
-                                    note = st.text_input("說明", placeholder="例如：走廊有垃圾", key=f"note_{selected_class}")
+                                    st.write("📍快速輸入小幫手")
+                                    b_opts = ["", "誠信樓A棟", "誠信樓B棟", "勤學樓靠柏油路", "勤學樓靠資收場", "敬業樓", "樸實樓", "操場", "資收場"]
+                                    f_opts = ["", "1樓", "2樓", "3樓", "4樓", "5樓", "6樓"]
+                                    area_opt = ["", "走廊", "樓梯", "廁所", "露臺", "天花板"]
+                                    bad_opts = ["", "很髒", "沒掃", "沒拖", "有蜘蛛網", "有灰塵", "有人工垃圾"]
+                                    c1, c2, c3, c4 = st.columns(4)
+                                    sel_b = c1.selectbox("大樓", b_opts, key=f"b_{selected_class}_{role}")
+                                    sel_f = c2.selectbox("樓層", f_opts, key=f"f_{selected_class}_{role}")
+                                    sel_a = c3.selectbox("區域", area_opts, key=f"a_{selected_class}_{role}")
+                                    sel_bad = c4.selectbox("狀況", bad_opts, key=f"bad_{selected_class}_{role}")
+                                    manual_note = st.text_input("📝 補充說明", placeholder="例如：靠近飲水機", key=f"note_{selected_class}_{role}")
+                                    parts = [x for x in [sel_b, sel_f, sel_a, sel_bad, manual_note] if x]
+                                    note = " ".join(parts)
                                     ph_c = st.number_input("手機人數 (無上限)", 0, key=f"ph_{selected_class}")
                                 else: note = "【優良】"
 
