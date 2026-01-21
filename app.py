@@ -550,72 +550,65 @@ try:
         deadline = current_date
         return today <= deadline
 
-    @st.cache_data(ttl=60)
+    @st.cache_data(ttl=300)
     def load_main_data():
-        ws = get_worksheet(SHEET_TABS["main"])
-        if not ws:
-            return pd.DataFrame(columns=EXPECTED_COLUMNS)
-        try:
-            date_col = ws.col_values(1) 
-            total_rows = len(date_col)
-            FETCH_COUNT = 800 
-            start_row = max(2, total_rows - FETCH_COUNT + 1)
-            if total_rows < 2: return pd.DataFrame(columns=EXPECTED_COLUMNS)
-
-            headers = EXPECTED_COLUMNS
-            data_range = f"A{start_row}:Z{total_rows}"
-            raw_data = ws.get(data_range)
-            df = pd.DataFrame(raw_data, columns=headers[:len(raw_data[0])] if raw_data else headers)
-
-            if df.empty: return pd.DataFrame(columns=EXPECTED_COLUMNS)
-
-            for col in EXPECTED_COLUMNS:
-                if col not in df.columns: df[col] = ""
-
-            text_cols = ["備註", "違規細項", "班級", "檢查人員", "修正", "晨掃未到者"]
-            for col in text_cols:
-                if col in df.columns: df[col] = df[col].fillna("").astype(str)
-
-            if "紀錄ID" not in df.columns: df["紀錄ID"] = df.index.astype(str)
-            else: df["紀錄ID"] = df["紀錄ID"].astype(str)
-            
-            numeric_cols = ["內掃原始分", "外掃原始分", "垃圾原始分", "晨間打掃原始分", "手機人數"]
-            for col in numeric_cols:
-                if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-
-            if "週次" in df.columns:
-                df["週次"] = pd.to_numeric(df["週次"], errors="coerce").fillna(0).astype(int)
-      
-        except Exception as e:
-            st.error(f"讀取資料錯誤: {e}")
-            return pd.DataFrame(columns=EXPECTED_COLUMNS)
-        
-        return df[EXPECTED_COLUMNS]
-
-    def load_full_semester_data_for_export():
         ws = get_worksheet(SHEET_TABS["main"])
         if not ws: return pd.DataFrame(columns=EXPECTED_COLUMNS)
         try:
             data = ws.get_all_records()
             df = pd.DataFrame(data)
             if df.empty: return pd.DataFrame(columns=EXPECTED_COLUMNS)
-
+        
+            # ====== 🛠️ 修正：強制清除班級名稱的前後空白 (解決資料看不到的問題) ======
+            if "班級" in df.columns:
+                # 將班級轉為字串，並去除前後空白
+                df["班級"] = df["班級"].astype(str).str.strip()
+            # =================================================================
+        
             for col in EXPECTED_COLUMNS:
                 if col not in df.columns: df[col] = ""
+            
+            if "紀錄ID" not in df.columns or df["紀錄ID"].all() == "":
+                df["紀錄ID"] = df.index.astype(str)
 
-            text_cols = ["備註", "違規細項", "班級", "檢查人員", "修正", "晨掃未到者", "照片路徑", "紀錄ID"]
-            for col in text_cols:
-                if col in df.columns: df[col] = df[col].fillna("").astype(str)
-
-            numeric_cols = ["內掃原始分", "外掃原始分", "垃圾原始分", "晨間打掃原始分", "手機人數", "週次"]
+            numeric_cols = ["內掃原始分", "外掃原始分", "垃圾原始分", "晨間打掃原始分", "手機人數"]
             for col in numeric_cols:
-                if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
+        
+            if "週次" in df.columns:
+                df["週次"] = pd.to_numeric(df["週次"], errors='coerce').fillna(0).astype(int)
 
+            if "修正" in df.columns:
+                df["修正"] = df["修正"].astype(str).apply(lambda x: True if x.upper() == "TRUE" else False)
+            
             return df[EXPECTED_COLUMNS]
+        except: return pd.DataFrame(columns=EXPECTED_COLUMNS)
 
-        except Exception as e:
-            st.error(f"全量讀取失敗: {e}")
-            return pd.DataFrame()
+        def load_full_semester_data_for_export():
+            ws = get_worksheet(SHEET_TABS["main"])
+            if not ws: return pd.DataFrame(columns=EXPECTED_COLUMNS)
+            try:
+                data = ws.get_all_records()
+                df = pd.DataFrame(data)
+                if df.empty: return pd.DataFrame(columns=EXPECTED_COLUMNS)
+
+                for col in EXPECTED_COLUMNS:
+                    if col not in df.columns: df[col] = ""
+
+                text_cols = ["備註", "違規細項", "班級", "檢查人員", "修正", "晨掃未到者", "照片路徑", "紀錄ID"]
+                for col in text_cols:
+                    if col in df.columns: df[col] = df[col].fillna("").astype(str)
+
+                numeric_cols = ["內掃原始分", "外掃原始分", "垃圾原始分", "晨間打掃原始分", "手機人數", "週次"]
+                for col in numeric_cols:
+                    if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+
+                return df[EXPECTED_COLUMNS]
+
+            except Exception as e:
+                st.error(f"全量讀取失敗: {e}")
+                return pd.DataFrame()
     
     def save_entry(new_entry, uploaded_files=None):
         if "日期" in new_entry and new_entry["日期"]:
