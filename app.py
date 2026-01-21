@@ -92,24 +92,25 @@ try:
         creds_dict = dict(st.secrets["gcp_service_account"])
         return ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 
-    @st.cache_resource
+    # 移除 @st.cache_resource
     def get_gspread_client():
         try:
             creds = get_credentials()
             if not creds: return None
             return gspread.authorize(creds)
         except Exception as e:
-            st.error(f"❌ Google Sheet 連線失敗: {e}")
+            # 建議改用 print 以免錯誤訊息洗版前台
+            print(f"Connection Error: {e}") 
             return None
 
-    @st.cache_resource
+    # 移除 @st.cache_resource
     def get_drive_service():
         try:
             creds = get_credentials()
             if not creds: return None
             return build('drive', 'v3', credentials=creds, cache_discovery=False)
         except Exception as e:
-            st.warning(f"⚠️ Google Drive 連線失敗: {e}")
+            print(f"Drive Connection Error: {e}")
             return None
 
     @st.cache_resource(ttl=21600)
