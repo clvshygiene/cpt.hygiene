@@ -113,13 +113,14 @@ try:
             print(f"Drive Connection Error: {e}")
             return None
 
-    @st.cache_resource(ttl=21600)
+    # 移除快取，確保每次都拿新的連線
     def get_spreadsheet_object():
-        client = get_gspread_client()
+        client = get_gspread_client() # 這會拿到全新的 client
         if not client: return None
         try: return client.open_by_url(SHEET_URL)
-        except Exception as e: st.error(f"❌ 無法開啟試算表: {e}")
-        return None
+        except Exception as e: 
+            print(f"Spreadsheet Error: {e}")
+            return None
 
     def get_worksheet(tab_name):
         max_retries = 3
