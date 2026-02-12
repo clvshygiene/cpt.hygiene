@@ -24,7 +24,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ct
 from PIL import Image  # 圖片處理核心套件
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="中壢家商，衛愛而生 V3.3 (Fix)", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="中壢家商，衛愛而生 V3.5", layout="wide", page_icon="🧹")
 
 # --- 2. 核心參數與全域設定 ---
 try:
@@ -42,11 +42,12 @@ try:
         "settings": "settings",
         "roster": "roster",
         "inspectors": "inspectors",
-        "duty": "duty",
+        "duty": "duty", # 晨間打掃輪值表
         "teachers": "teachers",
         "appeals": "appeals",
         "holidays": "holidays",
-        "service_hours": "service_hours"
+        "service_hours": "service_hours",
+        "office_areas": "office_areas" # [V3.5 新增] 外掃區域配置表
     }
 
     EXPECTED_COLUMNS = [
@@ -116,6 +117,7 @@ try:
                     if tab_name == "appeals": ws.append_row(APPEAL_COLUMNS)
                     if tab_name == "service_hours": ws.append_row(["日期", "學號", "班級", "類別", "時數", "紀錄ID"])
                     if tab_name == "holidays": ws.append_row(["日期", "說明"])
+                    if tab_name == "office_areas": ws.append_row(["區域名稱", "負責班級"]) # [V3.5] 初始化外掃表
                     return ws
             except Exception as e:
                 if "429" in str(e): 
@@ -489,6 +491,25 @@ try:
             return pd.DataFrame(), "missing_cols"
         except: return pd.DataFrame(), "error"
 
+    # [V3.5 新增] 讀取外掃區域配置表 (從 office_areas 分頁)
+    @st.cache_data(ttl=3600)
+    def load_office_area_map():
+        """
+        讀取 office_areas 分頁，回傳字典: {'教務處': '商一甲', '學務處': '資一乙', ...}
+        """
+        ws = get_worksheet(SHEET_TABS["office_areas"])
+        office_map = {}
+        if ws:
+            try:
+                records = ws.get_all_records()
+                for r in records:
+                    area = str(r.get("區域名稱", "")).strip()
+                    cls_name = str(r.get("負責班級", "")).strip()
+                    if area:
+                        office_map[area] = cls_name
+            except: pass
+        return office_map
+
     @st.cache_data(ttl=21600)
     def load_settings():
         ws = get_worksheet(SHEET_TABS["settings"])
@@ -784,92 +805,142 @@ try:
                 main_df = load_main_data()
 
                 if role == "垃圾/回收檢查":
-                    # [V3.3] 資收場電子點名板 (修正 TextColumn placeholder 錯誤)
+                    # [V3.5] 資收場電子點名板 (處室分流與精細分類)
                     st.info("🗑️ 資收場專用：電子點名模式 (有來的請打勾，未勾者可於後台結算扣分)")
                     
-                    sel_grade = st.radio("篩選年級", grades, horizontal=True)
-                    grade_classes = [c["name"] for c in structured_classes if c["grade"] == sel_grade]
+                    # 1. 選擇檢查維度：年級 (內掃) vs 各處室 (外掃)
+                    check_options = ["各處室 (外掃)"] + grades
+                    sel_filter = st.radio("篩選檢查對象", check_options, horizontal=True)
                     
+                    # 2. 準備今日紀錄 (加速比對)
                     today_records = pd.DataFrame()
                     if not main_df.empty:
                         today_str = str(input_date)
                         mask = (main_df["日期"].astype(str) == today_str) & (main_df["評分項目"] == "垃圾/回收檢查")
                         today_records = main_df[mask]
-                    
-                    rows = []
-                    for cls_name in grade_classes:
-                        cls_rec = today_records[today_records["班級"] == cls_name] if not today_records.empty else pd.DataFrame()
-                        has_in = False
-                        has_out = False
-                        out_loc = ""
-                        
-                        if not cls_rec.empty:
-                            for _, r in cls_rec.iterrows():
-                                note = str(r["備註"])
-                                if "內掃已到" in note: has_in = True
-                                if "外掃已到" in note: 
-                                    has_out = True
-                                    if "(" in note and ")" in note:
-                                        out_loc = note.split("(")[1].split(")")[0]
 
-                        rows.append({
-                            "班級": cls_name,
-                            "內掃已到": has_in,
-                            "外掃已到": has_out,
-                            "外掃區域 (選填)": out_loc
-                        })
+                    rows = []
                     
-                    editor_df = pd.DataFrame(rows)
-                    
-                    edited_df = st.data_editor(
-                        editor_df,
-                        column_config={
-                            "班級": st.column_config.TextColumn("班級", disabled=True),
-                            "內掃已到": st.column_config.CheckboxColumn("🏠 內掃", help="有拿教室垃圾來倒"),
-                            "外掃已到": st.column_config.CheckboxColumn("🏢 外掃", help="有拿處室垃圾來倒"),
-                            # [修正] 移除 placeholder 參數，避免報錯
-                            "外掃區域 (選填)": st.column_config.TextColumn("外掃地點", help="例如: 教務處")
-                        },
-                        hide_index=True,
-                        use_container_width=True,
-                        key=f"editor_{sel_grade}"
-                    )
-                    
-                    if st.button(f"💾 儲存 {sel_grade} 點名結果"):
-                        cnt = 0
-                        for index, row in edited_df.iterrows():
-                            cls = row["班級"]
-                            is_in = row["內掃已到"]
-                            is_out = row["外掃已到"]
-                            loc = row["外掃區域 (選填)"]
-                            
-                            orig_row = next((x for x in rows if x["班級"] == cls), None)
-                            
-                            if is_in and not orig_row["內掃已到"]:
-                                save_entry({
-                                    "日期": input_date, "週次": week_num, "檢查人員": inspector_name,
-                                    "班級": cls, "評分項目": role,
-                                    "垃圾內掃原始分": 0, "垃圾外掃原始分": 0,
-                                    "備註": "內掃已到", "違規細項": "簽到"
-                                })
-                                cnt += 1
-                                
-                            if is_out and not orig_row["外掃已到"]:
-                                note_str = f"外掃已到({loc})" if loc else "外掃已到"
-                                save_entry({
-                                    "日期": input_date, "週次": week_num, "檢查人員": inspector_name,
-                                    "班級": cls, "評分項目": role,
-                                    "垃圾內掃原始分": 0, "垃圾外掃原始分": 0,
-                                    "備註": note_str, "違規細項": "簽到"
-                                })
-                                cnt += 1
+                    # === 模式 A: 各處室 (外掃) ===
+                    if sel_filter == "各處室 (外掃)":
+                        # [V3.5 修改] 讀取 office_areas (不讀 duty)
+                        office_map = load_office_area_map()
                         
-                        if cnt > 0:
-                            st.success(f"✅ 成功儲存 {cnt} 筆簽到紀錄！")
-                            time.sleep(1.5)
-                            st.rerun()
-                        else:
-                            st.info("沒有新增的簽到紀錄。")
+                        # 預設處室名單 (若 Google Sheet 空白時使用)
+                        default_offices = ["教務處", "學務處", "總務處", "輔導室", "圖書館", "校長室", "人事室", "會計室", "健康中心", "體育組", "實習處"]
+                        target_list = list(office_map.keys())
+                        if not target_list: target_list = default_offices
+                        
+                        for off_name in target_list:
+                            cls_name = office_map.get(off_name, "未設定")
+                            
+                            is_gen = False
+                            is_recyc = False
+                            
+                            if not today_records.empty:
+                                for _, r in today_records.iterrows():
+                                    note = str(r["備註"])
+                                    # 關鍵字比對
+                                    if f"外掃({off_name})" in note and "一般" in note: is_gen = True
+                                    if f"外掃({off_name})" in note and "回收" in note: is_recyc = True
+
+                            rows.append({
+                                "處室/區域": off_name,
+                                "負責班級": cls_name,
+                                "一般垃圾 (外)": is_gen,
+                                "資源回收 (外)": is_recyc
+                            })
+                            
+                        editor_df = pd.DataFrame(rows)
+                        edited_df = st.data_editor(
+                            editor_df,
+                            column_config={
+                                "處室/區域": st.column_config.TextColumn("處室/區域", disabled=True),
+                                "負責班級": st.column_config.TextColumn("負責班級", disabled=True),
+                                "一般垃圾 (外)": st.column_config.CheckboxColumn("一般垃圾", help="有拿一般垃圾來倒"),
+                                "資源回收 (外)": st.column_config.CheckboxColumn("資源回收", help="有拿回收物來倒")
+                            },
+                            hide_index=True, use_container_width=True, key="editor_offices"
+                        )
+                        
+                        if st.button("💾 儲存 (各處室)"):
+                            cnt = 0
+                            for _, row in edited_df.iterrows():
+                                off = row["處室/區域"]
+                                cls = row["負責班級"]
+                                gen = row["一般垃圾 (外)"]
+                                rec = row["資源回收 (外)"]
+                                
+                                orig = next((x for x in rows if x["處室/區域"] == off), None)
+                                
+                                # 寫入邏輯 (0分=簽到)
+                                if gen and not orig["一般垃圾 (外)"]:
+                                    save_entry({
+                                        "日期": input_date, "週次": week_num, "檢查人員": inspector_name,
+                                        "班級": cls, "評分項目": role, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0,
+                                        "備註": f"外掃({off})-一般已到", "違規細項": "簽到"
+                                    }); cnt += 1
+                                if rec and not orig["資源回收 (外)"]:
+                                    save_entry({
+                                        "日期": input_date, "週次": week_num, "檢查人員": inspector_name,
+                                        "班級": cls, "評分項目": role, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0,
+                                        "備註": f"外掃({off})-回收已到", "違規細項": "簽到"
+                                    }); cnt += 1
+                            if cnt: st.success(f"✅ 更新 {cnt} 筆！"); time.sleep(1); st.rerun()
+
+                    # === 模式 B: 年級 (內掃) ===
+                    else:
+                        grade_classes = [c["name"] for c in structured_classes if c["grade"] == sel_filter]
+                        for cls_name in grade_classes:
+                            # 內掃比較簡單，直接找該班紀錄
+                            cls_rec = today_records[today_records["班級"] == cls_name] if not today_records.empty else pd.DataFrame()
+                            is_gen = False
+                            is_recyc = False
+                            
+                            if not cls_rec.empty:
+                                for _, r in cls_rec.iterrows():
+                                    note = str(r["備註"])
+                                    if "內掃" in note and "一般" in note: is_gen = True
+                                    if "內掃" in note and "回收" in note: is_recyc = True
+                            
+                            rows.append({
+                                "班級": cls_name,
+                                "一般垃圾 (內)": is_gen,
+                                "資源回收 (內)": is_recyc
+                            })
+                            
+                        editor_df = pd.DataFrame(rows)
+                        edited_df = st.data_editor(
+                            editor_df,
+                            column_config={
+                                "班級": st.column_config.TextColumn("班級", disabled=True),
+                                "一般垃圾 (內)": st.column_config.CheckboxColumn("🏠 一般垃圾", help="教室垃圾"),
+                                "資源回收 (內)": st.column_config.CheckboxColumn("♻️ 資源回收", help="教室回收")
+                            },
+                            hide_index=True, use_container_width=True, key=f"editor_{sel_filter}"
+                        )
+                        
+                        if st.button(f"💾 儲存 ({sel_filter})"):
+                            cnt = 0
+                            for _, row in edited_df.iterrows():
+                                cls = row["班級"]
+                                gen = row["一般垃圾 (內)"]
+                                rec = row["資源回收 (內)"]
+                                orig = next((x for x in rows if x["班級"] == cls), None)
+                                
+                                if gen and not orig["一般垃圾 (內)"]:
+                                    save_entry({
+                                        "日期": input_date, "週次": week_num, "檢查人員": inspector_name,
+                                        "班級": cls, "評分項目": role, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0,
+                                        "備註": "內掃-一般已到", "違規細項": "簽到"
+                                    }); cnt += 1
+                                if rec and not orig["資源回收 (內)"]:
+                                    save_entry({
+                                        "日期": input_date, "週次": week_num, "檢查人員": inspector_name,
+                                        "班級": cls, "評分項目": role, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0,
+                                        "備註": "內掃-回收已到", "違規細項": "簽到"
+                                    }); cnt += 1
+                            if cnt: st.success(f"✅ 更新 {cnt} 筆！"); time.sleep(1); st.rerun()
 
                 else:
                     st.markdown("### 🏫 選擇受檢班級")
@@ -1061,10 +1132,13 @@ try:
                 if st.button("🚀 計算全學期成績"):
                     full = load_full_semester_data_for_export()
                     if not full.empty:
+                        # [V3.3 修正] 垃圾分數分開結算
                         full["內掃結算"] = full["內掃原始分"].clip(upper=2)
                         full["外掃結算"] = full["外掃原始分"].clip(upper=2)
                         
+                        # 垃圾分數邏輯：若是新資料用分開的，舊資料用合併的
                         trash_total = full["垃圾內掃原始分"] + full["垃圾外掃原始分"]
+                        # 若新欄位都是0，嘗試用舊欄位
                         trash_total = trash_total.where(trash_total > 0, full["垃圾原始分"])
                         
                         full["垃圾結算"] = trash_total.clip(upper=2)
@@ -1096,6 +1170,7 @@ try:
                     with st.form("ret_clean"):
                         st.write(f"全班 {len(mems)} 人")
                         
+                        # A. 扣除缺席
                         absent = st.multiselect("1. 勾選缺席 (沒來的)", mems)
                         present_pool = [m for m in mems if m not in absent]
                         
@@ -1103,10 +1178,12 @@ try:
                         st.write("時數設定：")
                         base_h = st.number_input("基礎服務時數 (全班)", value=2.0, step=0.5)
                         
+                        # B. 加強組
                         with st.expander("🌟 加強組/特別組 (另外給時數)", expanded=True):
                             special_list = st.multiselect("2. 勾選掃特別久的同學", present_pool)
                             special_h = st.number_input("特別時數 (例如 3.0)", value=3.0, step=0.5)
                         
+                        # 計算一般組
                         normal_list = [m for m in present_pool if m not in special_list]
                         
                         st.info(f"預覽：一般組 {len(normal_list)} 人 ({base_h}hr) | 特別組 {len(special_list)} 人 ({special_h}hr)")
@@ -1116,8 +1193,10 @@ try:
                         if st.form_submit_button("登記並發放"):
                             if not pf: st.error("需照片")
                             else:
+                                # 讀取照片 bytes 一次，供兩次呼叫使用
                                 pf.seek(0); file_bytes = pf.read()
                                 
+                                # 1. 一般組
                                 if normal_list:
                                     pf_norm = io.BytesIO(file_bytes); pf_norm.name="proof.jpg"
                                     ent_n = {
@@ -1126,6 +1205,7 @@ try:
                                     }
                                     save_entry(ent_n, uploaded_files=[pf_norm], student_list=normal_list, custom_hours=base_h, custom_category="返校打掃(一般)")
                                 
+                                # 2. 特別組
                                 if special_list:
                                     pf_spec = io.BytesIO(file_bytes); pf_spec.name="proof.jpg"
                                     ent_s = {
@@ -1153,6 +1233,7 @@ try:
                     else:
                         stats = day_df.groupby("班級")[["內掃原始分","外掃原始分","垃圾原始分","垃圾內掃原始分","垃圾外掃原始分","晨間打掃原始分","手機人數"]].sum()
                         
+                        # [V3.3] 合併垃圾分數
                         trash_t = stats["垃圾內掃原始分"] + stats["垃圾外掃原始分"]
                         stats["Total"] = stats["內掃原始分"]+stats["外掃原始分"]+stats["晨間打掃原始分"]+stats["手機人數"] + trash_t + stats["垃圾原始分"]
                         
@@ -1220,8 +1301,8 @@ try:
                     
                     for _, row in today_df.iterrows():
                         note = str(row.get("備註", ""))
-                        if "內掃已到" in note: signed_in_classes.add(row["班級"])
-                        if "外掃已到" in note: signed_out_classes.add(row["班級"])
+                        if "內掃" in note and ("一般" in note or "回收" in note): signed_in_classes.add(row["班級"])
+                        if "外掃" in note and ("一般" in note or "回收" in note): signed_out_classes.add(row["班級"])
                     
                     all_cls_set = set(all_classes)
                     
@@ -1243,5 +1324,5 @@ try:
         else: st.error("密碼錯誤")
 
 except Exception as e:
-    st.error("❌ 系統發生錯誤")
-    print(traceback.format_exc())
+    st.error(f"❌ 系統發生錯誤: {str(e)}") # 直接顯示錯誤簡述
+    st.code(traceback.format_exc())      # 顯示詳細程式碼追蹤
