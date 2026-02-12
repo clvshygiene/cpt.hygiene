@@ -443,7 +443,7 @@ try:
         return roster_dict
     
     @st.cache_data(ttl=3600)
-        def load_sorted_classes():
+            def load_sorted_classes():
             ws = get_worksheet(SHEET_TABS["roster"])
             if not ws: return [], []
             try:
