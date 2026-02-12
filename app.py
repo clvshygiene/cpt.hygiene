@@ -24,7 +24,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ct
 from PIL import Image  # 圖片處理核心套件
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="中壢家商，衛愛而生 V3.1", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="中壢家商，衛愛而生 V3.2", layout="wide", page_icon="🧹")
 
 # --- 2. 核心參數與全域設定 ---
 try:
@@ -246,6 +246,7 @@ try:
         def _action():
             ws = get_worksheet(SHEET_TABS["service_hours"])
             if not ws: return
+            # 寫入 6 個欄位: 日期, 學號, 班級, 類別, 時數, 紀錄ID
             row = [
                 str(entry.get("日期", "")), str(entry.get("學號", "")),
                 str(entry.get("班級", "")), str(entry.get("類別", "")),
@@ -400,7 +401,7 @@ try:
             for col in EXPECTED_COLUMNS:
                 if col not in df.columns: df[col] = ""
             if "紀錄ID" not in df.columns: df["紀錄ID"] = df.index.astype(str)
-            for col in ["內掃原始分", "外掃原始分", "垃圾原始分", "晨間打掃原始分", "手機人數"]:
+            for col in ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數"]:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
             if "週次" in df.columns:
                 df["週次"] = pd.to_numeric(df["週次"], errors='coerce').fillna(0).astype(int)
@@ -421,7 +422,7 @@ try:
             text_cols = ["備註", "違規細項", "班級", "檢查人員", "修正", "晨掃未到者", "照片路徑", "紀錄ID"]
             for col in text_cols:
                 if col in df.columns: df[col] = df[col].fillna("").astype(str)
-            numeric_cols = ["內掃原始分", "外掃原始分", "垃圾原始分", "晨間打掃原始分", "手機人數", "週次"]
+            numeric_cols = ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數", "週次"]
             for col in numeric_cols:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
             return df[EXPECTED_COLUMNS]
@@ -447,30 +448,18 @@ try:
         ws = get_worksheet(SHEET_TABS["roster"])
         if not ws: return [], []
         try:
-            # 嘗試讀取所有紀錄
             records = ws.get_all_records()
-            # 如果是空的，嘗試用 get_all_values (處理標題列可能在非第一行的狀況)
             if not records:
                 all_vals = ws.get_all_values()
                 if len(all_vals) > 1:
                     headers = all_vals[0]
                     records = [dict(zip(headers, row)) for row in all_vals[1:]]
-            
             df = pd.DataFrame(records)
             if df.empty: return [], []
-
-            # 寬鬆搜尋「班級」欄位 (例如 "班級 " 或 " 班級")
             class_col = next((c for c in df.columns if "班級" in str(c).strip()), None)
-            
-            if not class_col: 
-                print("❌ 錯誤：在 roster 分頁中找不到「班級」欄位")
-                return [], []
-            
-            # 清理資料 (去除空白、排除空值)
-            unique = df[class_col].astype(str).str.strip()
-            unique = unique[unique != ""].unique().tolist()
-            
-            # 排序邏輯
+            if not class_col: return [], []
+            unique = df[class_col].astype(str).str.strip().unique().tolist()
+            unique = [c for c in unique if c]
             dept_order = {"商": 1, "英": 2, "資": 3, "家": 4, "服": 5}
             def get_sort_key(name):
                 grade = 99
@@ -481,15 +470,11 @@ try:
                 for k, v in dept_order.items():
                     if k in name: dept_score = v; break
                 return (grade, dept_score, name)
-            
             sorted_all = sorted(unique, key=get_sort_key)
             structured = [{"grade": f"{get_sort_key(c)[0]}年級" if get_sort_key(c)[0]!=99 else "其他", "name": c} for c in sorted_all]
-            
             return sorted_all, structured
-        except Exception as e:
-            print(f"Loading Classes Error: {e}")
-            return [], []
-                
+        except: return [], []
+
     @st.cache_data(ttl=60)
     def get_daily_duty(target_date):
         ws = get_worksheet(SHEET_TABS["duty"])
@@ -754,9 +739,14 @@ try:
     st.sidebar.title("🏫 功能選單")
     app_mode = st.sidebar.radio("請選擇模式", ["糾察底家👀", "班級負責人🥸", "晨掃志工隊🧹", "組長ㄉ窩💃"])
 
-    with st.sidebar.expander("🔧 系統狀態", expanded=False):
-        if get_gspread_client(): st.success("Google Sheets: OK")
-        else: st.error("Google Sheets: Error")
+    with st.sidebar.expander("🔧 系統狀態 (名單異常請點此)", expanded=True):
+        if get_gspread_client(): st.success("✅ Google Sheets 連線正常")
+        else: st.error("❌ Google Sheets 連線失敗")
+        
+        # [新增] 強制重讀按鈕
+        if st.button("🔄 重讀名單 (清除快取)"):
+            st.cache_data.clear()
+            st.rerun()
 
     # --- Mode 1: 糾察評分 ---
     if app_mode == "糾察底家👀":
@@ -795,22 +785,64 @@ try:
                 main_df = load_main_data()
 
                 if role == "垃圾/回收檢查":
-                    st.info("🗑️ 全校垃圾檢查 (每日每班上限扣2分)")
-                    trash_cat = st.radio("違規項目", ["一般垃圾", "紙類", "網袋", "其他回收"], horizontal=True)
-                    with st.form("trash_form"):
-                        t_data = [{"班級": c, "無簽名": False, "無分類": False} for c in all_classes]
-                        edited_t_df = st.data_editor(pd.DataFrame(t_data), hide_index=True, height=400, width="stretch")
-                        if st.form_submit_button("送出"):
-                            base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": False}
-                            cnt = 0
-                            for _, row in edited_t_df.iterrows():
-                                vios = []
-                                if row["無簽名"]: vios.append("無簽名")
-                                if row["無分類"]: vios.append("無分類")
-                                if vios:
-                                    save_entry({**base, "班級": row["班級"], "評分項目": role, "垃圾原始分": len(vios), "備註": f"{trash_cat}-{'、'.join(vios)}", "違規細項": trash_cat})
-                                    cnt += 1
-                            st.success(f"已排入背景處理： {cnt} 班" if cnt else "無違規"); st.rerun()
+                    # [V3.2] 垃圾檢查介面大改版：定點檢查模式 (左右分欄)
+                    st.info("🗑️ 資收場定點檢查模式：請先選擇班級，再勾選違規項目")
+                    
+                    target_cls = st.selectbox("👉 請選擇班級", all_classes)
+                    
+                    with st.form("trash_check_form"):
+                        col_in, col_out = st.columns(2)
+                        
+                        with col_in:
+                            st.subheader("🏠 內掃 (教室)")
+                            v_in_1 = st.checkbox("未分類", key=f"in_1_{target_cls}")
+                            v_in_2 = st.checkbox("未簽名", key=f"in_2_{target_cls}")
+                            
+                        with col_out:
+                            st.subheader("🏢 外掃 (處室)")
+                            v_out_1 = st.checkbox("外掃-未分類", key=f"out_1_{target_cls}")
+                            
+                            # 外掃必須指定處室
+                            office_list = ["", "教務處", "學務處", "總務處", "輔導室", "圖書館", "實習處", "健康中心", "體育組", "校長室", "人事室", "會計室", "其他"]
+                            target_office = st.selectbox("⚠️ 違規處室 (若勾選外掃違規請務必選擇)", office_list, key=f"off_{target_cls}")
+                        
+                        st.divider()
+                        note_ext = st.text_input("📝 補充說明 (選填)")
+                        
+                        if st.form_submit_button("🚀 送出違規"):
+                            # 計算分數
+                            score_in = 0
+                            score_out = 0
+                            violations = []
+                            
+                            if v_in_1: score_in += 1; violations.append("內掃-未分類")
+                            if v_in_2: score_in += 1; violations.append("內掃-未簽名")
+                            
+                            office_note = ""
+                            if v_out_1:
+                                score_out += 1
+                                if not target_office:
+                                    st.error("❌ 登記外掃違規，必須選擇「違規處室」！")
+                                    st.stop()
+                                violations.append(f"外掃({target_office})-未分類")
+                                office_note = target_office
+                            
+                            if score_in == 0 and score_out == 0:
+                                st.warning("未勾選任何違規項目")
+                            else:
+                                base = {
+                                    "日期": input_date, "週次": week_num, "檢查人員": inspector_name,
+                                    "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": False,
+                                    "班級": target_cls, "評分項目": role,
+                                    "垃圾內掃原始分": score_in, "垃圾外掃原始分": score_out, # 分開寫入
+                                    "備註": f"{','.join(violations)} {note_ext}",
+                                    "違規細項": "垃圾違規"
+                                }
+                                save_entry(base)
+                                st.success(f"✅ 已登記：{target_cls} (內掃:{score_in}分, 外掃:{score_out}分)")
+                                time.sleep(1.5)
+                                st.rerun()
+
                 else:
                     st.markdown("### 🏫 選擇受檢班級")
                     if assigned_classes:
@@ -887,7 +919,11 @@ try:
                     if not c_df.empty:
                         st.subheader(f"📊 {cls} 近期紀錄")
                         for idx, r in c_df.iterrows():
-                            tot = r['內掃原始分']+r['外掃原始分']+r['垃圾原始分']+r['晨間打掃原始分']
+                            # 顯示垃圾分開計分
+                            trash_score = r['垃圾內掃原始分'] + r['垃圾外掃原始分']
+                            if trash_score == 0: trash_score = r['垃圾原始分'] # 相容舊資料
+                            
+                            tot = r['內掃原始分']+r['外掃原始分']+trash_score+r['晨間打掃原始分']
                             ph = f" | 📱:{r['手機人數']}" if r['手機人數'] > 0 else ""
                             rid = str(r['紀錄ID'])
                             ap_st = appeal_map.get(rid)
@@ -997,9 +1033,17 @@ try:
                 if st.button("🚀 計算全學期成績"):
                     full = load_full_semester_data_for_export()
                     if not full.empty:
+                        # [V3.2 修正] 垃圾分數分開結算
                         full["內掃結算"] = full["內掃原始分"].clip(upper=2)
                         full["外掃結算"] = full["外掃原始分"].clip(upper=2)
-                        full["垃圾結算"] = full["垃圾原始分"].clip(upper=2)
+                        
+                        # 垃圾分數邏輯：若是新資料用分開的，舊資料用合併的
+                        trash_total = full["垃圾內掃原始分"] + full["垃圾外掃原始分"]
+                        # 若新欄位都是0，嘗試用舊欄位
+                        trash_total = trash_total.where(trash_total > 0, full["垃圾原始分"])
+                        
+                        full["垃圾結算"] = trash_total.clip(upper=2)
+                        
                         full["總扣分"] = full["內掃結算"]+full["外掃結算"]+full["垃圾結算"]+full["晨間打掃原始分"]+full["手機人數"]
                         rep = full.groupby("班級")["總扣分"].sum().reset_index()
                         
@@ -1017,7 +1061,7 @@ try:
             with t3:
                 st.subheader("🏫 全班返校打掃登記 (組長用)")
                 
-                # 1. 選擇班級 (移出 form)
+                # [V3.2] 修正：選單移出 form，確保名單連動
                 c1, c2 = st.columns(2)
                 rd = c1.date_input("日期", today_tw)
                 rc = c2.selectbox("班級", all_classes)
@@ -1052,16 +1096,7 @@ try:
                             if not pf: st.error("需照片")
                             else:
                                 # 讀取照片 bytes 一次，供兩次呼叫使用
-                                pf.seek(0)
-                                file_bytes = pf.read()
-                                # 為了相容 save_entry 介面，我們用 BytesIO 包裝
-                                # 但因為 save_entry 內部會讀取 stream，所以要小心
-                                # 最簡單解法：我們手動在這裡處理，或者呼叫兩次但要注意
-                                # 為了保險，我們只送一次主紀錄，但時數分開送
-                                
-                                # 修正策略：送兩次 save_entry，分別對應兩組人
-                                # 為了避免照片被上傳兩次浪費流量，我們可以... 
-                                # 算了，為了穩定性，上傳兩次無妨 (因為是背景執行)
+                                pf.seek(0); file_bytes = pf.read()
                                 
                                 # 1. 一般組
                                 if normal_list:
@@ -1098,8 +1133,13 @@ try:
                     day_df = df[df["日期"].astype(str) == str(td)]
                     if day_df.empty: st.info("無資料")
                     else:
-                        stats = day_df.groupby("班級")[["內掃原始分","外掃原始分","垃圾原始分","晨間打掃原始分","手機人數"]].sum()
-                        stats["Total"] = stats.sum(axis=1)
+                        stats = day_df.groupby("班級")[["內掃原始分","外掃原始分","垃圾原始分","垃圾內掃原始分","垃圾外掃原始分","晨間打掃原始分","手機人數"]].sum()
+                        
+                        # [V3.2] 合併垃圾分數
+                        trash_t = stats["垃圾內掃原始分"] + stats["垃圾外掃原始分"]
+                        # 若新欄位無值，加回舊的
+                        stats["Total"] = stats["內掃原始分"]+stats["外掃原始分"]+stats["晨間打掃原始分"]+stats["手機人數"] + trash_t + stats["垃圾原始分"]
+                        
                         vios = stats[stats["Total"]>0].reset_index()
                         mail_list = []
                         for _, r in vios.iterrows():
