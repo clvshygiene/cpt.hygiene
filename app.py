@@ -443,30 +443,53 @@ try:
         return roster_dict
     
     @st.cache_data(ttl=3600)
-    def load_sorted_classes():
-        ws = get_worksheet(SHEET_TABS["roster"])
-        if not ws: return [], []
-        try:
-            df = pd.DataFrame(ws.get_all_records())
-            class_col = next((c for c in df.columns if "班級" in c), None)
-            if not class_col: return [], []
-            unique = df[class_col].dropna().unique().tolist()
-            unique = [str(c).strip() for c in unique if str(c).strip()]
-            dept_order = {"商": 1, "英": 2, "資": 3, "家": 4, "服": 5}
-            def get_sort_key(name):
-                grade = 99
-                if "一" in name or "1" in name: grade = 1
-                elif "二" in name or "2" in name: grade = 2
-                elif "三" in name or "3" in name: grade = 3
-                dept_score = 99
-                for k, v in dept_order.items():
-                    if k in name: dept_score = v; break
-                return (grade, dept_score, name)
-            sorted_all = sorted(unique, key=get_sort_key)
-            structured = [{"grade": f"{get_sort_key(c)[0]}年級" if get_sort_key(c)[0]!=99 else "其他", "name": c} for c in sorted_all]
-            return sorted_all, structured
-        except: return [], []
+        def load_sorted_classes():
+            ws = get_worksheet(SHEET_TABS["roster"])
+            if not ws: return [], []
+            try:
+                # 嘗試讀取所有紀錄
+                records = ws.get_all_records()
+                # 如果是空的，嘗試用 get_all_values (處理標題列可能在非第一行的狀況)
+                if not records:
+                    all_vals = ws.get_all_values()
+                    if len(all_vals) > 1:
+                        headers = all_vals[0]
+                        records = [dict(zip(headers, row)) for row in all_vals[1:]]
+            
+                df = pd.DataFrame(records)
+                if df.empty: return [], []
 
+                # 寬鬆搜尋「班級」欄位 (例如 "班級 " 或 " 班級")
+                class_col = next((c for c in df.columns if "班級" in str(c).strip()), None)
+            
+                if not class_col: 
+                    print("❌ 錯誤：在 roster 分頁中找不到「班級」欄位")
+                    return [], []
+            
+                # 清理資料 (去除空白、排除空值)
+                unique = df[class_col].astype(str).str.strip()
+                unique = unique[unique != ""].unique().tolist()
+            
+                # 排序邏輯
+                dept_order = {"商": 1, "英": 2, "資": 3, "家": 4, "服": 5}
+                def get_sort_key(name):
+                    grade = 99
+                    if "一" in name or "1" in name: grade = 1
+                    elif "二" in name or "2" in name: grade = 2
+                    elif "三" in name or "3" in name: grade = 3
+                    dept_score = 99
+                    for k, v in dept_order.items():
+                        if k in name: dept_score = v; break
+                    return (grade, dept_score, name)
+            
+                sorted_all = sorted(unique, key=get_sort_key)
+                structured = [{"grade": f"{get_sort_key(c)[0]}年級" if get_sort_key(c)[0]!=99 else "其他", "name": c} for c in sorted_all]
+            
+                return sorted_all, structured
+            except Exception as e:
+                print(f"Loading Classes Error: {e}")
+                return [], []
+                
     @st.cache_data(ttl=60)
     def get_daily_duty(target_date):
         ws = get_worksheet(SHEET_TABS["duty"])
