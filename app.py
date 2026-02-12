@@ -24,7 +24,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ct
 from PIL import Image  # 圖片處理核心套件
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="中壢家商，衛愛而生 V3.3", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="中壢家商，衛愛而生 V3.3 (Fix)", layout="wide", page_icon="🧹")
 
 # --- 2. 核心參數與全域設定 ---
 try:
@@ -784,51 +784,31 @@ try:
                 main_df = load_main_data()
 
                 if role == "垃圾/回收檢查":
-                    # [V3.3 重大升級] 資收場電子點名板 (Check-list Mode)
+                    # [V3.3] 資收場電子點名板 (修正 TextColumn placeholder 錯誤)
                     st.info("🗑️ 資收場專用：電子點名模式 (有來的請打勾，未勾者可於後台結算扣分)")
                     
-                    # 1. 選擇年級 (加速篩選)
                     sel_grade = st.radio("篩選年級", grades, horizontal=True)
-                    
-                    # 2. 準備資料
-                    # 取得該年級所有班級
                     grade_classes = [c["name"] for c in structured_classes if c["grade"] == sel_grade]
                     
-                    # 取得「今日」已經簽到的資料 (從 main_data 撈取)
-                    # 邏輯：有 0 分的紀錄 = 已簽到 (內掃/外掃)
-                    # 為了效能，這裡做一次查詢
                     today_records = pd.DataFrame()
                     if not main_df.empty:
                         today_str = str(input_date)
                         mask = (main_df["日期"].astype(str) == today_str) & (main_df["評分項目"] == "垃圾/回收檢查")
                         today_records = main_df[mask]
                     
-                    # 建構顯示用的 DataFrame
-                    # 欄位：班級, 內掃已到(Bool), 外掃已到(Bool), 外掃區域(Str)
                     rows = []
                     for cls_name in grade_classes:
-                        # 檢查該班今日是否已有點名紀錄
                         cls_rec = today_records[today_records["班級"] == cls_name] if not today_records.empty else pd.DataFrame()
-                        
                         has_in = False
                         has_out = False
                         out_loc = ""
                         
                         if not cls_rec.empty:
-                            # 如果有紀錄且「垃圾內掃原始分」== 0 (代表有來且沒違規，或是我們視為簽到)
-                            # 這裡定義：只要有紀錄就算簽到 (不論有無扣分，因為這裡是「點名」)
-                            # 為了區分「內掃」跟「外掃」，我們看備註或欄位?
-                            # 簡化邏輯：
-                            # 系統只記錄「違規」或「簽到(0分)」。
-                            # 我們假設 Check-in 會寫入一筆 0 分紀錄。
-                            # 我們需要判斷這筆紀錄是「內掃」還是「外掃」。
-                            # 透過備註關鍵字判斷
                             for _, r in cls_rec.iterrows():
                                 note = str(r["備註"])
                                 if "內掃已到" in note: has_in = True
                                 if "外掃已到" in note: 
                                     has_out = True
-                                    # 嘗試提取地點 (格式: 外掃已到(地點))
                                     if "(" in note and ")" in note:
                                         out_loc = note.split("(")[1].split(")")[0]
 
@@ -841,27 +821,21 @@ try:
                     
                     editor_df = pd.DataFrame(rows)
                     
-                    # 3. 顯示 Data Editor (可編輯表格)
                     edited_df = st.data_editor(
                         editor_df,
                         column_config={
                             "班級": st.column_config.TextColumn("班級", disabled=True),
                             "內掃已到": st.column_config.CheckboxColumn("🏠 內掃", help="有拿教室垃圾來倒"),
                             "外掃已到": st.column_config.CheckboxColumn("🏢 外掃", help="有拿處室垃圾來倒"),
-                            "外掃區域 (選填)": st.column_config.TextColumn("外掃地點", help="例如: 教務處", placeholder="處室名稱")
+                            # [修正] 移除 placeholder 參數，避免報錯
+                            "外掃區域 (選填)": st.column_config.TextColumn("外掃地點", help="例如: 教務處")
                         },
                         hide_index=True,
                         use_container_width=True,
-                        key=f"editor_{sel_grade}" # Key 綁定年級，切換年級時重置
+                        key=f"editor_{sel_grade}"
                     )
                     
-                    # 4. 儲存按鈕
                     if st.button(f"💾 儲存 {sel_grade} 點名結果"):
-                        # 比對差異，找出「新勾選」的項目並寫入
-                        # 為避免重複寫入，我們只寫入「目前是 True」且「原本是 False (即資料庫沒紀錄)」的嗎?
-                        # 或是簡單暴力一點：每次按儲存，就把當下勾選的狀態寫入 (會有多筆紀錄)?
-                        # 最佳解：寫入一筆「簽到紀錄」。
-                        
                         cnt = 0
                         for index, row in edited_df.iterrows():
                             cls = row["班級"]
@@ -869,19 +843,13 @@ try:
                             is_out = row["外掃已到"]
                             loc = row["外掃區域 (選填)"]
                             
-                            # 檢查是否已存在 (避免重複按鈕造成重複寫入)
-                            # 這裡做個簡單的 Session State 卡控或直接允許 (後台結算去重即可)
-                            # 為了即時性，直接寫入。後台用 GroupBy 去重。
-                            
-                            # 找出原本狀態
                             orig_row = next((x for x in rows if x["班級"] == cls), None)
                             
-                            # 只有當「狀態改變」且「變為 True」時才寫入，節省資料庫空間
                             if is_in and not orig_row["內掃已到"]:
                                 save_entry({
                                     "日期": input_date, "週次": week_num, "檢查人員": inspector_name,
                                     "班級": cls, "評分項目": role,
-                                    "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, # 0分代表簽到
+                                    "垃圾內掃原始分": 0, "垃圾外掃原始分": 0,
                                     "備註": "內掃已到", "違規細項": "簽到"
                                 })
                                 cnt += 1
@@ -1093,13 +1061,10 @@ try:
                 if st.button("🚀 計算全學期成績"):
                     full = load_full_semester_data_for_export()
                     if not full.empty:
-                        # [V3.3 修正] 垃圾分數分開結算
                         full["內掃結算"] = full["內掃原始分"].clip(upper=2)
                         full["外掃結算"] = full["外掃原始分"].clip(upper=2)
                         
-                        # 垃圾分數邏輯：若是新資料用分開的，舊資料用合併的
                         trash_total = full["垃圾內掃原始分"] + full["垃圾外掃原始分"]
-                        # 若新欄位都是0，嘗試用舊欄位
                         trash_total = trash_total.where(trash_total > 0, full["垃圾原始分"])
                         
                         full["垃圾結算"] = trash_total.clip(upper=2)
@@ -1121,7 +1086,6 @@ try:
             with t3:
                 st.subheader("🏫 全班返校打掃登記 (組長用)")
                 
-                # [V3.3] 修正：選單移出 form，確保名單連動
                 c1, c2 = st.columns(2)
                 rd = c1.date_input("日期", today_tw)
                 rc = c2.selectbox("班級", all_classes)
@@ -1132,7 +1096,6 @@ try:
                     with st.form("ret_clean"):
                         st.write(f"全班 {len(mems)} 人")
                         
-                        # A. 扣除缺席
                         absent = st.multiselect("1. 勾選缺席 (沒來的)", mems)
                         present_pool = [m for m in mems if m not in absent]
                         
@@ -1140,12 +1103,10 @@ try:
                         st.write("時數設定：")
                         base_h = st.number_input("基礎服務時數 (全班)", value=2.0, step=0.5)
                         
-                        # B. 加強組
                         with st.expander("🌟 加強組/特別組 (另外給時數)", expanded=True):
                             special_list = st.multiselect("2. 勾選掃特別久的同學", present_pool)
                             special_h = st.number_input("特別時數 (例如 3.0)", value=3.0, step=0.5)
                         
-                        # 計算一般組
                         normal_list = [m for m in present_pool if m not in special_list]
                         
                         st.info(f"預覽：一般組 {len(normal_list)} 人 ({base_h}hr) | 特別組 {len(special_list)} 人 ({special_h}hr)")
@@ -1155,10 +1116,8 @@ try:
                         if st.form_submit_button("登記並發放"):
                             if not pf: st.error("需照片")
                             else:
-                                # 讀取照片 bytes 一次，供兩次呼叫使用
                                 pf.seek(0); file_bytes = pf.read()
                                 
-                                # 1. 一般組
                                 if normal_list:
                                     pf_norm = io.BytesIO(file_bytes); pf_norm.name="proof.jpg"
                                     ent_n = {
@@ -1167,7 +1126,6 @@ try:
                                     }
                                     save_entry(ent_n, uploaded_files=[pf_norm], student_list=normal_list, custom_hours=base_h, custom_category="返校打掃(一般)")
                                 
-                                # 2. 特別組
                                 if special_list:
                                     pf_spec = io.BytesIO(file_bytes); pf_spec.name="proof.jpg"
                                     ent_s = {
@@ -1195,7 +1153,6 @@ try:
                     else:
                         stats = day_df.groupby("班級")[["內掃原始分","外掃原始分","垃圾原始分","垃圾內掃原始分","垃圾外掃原始分","晨間打掃原始分","手機人數"]].sum()
                         
-                        # [V3.3] 合併垃圾分數
                         trash_t = stats["垃圾內掃原始分"] + stats["垃圾外掃原始分"]
                         stats["Total"] = stats["內掃原始分"]+stats["外掃原始分"]+stats["晨間打掃原始分"]+stats["手機人數"] + trash_t + stats["垃圾原始分"]
                         
@@ -1253,7 +1210,6 @@ try:
                 if st.button("🔍 分析缺席名單"):
                     df = load_main_data()
                     
-                    # 1. 撈出當日有簽到的班級
                     if not df.empty:
                         today_df = df[(df["日期"].astype(str) == str(check_date)) & (df["評分項目"] == "垃圾/回收檢查")]
                     else:
@@ -1267,11 +1223,10 @@ try:
                         if "內掃已到" in note: signed_in_classes.add(row["班級"])
                         if "外掃已到" in note: signed_out_classes.add(row["班級"])
                     
-                    # 2. 比對全校名單
                     all_cls_set = set(all_classes)
                     
                     missing_in = sorted(list(all_cls_set - signed_in_classes))
-                    missing_out = sorted(list(all_cls_set - signed_out_classes)) # 這裡假設全校都要外掃，若非全校則需調整
+                    missing_out = sorted(list(all_cls_set - signed_out_classes)) 
                     
                     c1, c2 = st.columns(2)
                     with c1:
@@ -1288,5 +1243,5 @@ try:
         else: st.error("密碼錯誤")
 
 except Exception as e:
-    st.error(f"❌ 系統發生錯誤: {str(e)}") # 直接顯示錯誤簡述
-    st.code(traceback.format_exc())      # 顯示詳細程式碼追蹤
+    st.error("❌ 系統發生錯誤")
+    print(traceback.format_exc())
