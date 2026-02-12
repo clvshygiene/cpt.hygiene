@@ -1288,5 +1288,5 @@ try:
         else: st.error("密碼錯誤")
 
 except Exception as e:
-    st.error("❌ 系統發生錯誤")
-    print(traceback.format_exc())
+    st.error(f"❌ 系統發生錯誤: {str(e)}") # 直接顯示錯誤簡述
+    st.code(traceback.format_exc())      # 顯示詳細程式碼追蹤
