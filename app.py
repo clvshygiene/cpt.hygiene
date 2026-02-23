@@ -24,7 +24,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ct
 from PIL import Image
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="中壢家商，衛愛而生 V3.8", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="中壢家商，衛愛而生 V3.9", layout="wide", page_icon="🧹")
 
 # --- 2. 核心參數與全域設定 ---
 try:
@@ -136,7 +136,7 @@ try:
         except: return str(val).strip()
 
     # ==========================================
-    # SQLite 背景佇列 (核心引擎)
+    # SQLite 背景佇列
     # ==========================================
     _queue_lock = threading.Lock()
 
@@ -195,7 +195,7 @@ try:
             get_queue_connection().commit()
 
     # ==========================================
-    # 背景處理邏輯 (Worker)
+    # 背景處理邏輯
     # ==========================================
     def process_task(task):
         task_type, payload = task["task_type"], task["payload"]
@@ -520,14 +520,25 @@ try:
         except: return pd.DataFrame()
 
     # ==========================================
-    # 3. 主程式 UI
+    # 3. 主程式 UI 啟動前準備
     # ==========================================
+    
+    # 🚨 [修正點 1] 補回被刪掉的 now_tw 定義
+    now_tw = datetime.now(TW_TZ)
+    today_tw = now_tw.date()
+    
     SYSTEM_CONFIG, ROSTER_DICT, INSPECTOR_LIST, TEACHER_MAILS = load_settings(), load_roster_dict(), load_inspector_list(), load_teacher_emails()
     all_classes, structured_classes = load_sorted_classes()
     if not all_classes: all_classes, structured_classes = ["測試班級"], [{"grade": "其他", "name": "測試班級"}]
     grades = sorted(list(set([c["grade"] for c in structured_classes])))
-    today_tw = datetime.now(TW_TZ).date()
     
+    def get_week_num(d):
+        try:
+            start = datetime.strptime(SYSTEM_CONFIG["semester_start"], "%Y-%m-%d").date()
+            if isinstance(d, datetime): d = d.date()
+            return max(0, ((d - start).days // 7) + 1)
+        except: return 0
+
     st.sidebar.title("🏫 功能選單")
     app_mode = st.sidebar.radio("請選擇模式", ["糾察底家👀", "班級負責人🥸", "晨掃志工隊🧹", "組長ㄉ窩💃"])
 
@@ -550,22 +561,21 @@ try:
             prefixes = sorted(list(set([p["id_prefix"] for p in INSPECTOR_LIST])))
             if not prefixes: st.warning("找不到糾察名單")
             else:
-                sel_p = st.radio("步驟 1：選擇開頭", [f"{p}開頭" for p in prefixes], horizontal=True)[0]
-                inspector_name = st.radio("步驟 2：點選身份", [p["label"] for p in INSPECTOR_LIST if p["id_prefix"] == sel_p])
+                sel_p = st.radio("步驟 1：選擇開頭", [f"{p}開頭" for p in prefixes], horizontal=True, key="m1_p_radio")[0]
+                inspector_name = st.radio("步驟 2：點選身份", [p["label"] for p in INSPECTOR_LIST if p["id_prefix"] == sel_p], key="m1_name_radio")
                 curr_inspector = next((p for p in INSPECTOR_LIST if p["label"] == inspector_name), {})
                 allowed_roles = [r for r in curr_inspector.get("allowed_roles", ["內掃檢查"]) if r != "晨間打掃"] or ["內掃檢查"]
                 
                 st.markdown("---")
                 c_d, c_r = st.columns(2)
                 input_date = c_d.date_input("檢查日期", today_tw)
-                role = c_r.radio("檢查項目", allowed_roles, horizontal=True) if len(allowed_roles)>1 else allowed_roles[0]
-                week_num = max(0, ((input_date - datetime.strptime(SYSTEM_CONFIG["semester_start"], "%Y-%m-%d").date()).days // 7) + 1)
+                role = c_r.radio("檢查項目", allowed_roles, horizontal=True, key="m1_role_radio") if len(allowed_roles)>1 else allowed_roles[0]
+                week_num = get_week_num(input_date)
                 main_df = load_main_data()
 
                 if role == "垃圾/回收檢查":
                     st.info("🗑️ 資收場專用：負面表列模式 (有違規才打勾，系統將自動記錄扣分)")
                     
-                    # 修正點：為此 radio 加上 key
                     sel_filter = st.radio("篩選檢查對象", ["各處室 (外掃)"] + grades, horizontal=True, key="m1_trash_filter")
                     today_records = main_df[(main_df["日期"].astype(str) == str(input_date)) & (main_df["評分項目"] == "垃圾/回收檢查")] if not main_df.empty else pd.DataFrame()
                     rows = []
@@ -610,7 +620,7 @@ try:
                 else:
                     assigned_classes = curr_inspector.get("assigned_classes", [])
                     
-                    # 修正點：解開過度壓縮的 radio 寫法，並加上專屬 key
+                    # 🚨 [修正點 2] 解開導致當機的 list comprehension radio 寫法
                     if assigned_classes:
                         sel_cls = st.radio("選擇負責班級", assigned_classes, key="m1_cls_assigned")
                     else:
@@ -644,7 +654,7 @@ try:
         df, appeals_df = load_main_data(), load_appeals()
         appeal_map = {str(r.get("對應紀錄ID")): r.get("處理狀態") for _, r in appeals_df.iterrows()} if not appeals_df.empty else {}
         
-        # 修正點：解開導致當機的 list comprehension radio 寫法
+        # 🚨 [修正點 2] 解開導致當機的 list comprehension radio 寫法
         sel_grade_m2 = st.radio("選擇年級", grades, horizontal=True, key="m2_grade_select")
         cls_opts = [c["name"] for c in structured_classes if c["grade"] == sel_grade_m2]
         
@@ -652,7 +662,10 @@ try:
             cls = st.selectbox("選擇班級", cls_opts, key="m2_cls_select")
             if cls and not df.empty:
                 for idx, r in df[df["班級"] == cls].sort_values("登錄時間", ascending=False).iterrows():
-                    tot = r['內掃原始分'] + r['外掃原始分'] + (r['垃圾內掃原始分'] + r['垃圾外掃原始分'] or r['垃圾原始分']) + r['晨間打掃原始分']
+                    trash_score = r['垃圾內掃原始分'] + r['垃圾外掃原始分']
+                    if trash_score == 0: trash_score = r['垃圾原始分']
+                    
+                    tot = r['內掃原始分'] + r['外掃原始分'] + trash_score + r['晨間打掃原始分']
                     rid, ap_st = str(r['紀錄ID']), appeal_map.get(str(r['紀錄ID']))
                     icon = "✅" if ap_st=="已核可" else "🚫" if ap_st=="已駁回" else "⏳" if ap_st=="待處理" else "🛠️" if str(r['修正'])=="TRUE" else ""
                     with st.expander(f"{icon} {r['日期']} - {r['評分項目']} (扣:{tot})"):
@@ -670,11 +683,10 @@ try:
         st.title("🧹 晨掃志工回報專區")
         if now_tw.hour >= 16: st.error("🚫 今日回報已截止 (16:00)")
         else:
-            my_cls = st.selectbox("選擇班級", all_classes)
+            my_cls = st.selectbox("選擇班級", all_classes, key="m3_cls_select")
             main_df = load_main_data()
             if not main_df[(main_df["日期"].astype(str)==str(today_tw)) & (main_df["班級"]==my_cls) & (main_df["評分項目"]=="晨間打掃")].empty: st.warning(f"⚠️ {my_cls} 已回報！")
             else:
-                # 修正點：解開字典讀取以防止 KeyError 崩潰
                 duty_df, _ = get_daily_duty(today_tw)
                 area_name = "無"
                 n_std = 4
@@ -682,7 +694,11 @@ try:
                     m_d = duty_df[duty_df["負責班級"]==my_cls]
                     if not m_d.empty:
                         area_name = m_d.iloc[0].get('掃地區域', '無')
-                        n_std = int(m_d.iloc[0].get('標準人數', 4))
+                        # 加入防錯機制，即使 N 被刪掉也能抓到對應欄位
+                        try:
+                            n_std = int(m_d.iloc[0].get('標準人數', 4))
+                        except:
+                            n_std = 4
                 
                 st.info(f"📍 任務: {area_name} (應到:{n_std}人)")
                 with st.form("vol_form"):
@@ -695,7 +711,13 @@ try:
     # --- Mode 4: 組長後台 ---
     elif app_mode == "組長ㄉ窩💃":
         st.title("⚙️ 管理後台")
-        if st.text_input("管理密碼", type="password") == st.secrets["system_config"]["admin_password"]:
+        metrics = get_queue_metrics()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("待處理", metrics["pending"])
+        c2.metric("失敗", metrics["failed"])
+        c3.metric("延遲(s)", int(metrics["oldest_pending_sec"]))
+
+        if st.text_input("管理密碼", type="password", key="admin_pwd") == st.secrets["system_config"]["admin_password"]:
             t1, t2, t3, t4, t5, t6, t7 = st.tabs(["🧹 晨掃審核", "📊 成績總表", "🏫 返校打掃", "📝 扣分明細", "📧 寄信", "📣 申訴", "⚙️ 設定"])
             
             with t1:
@@ -705,7 +727,6 @@ try:
                         c1, c2, c3 = st.columns([2,2,1])
                         c1.write(f"**{r['班級']}** | {r['檢查人員']}"); c2.image(str(r['照片路徑']).split(";")[0], width=150) if "http" in str(r['照片路徑']) else None
                         
-                        # 修正點：安全寫入 Google Sheet，避免 Index Error
                         if c3.button("✅ 通過", key=f"p_{r['紀錄ID']}"): 
                             ws = get_worksheet(SHEET_TABS["main"])
                             id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
@@ -726,7 +747,7 @@ try:
 
             with t3:
                 c1, c2 = st.columns(2)
-                rd, rc = c1.date_input("日期", today_tw), c2.selectbox("班級", all_classes)
+                rd, rc = c1.date_input("日期", today_tw, key="ret_date"), c2.selectbox("班級", all_classes, key="ret_cls")
                 mems = [s for s, c in ROSTER_DICT.items() if c == rc]
                 if mems:
                     with st.form("ret_clean"):
