@@ -24,7 +24,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ct
 from PIL import Image
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="中壢家商，衛愛而生 V3.8", layout="wide", page_icon="🧹")
 
 # --- 2. 核心參數與全域設定 ---
 try:
@@ -504,6 +504,21 @@ try:
         }
         return enqueue_task("volunteer_report" if student_list is not None else "main_entry", payload)
 
+    def load_full_semester_data_for_export():
+        ws = get_worksheet(SHEET_TABS["main"])
+        if not ws: return pd.DataFrame(columns=EXPECTED_COLUMNS)
+        try:
+            df = pd.DataFrame(ws.get_all_records())
+            if df.empty: return pd.DataFrame(columns=EXPECTED_COLUMNS)
+            for col in EXPECTED_COLUMNS:
+                if col not in df.columns: df[col] = ""
+            for col in ["備註", "違規細項", "班級", "檢查人員", "修正", "晨掃未到者", "照片路徑", "紀錄ID"]:
+                if col in df.columns: df[col] = df[col].fillna("").astype(str)
+            for col in ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數", "週次"]:
+                if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+            return df[EXPECTED_COLUMNS]
+        except: return pd.DataFrame()
+
     # ==========================================
     # 3. 主程式 UI
     # ==========================================
@@ -514,7 +529,7 @@ try:
     today_tw = datetime.now(TW_TZ).date()
     
     st.sidebar.title("🏫 功能選單")
-    app_mode = st.sidebar.radio("請選擇模式", ["糾察底家👀", "班級負責人🥸", "晨掃志工🧹", "組長ㄉ窩💃"])
+    app_mode = st.sidebar.radio("請選擇模式", ["糾察底家👀", "班級負責人🥸", "晨掃志工隊🧹", "組長ㄉ窩💃"])
 
     with st.sidebar.expander("🔧 系統狀態 (名單異常請點此)", expanded=True):
         if get_gspread_client(): st.success("✅ Google Sheets 連線正常")
@@ -549,7 +564,9 @@ try:
 
                 if role == "垃圾/回收檢查":
                     st.info("🗑️ 資收場專用：負面表列模式 (有違規才打勾，系統將自動記錄扣分)")
-                    sel_filter = st.radio("篩選檢查對象", ["各處室 (外掃)"] + grades, horizontal=True)
+                    
+                    # 修正點：為此 radio 加上 key
+                    sel_filter = st.radio("篩選檢查對象", ["各處室 (外掃)"] + grades, horizontal=True, key="m1_trash_filter")
                     today_records = main_df[(main_df["日期"].astype(str) == str(input_date)) & (main_df["評分項目"] == "垃圾/回收檢查")] if not main_df.empty else pd.DataFrame()
                     rows = []
                     
@@ -561,7 +578,7 @@ try:
                             is_recyc_bad = any(f"外掃({off_name})" in str(r["備註"]) and ("未分類" in str(r["備註"]) or "未倒" in str(r["備註"])) and "回收" in str(r["備註"]) for _, r in today_records.iterrows()) if not today_records.empty else False
                             rows.append({"處室/區域": off_name, "負責班級": cls_name, "一般-未分類": is_gen_bad, "回收-未倒/未分類": is_recyc_bad})
                             
-                        edited_df = st.data_editor(pd.DataFrame(rows), column_config={"處室/區域": st.column_config.TextColumn(disabled=True), "負責班級": st.column_config.TextColumn(disabled=True)}, hide_index=True, use_container_width=True)
+                        edited_df = st.data_editor(pd.DataFrame(rows), column_config={"處室/區域": st.column_config.TextColumn(disabled=True), "負責班級": st.column_config.TextColumn(disabled=True)}, hide_index=True, use_container_width=True, key="ed_offices")
                         if st.button("💾 登記違規 (各處室)"):
                             cnt = 0
                             for _, row in edited_df.iterrows():
@@ -579,7 +596,7 @@ try:
                             is_recyc_bad = any("內掃" in str(r["備註"]) and ("未分類" in str(r["備註"]) or "未倒" in str(r["備註"])) and "回收" in str(r["備註"]) for _, r in cls_rec.iterrows()) if not cls_rec.empty else False
                             rows.append({"班級": cls_name, "一般-未分類": is_gen_bad, "回收-未倒/未分類": is_recyc_bad})
                             
-                        edited_df = st.data_editor(pd.DataFrame(rows), column_config={"班級": st.column_config.TextColumn(disabled=True)}, hide_index=True, use_container_width=True)
+                        edited_df = st.data_editor(pd.DataFrame(rows), column_config={"班級": st.column_config.TextColumn(disabled=True)}, hide_index=True, use_container_width=True, key=f"ed_{sel_filter}")
                         if st.button(f"💾 登記違規 ({sel_filter})"):
                             cnt = 0
                             for _, row in edited_df.iterrows():
@@ -592,7 +609,15 @@ try:
 
                 else:
                     assigned_classes = curr_inspector.get("assigned_classes", [])
-                    sel_cls = st.radio("選擇負責班級", assigned_classes) if assigned_classes else st.radio("步驟 B: 選擇班級", [c["name"] for c in structured_classes if c["grade"] == st.radio("步驟 A: 選擇年級", grades, horizontal=True)], horizontal=True)
+                    
+                    # 修正點：解開過度壓縮的 radio 寫法，並加上專屬 key
+                    if assigned_classes:
+                        sel_cls = st.radio("選擇負責班級", assigned_classes, key="m1_cls_assigned")
+                    else:
+                        temp_g = st.radio("步驟 A: 選擇年級", grades, horizontal=True, key="m1_grade_select")
+                        f_cls_list = [c["name"] for c in structured_classes if c["grade"] == temp_g]
+                        sel_cls = st.radio("步驟 B: 選擇班級", f_cls_list, horizontal=True, key="m1_cls_select") if f_cls_list else None
+
                     if sel_cls:
                         st.divider()
                         if check_duplicate_record(main_df, input_date, inspector_name, role, sel_cls): st.warning(f"⚠️ 今日已評過 {sel_cls}！")
@@ -619,9 +644,12 @@ try:
         df, appeals_df = load_main_data(), load_appeals()
         appeal_map = {str(r.get("對應紀錄ID")): r.get("處理狀態") for _, r in appeals_df.iterrows()} if not appeals_df.empty else {}
         
-        cls_opts = [c["name"] for c in structured_classes if c["grade"] == st.radio("選擇年級", grades, horizontal=True)]
+        # 修正點：解開導致當機的 list comprehension radio 寫法
+        sel_grade_m2 = st.radio("選擇年級", grades, horizontal=True, key="m2_grade_select")
+        cls_opts = [c["name"] for c in structured_classes if c["grade"] == sel_grade_m2]
+        
         if cls_opts:
-            cls = st.selectbox("選擇班級", cls_opts)
+            cls = st.selectbox("選擇班級", cls_opts, key="m2_cls_select")
             if cls and not df.empty:
                 for idx, r in df[df["班級"] == cls].sort_values("登錄時間", ascending=False).iterrows():
                     tot = r['內掃原始分'] + r['外掃原始分'] + (r['垃圾內掃原始分'] + r['垃圾外掃原始分'] or r['垃圾原始分']) + r['晨間打掃原始分']
@@ -638,7 +666,7 @@ try:
                                     st.rerun()
 
     # --- Mode 3: 晨掃志工隊 ---
-    elif app_mode == "晨掃志工🧹":
+    elif app_mode == "晨掃志工隊🧹":
         st.title("🧹 晨掃志工回報專區")
         if now_tw.hour >= 16: st.error("🚫 今日回報已截止 (16:00)")
         else:
@@ -646,9 +674,17 @@ try:
             main_df = load_main_data()
             if not main_df[(main_df["日期"].astype(str)==str(today_tw)) & (main_df["班級"]==my_cls) & (main_df["評分項目"]=="晨間打掃")].empty: st.warning(f"⚠️ {my_cls} 已回報！")
             else:
+                # 修正點：解開字典讀取以防止 KeyError 崩潰
                 duty_df, _ = get_daily_duty(today_tw)
-                m_d = duty_df[duty_df["負責班級"]==my_cls] if not duty_df.empty else pd.DataFrame()
-                st.info(f"📍 任務: {m_d.iloc[0]['掃地區域'] if not m_d.empty else '無'} (應到:{int(m_d.iloc[0]['標準人數']) if not m_d.empty else 4}人)")
+                area_name = "無"
+                n_std = 4
+                if not duty_df.empty:
+                    m_d = duty_df[duty_df["負責班級"]==my_cls]
+                    if not m_d.empty:
+                        area_name = m_d.iloc[0].get('掃地區域', '無')
+                        n_std = int(m_d.iloc[0].get('標準人數', 4))
+                
+                st.info(f"📍 任務: {area_name} (應到:{n_std}人)")
                 with st.form("vol_form"):
                     present = st.multiselect("✅ 實到同學", [s for s, c in ROSTER_DICT.items() if c == my_cls])
                     files = st.file_uploader("📸 成果照片", accept_multiple_files=True, type=['jpg','png'])
@@ -668,7 +704,16 @@ try:
                     with st.container(border=True):
                         c1, c2, c3 = st.columns([2,2,1])
                         c1.write(f"**{r['班級']}** | {r['檢查人員']}"); c2.image(str(r['照片路徑']).split(";")[0], width=150) if "http" in str(r['照片路徑']) else None
-                        if c3.button("✅ 通過", key=f"p_{r['紀錄ID']}"): get_worksheet(SHEET_TABS["main"]).update_cell(get_worksheet(SHEET_TABS["main"]).col_values(EXPECTED_COLUMNS.index("紀錄ID")+1).index(str(r["紀錄ID"]))+1, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, 2); st.cache_data.clear(); st.rerun()
+                        
+                        # 修正點：安全寫入 Google Sheet，避免 Index Error
+                        if c3.button("✅ 通過", key=f"p_{r['紀錄ID']}"): 
+                            ws = get_worksheet(SHEET_TABS["main"])
+                            id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
+                            if str(r["紀錄ID"]) in id_list:
+                                ridx = id_list.index(str(r["紀錄ID"])) + 1
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, 2)
+                                st.cache_data.clear()
+                                st.rerun()
                         if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}"): delete_rows_by_ids([str(r["紀錄ID"])]); st.rerun()
 
             with t2:
