@@ -24,7 +24,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ct
 from PIL import Image
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="中壢家商，衛愛而生 V3.9", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
 
 # --- 2. 核心參數與全域設定 ---
 try:
