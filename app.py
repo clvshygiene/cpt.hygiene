@@ -24,7 +24,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ct
 from PIL import Image
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="中壢家商，衛愛而生 V3.9", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="中壢家商，衛愛而生 V4.2", layout="wide", page_icon="🧹")
 
 # --- 2. 核心參數與全域設定 ---
 try:
@@ -197,10 +197,65 @@ try:
     # ==========================================
     # 背景處理邏輯
     # ==========================================
+    def _append_main_entry_row(entry):
+        def _action():
+            ws = get_worksheet(SHEET_TABS["main"])
+            if not ws: return
+            all_vals = ws.get_all_values()
+            if not all_vals: ws.append_row(EXPECTED_COLUMNS)
+            row = []
+            for col in EXPECTED_COLUMNS:
+                val = entry.get(col, "")
+                if isinstance(val, bool): val = str(val).upper()
+                if col == "日期": val = str(val)
+                row.append(val)
+            ws.append_row(row)
+        execute_with_retry(_action)
+    
+    # [V4.2 重大防呆機制] 去重複寫入服務時數
+    def _append_service_row_unique(entry):
+        def _action():
+            ws = get_worksheet(SHEET_TABS["service_hours"])
+            if not ws: return
+            all_vals = ws.get_all_values()
+            
+            t_date = str(entry.get("日期", ""))
+            t_sid = str(entry.get("學號", ""))
+            t_cat = str(entry.get("類別", ""))
+            
+            # 反向檢查，只要今天該學號的該類別已經有發放，就不再重複發放
+            for row in reversed(all_vals):
+                if len(row) >= 4:
+                    if row[0] == t_date and row[1] == t_sid and row[3] == t_cat:
+                        return # 已經給過了，直接略過
+                        
+            # 如果沒給過，才寫入
+            new_row = [
+                t_date, t_sid, str(entry.get("班級", "")),
+                t_cat, str(entry.get("時數", "")), str(entry.get("紀錄ID", ""))
+            ]
+            ws.append_row(new_row)
+        execute_with_retry(_action)
+
     def process_task(task):
         task_type, payload = task["task_type"], task["payload"]
-        entry = payload.get("entry", {})
+        
+        # 純發放時數邏輯 (提供給資收點名、晨掃志工等)
+        if task_type == "service_hours_only":
+            try:
+                for sid in payload.get("student_list", []):
+                    log_entry = {
+                        "日期": payload.get("date", str(date.today())), "學號": sid,
+                        "班級": payload.get("class_name", ""), "類別": payload.get("category", ""), 
+                        "時數": payload.get("hours", 0.5), "紀錄ID": uuid.uuid4().hex[:8]
+                    }
+                    _append_service_row_unique(log_entry) # 使用去重複寫入
+                return True, None
+            except Exception as e:
+                return False, str(e)
 
+        # 正常評分與申訴邏輯
+        entry = payload.get("entry", {})
         try:
             image_paths, filenames, drive_links = payload.get("image_paths", []), payload.get("filenames", []), []
             for path, fname in zip(image_paths, filenames):
@@ -210,20 +265,27 @@ try:
             if drive_links: entry["照片路徑"] = ";".join(drive_links)
 
             if task_type in ["main_entry", "volunteer_report"]:
-                def _main_act():
-                    ws = get_worksheet(SHEET_TABS["main"])
-                    if not ws.get_all_values(): ws.append_row(EXPECTED_COLUMNS)
-                    ws.append_row([str(entry.get(col, "")).upper() if isinstance(entry.get(col, ""), bool) else str(entry.get(col, "")) for col in EXPECTED_COLUMNS])
-                execute_with_retry(_main_act)
+                _append_main_entry_row(entry)
 
+                # [V4.2] 自動判斷「整潔評分糾察」並給予 0.25 小時 (且自動防重複)
                 inspector_name = entry.get("檢查人員", "")
                 if "學號:" in inspector_name:
                     sid = inspector_name.split("學號:")[1].strip()
-                    execute_with_retry(lambda: get_worksheet(SHEET_TABS["service_hours"]).append_row([entry.get("日期"), sid, "", "衛生糾察", 0.5, uuid.uuid4().hex[:8]]))
+                    log_entry = {
+                        "日期": entry.get("日期"), "學號": sid,
+                        "班級": "", "類別": "整潔評分糾察", "時數": 0.25, "紀錄ID": uuid.uuid4().hex[:8]
+                    }
+                    _append_service_row_unique(log_entry) # 就算他評了10班，今天也只會寫入這一筆
                 
+                # 晨掃或返校志工時數
                 if task_type == "volunteer_report":
                     for sid in payload.get("student_list", []):
-                        execute_with_retry(lambda: get_worksheet(SHEET_TABS["service_hours"]).append_row([entry.get("日期", str(date.today())), sid, entry.get("班級", ""), payload.get("custom_category", "晨掃志工"), payload.get("custom_hours", 0.5), uuid.uuid4().hex[:8]]))
+                        v_entry = {
+                            "日期": entry.get("日期", str(date.today())), "學號": sid, 
+                            "班級": entry.get("班級", ""), "類別": payload.get("custom_category", "晨掃志工"), 
+                            "時數": payload.get("custom_hours", 0.5), "紀錄ID": uuid.uuid4().hex[:8]
+                        }
+                        _append_service_row_unique(v_entry)
 
             elif task_type == "appeal_entry":
                 image_info = payload.get("image_file")
@@ -458,7 +520,7 @@ try:
     @st.cache_data(ttl=21600)
     def load_inspector_list():
         ws = get_worksheet(SHEET_TABS["inspectors"])
-        default = [{"label": "測試人員", "allowed_roles": ["內掃檢查"], "assigned_classes": [], "id_prefix": "測"}]
+        default = [{"label": "測試人員", "allowed_roles": ["內掃檢查"], "assigned_classes": [], "id_prefix": "測", "raw_role": "內掃"}]
         if not ws: return default
         try:
             df = pd.DataFrame(ws.get_all_records())
@@ -469,7 +531,13 @@ try:
                     sid, s_role = clean_id(row[id_c]), str(row[r_c]).strip() if r_c else ""
                     allowed = ["內掃檢查", "外掃檢查", "垃圾/回收檢查", "晨間打掃"] if "組長" in s_role else (["內掃檢查", "外掃檢查", "垃圾/回收檢查"] if "機動" in s_role else [r for r in ["外掃檢查", "垃圾/回收檢查", "晨間打掃", "內掃檢查"] if r[:2] in s_role])
                     s_classes = [c.strip() for c in str(row[s_c]).replace("、", ";").replace(",", ";").split(";") if c.strip()] if s_c and str(row[s_c]) else []
-                    inspectors.append({"label": f"學號: {sid}", "allowed_roles": allowed or ["內掃檢查"], "assigned_classes": s_classes, "id_prefix": sid[0] if sid else "X"})
+                    
+                    # [V4.2] 記錄原始 role 字串，方便後台過濾
+                    inspectors.append({
+                        "label": f"學號: {sid}", "allowed_roles": allowed or ["內掃檢查"], 
+                        "assigned_classes": s_classes, "id_prefix": sid[0] if sid else "X",
+                        "raw_role": s_role
+                    })
             return inspectors or default
         except: return default
 
@@ -522,8 +590,6 @@ try:
     # ==========================================
     # 3. 主程式 UI 啟動前準備
     # ==========================================
-    
-    # 🚨 [修正點 1] 補回被刪掉的 now_tw 定義
     now_tw = datetime.now(TW_TZ)
     today_tw = now_tw.date()
     
@@ -588,13 +654,13 @@ try:
                             is_recyc_bad = any(f"外掃({off_name})" in str(r["備註"]) and ("未分類" in str(r["備註"]) or "未倒" in str(r["備註"])) and "回收" in str(r["備註"]) for _, r in today_records.iterrows()) if not today_records.empty else False
                             rows.append({"處室/區域": off_name, "負責班級": cls_name, "一般-未分類": is_gen_bad, "回收-未倒/未分類": is_recyc_bad})
                             
-                        edited_df = st.data_editor(pd.DataFrame(rows), column_config={"處室/區域": st.column_config.TextColumn(disabled=True), "負責班級": st.column_config.TextColumn(disabled=True)}, hide_index=True, use_container_width=True, key="ed_offices")
+                        edited_df = st.data_editor(pd.DataFrame(rows), column_config={"處室/區域": st.column_config.TextColumn(disabled=True), "負責班級": st.column_config.TextColumn(disabled=True)}, hide_index=True, key="ed_offices")
                         if st.button("💾 登記違規 (各處室)"):
                             cnt = 0
                             for _, row in edited_df.iterrows():
                                 off, cls, gen_bad, recyc_bad = row["處室/區域"], row["負責班級"], row["一般-未分類"], row["回收-未倒/未分類"]
                                 orig = next((x for x in rows if x["處室/區域"] == off), None)
-                                base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "班級": cls, "評分項目": role, "垃圾內掃原始分": 0, "垃圾外掃原始分": 1}
+                                base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "班級": cls, "評分項目": role, "垃圾內掃原始分": 0, "垃圾外掃原始分": 1}
                                 if gen_bad and not orig["一般-未分類"]: save_entry({**base, "備註": f"外掃({off})-一般未分類", "違規細項": "一般垃圾"}); cnt += 1
                                 if recyc_bad and not orig["回收-未倒/未分類"]: save_entry({**base, "備註": f"外掃({off})-回收未倒/未分類", "違規細項": "資源回收"}); cnt += 1
                             if cnt: st.success(f"✅ 已登記 {cnt} 筆違規！"); time.sleep(1); st.rerun()
@@ -606,13 +672,13 @@ try:
                             is_recyc_bad = any("內掃" in str(r["備註"]) and ("未分類" in str(r["備註"]) or "未倒" in str(r["備註"])) and "回收" in str(r["備註"]) for _, r in cls_rec.iterrows()) if not cls_rec.empty else False
                             rows.append({"班級": cls_name, "一般-未分類": is_gen_bad, "回收-未倒/未分類": is_recyc_bad})
                             
-                        edited_df = st.data_editor(pd.DataFrame(rows), column_config={"班級": st.column_config.TextColumn(disabled=True)}, hide_index=True, use_container_width=True, key=f"ed_{sel_filter}")
+                        edited_df = st.data_editor(pd.DataFrame(rows), column_config={"班級": st.column_config.TextColumn(disabled=True)}, hide_index=True, key=f"ed_{sel_filter}")
                         if st.button(f"💾 登記違規 ({sel_filter})"):
                             cnt = 0
                             for _, row in edited_df.iterrows():
                                 cls, gen_bad, recyc_bad = row["班級"], row["一般-未分類"], row["回收-未倒/未分類"]
                                 orig = next((x for x in rows if x["班級"] == cls), None)
-                                base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "班級": cls, "評分項目": role, "垃圾內掃原始分": 1, "垃圾外掃原始分": 0}
+                                base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "班級": cls, "評分項目": role, "垃圾內掃原始分": 1, "垃圾外掃原始分": 0}
                                 if gen_bad and not orig["一般-未分類"]: save_entry({**base, "備註": "內掃-一般未分類", "違規細項": "一般垃圾"}); cnt += 1
                                 if recyc_bad and not orig["回收-未倒/未分類"]: save_entry({**base, "備註": "內掃-回收未倒/未分類", "違規細項": "資源回收"}); cnt += 1
                             if cnt: st.success(f"✅ 已登記 {cnt} 筆違規！"); time.sleep(1); st.rerun()
@@ -620,7 +686,6 @@ try:
                 else:
                     assigned_classes = curr_inspector.get("assigned_classes", [])
                     
-                    # 🚨 [修正點 2] 解開導致當機的 list comprehension radio 寫法
                     if assigned_classes:
                         sel_cls = st.radio("選擇負責班級", assigned_classes, key="m1_cls_assigned")
                     else:
@@ -645,8 +710,8 @@ try:
                             if st.form_submit_button("送出"):
                                 if (in_s + out_s) > 0 and not files: st.error("扣分需照片")
                                 else:
-                                    save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note}, uploaded_files=files)
-                                    st.success("✅ 送出成功！"); st.rerun()
+                                    save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note}, uploaded_files=files)
+                                    st.success("✅ 送出成功！系統將自動排程發放本日 0.25 小時。"); st.rerun()
 
     # --- Mode 2: 班級負責人 ---
     elif app_mode == "班級負責人🥸":
@@ -654,7 +719,6 @@ try:
         df, appeals_df = load_main_data(), load_appeals()
         appeal_map = {str(r.get("對應紀錄ID")): r.get("處理狀態") for _, r in appeals_df.iterrows()} if not appeals_df.empty else {}
         
-        # 🚨 [修正點 2] 解開導致當機的 list comprehension radio 寫法
         sel_grade_m2 = st.radio("選擇年級", grades, horizontal=True, key="m2_grade_select")
         cls_opts = [c["name"] for c in structured_classes if c["grade"] == sel_grade_m2]
         
@@ -668,7 +732,11 @@ try:
                     tot = r['內掃原始分'] + r['外掃原始分'] + trash_score + r['晨間打掃原始分']
                     rid, ap_st = str(r['紀錄ID']), appeal_map.get(str(r['紀錄ID']))
                     icon = "✅" if ap_st=="已核可" else "🚫" if ap_st=="已駁回" else "⏳" if ap_st=="待處理" else "🛠️" if str(r['修正'])=="TRUE" else ""
-                    with st.expander(f"{icon} {r['日期']} - {r['評分項目']} (扣:{tot})"):
+                    
+                    # [V4.1] 標題加上詳細到秒的時間
+                    time_str = str(r.get('登錄時間', '')).split(' ')[-1] if str(r.get('登錄時間', '')) else ''
+                    with st.expander(f"{icon} {r['日期']} {time_str} - {r['評分項目']} (扣:{tot})"):
+                        st.caption(f"登錄時間：{r['登錄時間']}") # 展開後也看得到精準時間
                         st.write(f"備註: {r['備註']}")
                         if str(r['照片路徑']) and "http" in str(r['照片路徑']): st.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=200)
                         if not ap_st and is_within_appeal_period(r['日期']) and (tot > 0 or r['手機人數'] > 0):
@@ -694,18 +762,15 @@ try:
                     m_d = duty_df[duty_df["負責班級"]==my_cls]
                     if not m_d.empty:
                         area_name = m_d.iloc[0].get('掃地區域', '無')
-                        # 加入防錯機制，即使 N 被刪掉也能抓到對應欄位
-                        try:
-                            n_std = int(m_d.iloc[0].get('標準人數', 4))
-                        except:
-                            n_std = 4
+                        try: n_std = int(m_d.iloc[0].get('標準人數', 4))
+                        except: n_std = 4
                 
                 st.info(f"📍 任務: {area_name} (應到:{n_std}人)")
                 with st.form("vol_form"):
                     present = st.multiselect("✅ 實到同學", [s for s, c in ROSTER_DICT.items() if c == my_cls])
                     files = st.file_uploader("📸 成果照片", accept_multiple_files=True, type=['jpg','png'])
                     if st.form_submit_button("送出") and present and files:
-                        save_entry({"日期": str(today_tw), "班級": my_cls, "評分項目": "晨間打掃", "檢查人員": f"志工(實到:{len(present)})", "晨間打掃原始分": 0, "備註": f"名單:{','.join(present)}"}, uploaded_files=files, student_list=present, custom_hours=0.5, custom_category="晨掃志工")
+                        save_entry({"日期": str(today_tw), "班級": my_cls, "評分項目": "晨間打掃", "檢查人員": f"志工(實到:{len(present)})", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "晨間打掃原始分": 0, "備註": f"名單:{','.join(present)}"}, uploaded_files=files, student_list=present, custom_hours=0.5, custom_category="晨掃志工")
                         st.success("✅ 回報成功！"); st.rerun()
 
     # --- Mode 4: 組長後台 ---
@@ -718,25 +783,107 @@ try:
         c3.metric("延遲(s)", int(metrics["oldest_pending_sec"]))
 
         if st.text_input("管理密碼", type="password", key="admin_pwd") == st.secrets["system_config"]["admin_password"]:
-            t1, t2, t3, t4, t5, t6, t7 = st.tabs(["🧹 晨掃審核", "📊 成績總表", "🏫 返校打掃", "📝 扣分明細", "📧 寄信", "📣 申訴", "⚙️ 設定"])
             
+            # [V4.2] 重新整理 Tabs 順序，加入監控與點名
+            t_mon, t_rollcall, t1, t2, t3, t4, t5, t6, t7, t_trash = st.tabs([
+                "👀 評分進度監控", "👮 勞動糾察點名", "🧹 晨掃審核", "📊 成績總表", "🏫 返校打掃", 
+                "📝 扣分明細", "📧 寄信", "📣 申訴", "⚙️ 設定", "📉 垃圾結算"
+            ])
+            
+            # T_MON: 糾察進度監控 (整潔評分專用)
+            with t_mon:
+                st.subheader("🕵️ 今日「整潔評分」進度監控")
+                monitor_date = st.date_input("監控日期", today_tw, key="monitor_date")
+                st.caption(f"📅 此區僅顯示負責「內掃、外掃、機動」的評分糾察進度。")
+
+                df = load_main_data()
+                submitted_names = set()
+                if not df.empty:
+                    today_records = df[df["日期"].astype(str) == str(monitor_date)]
+                    submitted_names = set(today_records["檢查人員"].unique())
+
+                # 過濾出「非垃圾回收」的評分糾察
+                cleaning_inspectors = [p for p in INSPECTOR_LIST if any(x in p.get("raw_role", "") for x in ["內掃", "外掃", "機動", "組長"])]
+                
+                regular_inspectors, mobile_inspectors = [], []
+                for p in cleaning_inspectors:
+                    p_name = p["label"]
+                    is_mobile = len(p.get("assigned_classes", [])) == 0
+                    status_obj = {"name": p_name, "role_desc": p.get("raw_role", ""), "done": p_name in submitted_names}
+                    if is_mobile: mobile_inspectors.append(status_obj)
+                    else: regular_inspectors.append(status_obj)
+
+                col_reg, col_mob = st.columns(2)
+                with col_reg:
+                    st.write("#### 🔴 班級評分員 (未完成)")
+                    missing_reg = [x for x in regular_inspectors if not x["done"]]
+                    if missing_reg:
+                        for p in missing_reg: st.error(f"❌ {p['name']}")
+                    else: st.success("🎉 全員完成！")
+                with col_mob:
+                    st.write("#### 🟠 機動/組長 (未完成)")
+                    st.caption("機動人員若今日無違規，可能不會送出資料。")
+                    missing_mob = [x for x in mobile_inspectors if not x["done"]]
+                    if missing_mob:
+                        for p in missing_mob: st.warning(f"⚠️ {p['name']} \n ({p['role_desc']})")
+                    else: st.success("🎉 全員完成！")
+
+            # T_ROLLCALL: 糾察出勤點名 (勞動糾察專用)
+            with t_rollcall:
+                st.subheader("👮 勞動型糾察 (資收場) 出勤點名")
+                st.info("💡 說明：此區專為「不會頻繁使用手機評分」的資收場糾察設計。勾選沒來的人，系統會自動幫有來的人發放 0.25 小時。")
+                
+                rc_date = st.date_input("出勤日期", today_tw, key="insp_rc_date")
+                
+                # 過濾出「垃圾/回收」的勞動糾察
+                trash_inspectors = [p for p in INSPECTOR_LIST if "垃圾" in p.get("raw_role", "") or "回收" in p.get("raw_role", "")]
+                insp_names = [p["label"] for p in trash_inspectors]
+                
+                if not insp_names:
+                    st.warning("⚠️ 目前名單中沒有負責「垃圾/回收檢查」的糾察。請至 inspectors 表格將負責項目改為包含『垃圾』或『回收』字眼。")
+                else:
+                    with st.form("insp_rc_form"):
+                        st.write(f"資收場糾察名單共 {len(insp_names)} 人")
+                        absent_insps = st.multiselect("❌ 勾選【請假 / 未到】的糾察 (扣除法)", insp_names)
+                        present_insps = [n for n in insp_names if n not in absent_insps]
+                        
+                        st.write(f"✅ 預計發放對象：共 {len(present_insps)} 人 (每人 0.25 小時)")
+                        
+                        if st.form_submit_button("🚀 發放勞動糾察時數"):
+                            present_ids = [name.split("學號:")[1].strip() for name in present_insps if "學號:" in name]
+                            if present_ids:
+                                payload = {
+                                    "student_list": present_ids,
+                                    "date": str(rc_date),
+                                    "class_name": "糾察隊",
+                                    "category": "資源回收糾察",
+                                    "hours": 0.25
+                                }
+                                enqueue_task("service_hours_only", payload)
+                                st.success(f"✅ 已排程發放 {len(present_ids)} 人的出勤時數！(系統會自動阻擋同一天的重複發放)")
+                            else:
+                                st.warning("沒有可發放時數的對象")
+
+            # T1: 晨掃審核
             with t1:
                 df = load_main_data()
                 for i, r in df[(df["評分項目"]=="晨間打掃") & (df["晨間打掃原始分"]==0) & (df["修正"]!="TRUE")].iterrows():
                     with st.container(border=True):
                         c1, c2, c3 = st.columns([2,2,1])
-                        c1.write(f"**{r['班級']}** | {r['檢查人員']}"); c2.image(str(r['照片路徑']).split(";")[0], width=150) if "http" in str(r['照片路徑']) else None
+                        c1.write(f"**{r['班級']}** | {r['檢查人員']}")
+                        c1.caption(f"登錄時間：{r['登錄時間']}") # [V4.1] 顯示詳細時間
+                        if "http" in str(r['照片路徑']): c2.image(str(r['照片路徑']).split(";")[0], width=150) 
                         
-                        if c3.button("✅ 通過", key=f"p_{r['紀錄ID']}"): 
+                        if c3.button("✅ 通過(+2)", key=f"p_{r['紀錄ID']}"): 
                             ws = get_worksheet(SHEET_TABS["main"])
                             id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
                             if str(r["紀錄ID"]) in id_list:
                                 ridx = id_list.index(str(r["紀錄ID"])) + 1
                                 ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, 2)
-                                st.cache_data.clear()
-                                st.rerun()
+                                st.cache_data.clear(); st.rerun()
                         if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}"): delete_rows_by_ids([str(r["紀錄ID"])]); st.rerun()
 
+            # T2: 成績總表
             with t2:
                 if st.button("🚀 計算全學期成績"):
                     full = load_full_semester_data_for_export()
@@ -745,6 +892,7 @@ try:
                     fin["總成績"] = 90 - fin["總扣分"]
                     st.dataframe(fin.sort_values("總成績", ascending=False))
 
+            # T3: 返校打掃
             with t3:
                 c1, c2 = st.columns(2)
                 rd, rc = c1.date_input("日期", today_tw, key="ret_date"), c2.selectbox("班級", all_classes, key="ret_cls")
@@ -760,11 +908,36 @@ try:
                         if st.form_submit_button("發放") and pf:
                             pf.seek(0); fb = pf.read()
                             norm = [m for m in pool if m not in spec]
-                            if norm: pf_n = io.BytesIO(fb); pf_n.name="p.jpg"; save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃"}, [pf_n], norm, base_h, "返校打掃(一般)")
-                            if spec: pf_s = io.BytesIO(fb); pf_s.name="p.jpg"; save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃"}, [pf_s], spec, spec_h, "返校打掃(加強)")
+                            if norm: pf_n = io.BytesIO(fb); pf_n.name="p.jpg"; save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")}, [pf_n], norm, base_h, "返校打掃(一般)")
+                            if spec: pf_s = io.BytesIO(fb); pf_s.name="p.jpg"; save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")}, [pf_s], spec, spec_h, "返校打掃(加強)")
                             st.success("已登記！"); st.rerun()
 
-            with t4: st.dataframe(load_main_data())
+            # T4: 明細
+            with t4:
+                df = load_main_data()
+                if not df.empty:
+                    st.dataframe(df[["登錄時間", "日期", "班級", "評分項目", "檢查人員", "備註", "違規細項", "紀錄ID"]].sort_values("登錄時間", ascending=False))
+
+            # T5: 寄信
+            with t5:
+                td = st.date_input("日期", today_tw, key="mail_d")
+                if st.button("預覽寄送名單"):
+                    df = load_main_data()
+                    day_df = df[df["日期"].astype(str) == str(td)]
+                    if day_df.empty: st.info("無資料")
+                    else:
+                        stats = day_df.groupby("班級")[["內掃原始分","外掃原始分","垃圾原始分","垃圾內掃原始分","垃圾外掃原始分","晨間打掃原始分","手機人數"]].sum()
+                        trash_t = stats["垃圾內掃原始分"] + stats["垃圾外掃原始分"]
+                        stats["Total"] = stats["內掃原始分"]+stats["外掃原始分"]+stats["晨間打掃原始分"]+stats["手機人數"] + trash_t + stats["垃圾原始分"]
+                        
+                        vios = stats[stats["Total"]>0].reset_index()
+                        mail_list = []
+                        for _, r in vios.iterrows():
+                            t_info = TEACHER_MAILS.get(r["班級"], {})
+                            mail_list.append({"班級":r["班級"], "扣分":r["Total"], "Email":t_info.get("email","")})
+                        st.dataframe(pd.DataFrame(mail_list))
+
+            # T6: 申訴
             with t6:
                 ap_df = load_appeals()
                 for i, r in ap_df[ap_df["處理狀態"]=="待處理"].iterrows():
@@ -774,9 +947,32 @@ try:
                         if c1.button("核可", key=f"ok_{i}"): update_appeal_status(i, "已核可", r["對應紀錄ID"]); st.rerun()
                         if c1.button("駁回", key=f"ng_{i}"): update_appeal_status(i, "已駁回", r["對應紀錄ID"]); st.rerun()
 
+            # T7: 設定
             with t7:
-                st.info("系統維護區")
+                curr = SYSTEM_CONFIG.get("semester_start")
+                nd = st.date_input("開學日", datetime.strptime(curr, "%Y-%m-%d").date() if curr else today_tw)
+                if st.button("更新開學日"): save_setting("semester_start", str(nd))
+                st.info("若需修改名單請直接至 Google Sheet 修改 inspectors / roster / office_areas 分頁")
                 if st.button("清除快取"): st.cache_data.clear(); st.success("Done")
+
+            # T_TRASH: 垃圾未到結算
+            with t_trash:
+                st.subheader("📉 今日垃圾未到結算")
+                check_date = st.date_input("結算日期", today_tw, key="settle_d")
+                if st.button("🔍 分析缺席名單"):
+                    df = load_main_data()
+                    today_df = df[(df["日期"].astype(str) == str(check_date)) & (df["評分項目"] == "垃圾/回收檢查")] if not df.empty else pd.DataFrame()
+                    signed_in_classes, signed_out_classes = set(), set()
+                    for _, row in today_df.iterrows():
+                        note = str(row.get("備註", ""))
+                        if "內掃" in note and ("一般" in note or "回收" in note): signed_in_classes.add(row["班級"])
+                        if "外掃" in note and ("一般" in note or "回收" in note): signed_out_classes.add(row["班級"])
+                    
+                    missing_in = sorted(list(set(all_classes) - signed_in_classes))
+                    missing_out = sorted(list(set(all_classes) - signed_out_classes)) 
+                    c1, c2 = st.columns(2)
+                    with c1: st.error(f"🏠 內掃未簽到 ({len(missing_in)} 班)"); st.write(", ".join(missing_in))
+                    with c2: st.error(f"🏢 外掃未簽到 ({len(missing_out)} 班)"); st.write(", ".join(missing_out))
 
 except Exception as e:
     st.error(f"❌ 系統發生錯誤: {str(e)}")
