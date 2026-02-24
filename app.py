@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import os
+import smtplib
 import time
 import io
 import traceback
@@ -10,6 +11,8 @@ import re
 import sqlite3
 import json
 import random
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, date, timedelta
 from datetime import timezone
 import pytz
@@ -21,7 +24,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ct
 from PIL import Image
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="中壢家商，衛愛而生 V4.6", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="中壢家商，衛愛而生 V4.6.1", layout="wide", page_icon="🧹")
 
 # --- 2. 核心參數與全域設定 ---
 try:
@@ -158,6 +161,27 @@ try:
                 (task_id, task_type, datetime.now(timezone.utc).isoformat(), json.dumps(payload, ensure_ascii=False)))
             conn.commit()
         return task_id
+
+    # 🚨 [V4.6.1 修復] 補回被誤刪的 get_queue_metrics 函式
+    def get_queue_metrics():
+        conn = get_queue_connection()
+        metrics = {"pending": 0, "retry": 0, "failed": 0, "oldest_pending_sec": 0, "recent_errors": []}
+        with _queue_lock:
+            cur = conn.cursor()
+            cur.execute("SELECT status, COUNT(*) FROM task_queue GROUP BY status")
+            for s, c in cur.fetchall():
+                if s == 'PENDING': metrics["pending"] = c
+                elif s == 'RETRY': metrics["retry"] = c
+                elif s == 'FAILED': metrics["failed"] = c
+            
+            cur.execute("SELECT MIN(created_ts) FROM task_queue WHERE status IN ('PENDING', 'RETRY')")
+            oldest = cur.fetchone()[0]
+            if oldest:
+                try: metrics["oldest_pending_sec"] = (datetime.now(pytz.utc) - datetime.fromisoformat(oldest.replace("Z", "+00:00"))).total_seconds()
+                except: pass
+            cur.execute("SELECT last_error, created_ts FROM task_queue WHERE status='FAILED' OR status='RETRY' ORDER BY created_ts DESC LIMIT 5")
+            metrics["recent_errors"] = cur.fetchall()
+        return metrics
 
     def fetch_next_task(max_attempts=6):
         conn = get_queue_connection()
@@ -613,7 +637,7 @@ try:
                 main_df = load_main_data()
 
                 if role == "垃圾/回收檢查":
-                    # [V4.6] 垃圾檢查分步驟，動態顯示選項
+                    # [V4.6.1] 垃圾檢查分步驟，動態顯示選項
                     st.info("🗑️ 資源回收與垃圾檢查 (每日每班此項目總扣分上限2分將於結算時自動卡控)")
                     
                     step_a = st.radio("步驟 A: 選擇垃圾類別", ["一般垃圾", "紙類", "網袋aka塑膠鐵鋁", "其他"], horizontal=True, key="m1_trash_a")
@@ -754,7 +778,6 @@ try:
                         st.caption(f"登錄時間：{r['登錄時間']}") 
                         st.write(f"備註: {r['備註']}")
                         
-                        # [V4.6] 顯示審核回覆
                         if ap_st:
                             if ap_st == "待處理": st.info("⏳ 申訴審核中...")
                             elif ap_st == "已核可": st.success(f"✅ 申訴成功。組長回覆: {ap_reply if ap_reply else '無'}")
@@ -806,7 +829,7 @@ try:
 
         if st.text_input("管理密碼", type="password", key="admin_pwd") == st.secrets["system_config"]["admin_password"]:
             
-            # [V4.6] 更新分頁名稱與順序
+            # [V4.6.1] 依照您的要求調整標籤名稱與順序
             t_mon, t_rollcall, t4, t_appeal, t2, t1, t_settings, t3 = st.tabs([
                 "👀 衛生糾察", "👮 環保糾察", "📝 扣分明細", "📣 申訴", "📊 成績總表", 
                 "🧹 晨掃審核", "⚙️ 設定", "🏫 返校打掃"
@@ -887,7 +910,6 @@ try:
                 if not df.empty:
                     st.dataframe(df[["登錄時間", "日期", "班級", "評分項目", "檢查人員", "備註", "違規細項", "紀錄ID"]].sort_values("登錄時間", ascending=False))
 
-            # [V4.6] 申訴分頁升級：顯示圖片與文字回覆
             with t_appeal:
                 st.subheader("📣 申訴審核")
                 ap_df = load_appeals()
@@ -903,14 +925,12 @@ try:
                             c1.write(f"**申訴理由**: {r['申訴理由']}")
                             c1.caption(f"違規日期: {r['違規日期']} | 申訴時間: {r['登錄時間']}")
                             
-                            # 顯示照片
                             img_urls = str(r.get('佐證照片', ''))
                             if img_urls and "http" in img_urls:
                                 c2.image([p for p in img_urls.split(";") if "http" in p], width=250)
                             else:
                                 c2.info("無佐證照片")
                                 
-                            # 回覆欄位
                             reply_text = c1.text_input("💬 審核回覆 (填寫後學生將在查詢頁面看到此說明)", key=f"reply_{i}")
                             
                             col_btn1, col_btn2 = c1.columns(2)
