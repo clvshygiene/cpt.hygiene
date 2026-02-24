@@ -788,7 +788,7 @@ try:
 
             with t_rollcall:
                 st.subheader("👮 環保糾察出勤點名")
-                st.info("💡 說明：此區專為「不會頻繁使用手機評分」的資收場糾察設計。勾選沒來的人，系統會自動幫有來的人發放 0.25 小時。")
+                st.info("💡 說明：勾選沒來的人，系統會自動幫有來的人發放 0.25 小時。")
                 
                 rc_date = st.date_input("出勤日期", today_tw, key="insp_rc_date")
                 
@@ -805,7 +805,7 @@ try:
                         
                         st.write(f"✅ 預計發放對象：共 {len(present_insps)} 人 (每人 0.25 小時)")
                         
-                        if st.form_submit_button("🚀 發放勞智糾察時數"):
+                        if st.form_submit_button("🚀 發放資收場服務時數"):
                             present_ids = [name.split("學號:")[1].strip() for name in present_insps if "學號:" in name]
                             if present_ids:
                                 payload = {
