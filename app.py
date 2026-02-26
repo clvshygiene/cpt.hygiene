@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import os
-import smtplib
 import time
 import io
 import traceback
@@ -11,8 +10,6 @@ import re
 import sqlite3
 import json
 import random
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from datetime import datetime, date, timedelta
 from datetime import timezone
 import pytz
@@ -31,7 +28,7 @@ except ImportError:
     NOTION_INSTALLED = False
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="中壢家商，衛愛而生 V5.0", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="中壢家商，衛愛而生 V5.2", layout="wide", page_icon="🧹")
 
 # --- 2. 核心參數與全域設定 ---
 try:
@@ -57,58 +54,42 @@ try:
     APPEAL_COLUMNS = ["申訴日期", "班級", "違規日期", "違規項目", "原始扣分", "申訴理由", "佐證照片", "處理狀態", "登錄時間", "對應紀錄ID", "審核回覆"]
 
     # ==========================================
-    # Notion API 輔助函式 [V5.0 新增]
+    # Notion API 輔助函式 
     # ==========================================
     @st.cache_resource
     def get_notion_client():
-        if NOTION_INSTALLED and "system_config" in st.secrets and "notion_token" in st.secrets["system_config"]:
-            return Client(auth=st.secrets["system_config"]["notion_token"])
+        if NOTION_INSTALLED:
+            token = st.secrets.get("notion_token") or st.secrets.get("system_config", {}).get("notion_token")
+            if token: return Client(auth=token)
         return None
 
     def fetch_available_notion_tasks():
         client = get_notion_client()
-        db_id = st.secrets["system_config"].get("notion_db_id", "") if "system_config" in st.secrets else ""
+        db_id = st.secrets.get("notion_db_id") or st.secrets.get("system_config", {}).get("notion_db_id")
         if not client or not db_id: return []
         
         try:
-            # 篩選出「任務狀態」為「待認領」的任務
             response = client.databases.query(
                 database_id=db_id,
-                filter={
-                    "property": "任務狀態",
-                    "status": {"equals": "待認領"}
-                }
+                filter={"property": "任務狀態", "status": {"equals": "待認領"}}
             )
             tasks = []
             for page in response.get("results", []):
                 props = page.get("properties", {})
-                
-                # 安全解析 Notion 格式
                 title = props.get("任務名稱", {}).get("title", [{}])
                 title_text = title[0].get("text", {}).get("content", "未命名任務") if title else "未命名任務"
-                
                 date_obj = props.get("執行日期", {}).get("date", {})
                 date_val = date_obj.get("start", "未定") if date_obj else "未定"
-                
                 area = props.get("打掃區域", {}).get("rich_text", [{}])
                 area_text = area[0].get("text", {}).get("content", "未填寫") if area else "未填寫"
                 
-                tasks.append({
-                    "id": page["id"],
-                    "title": title_text,
-                    "date": date_val,
-                    "area": area_text
-                })
+                tasks.append({"id": page["id"], "title": title_text, "date": date_val, "area": area_text})
             return tasks
         except Exception as e:
-            # 若 status 篩選失敗，嘗試用 select 格式過濾 (兼容 Notion 兩種屬性設定)
             try:
                 response = client.databases.query(
                     database_id=db_id,
-                    filter={
-                        "property": "任務狀態",
-                        "select": {"equals": "待認領"}
-                    }
+                    filter={"property": "任務狀態", "select": {"equals": "待認領"}}
                 )
                 tasks = []
                 for page in response.get("results", []):
@@ -128,7 +109,6 @@ try:
     def claim_notion_task(page_id, student_id):
         client = get_notion_client()
         try:
-            # 嘗試更新 Status 類型與填寫認領學號
             client.pages.update(
                 page_id=page_id,
                 properties={
@@ -138,7 +118,6 @@ try:
             )
             return True, ""
         except Exception as e:
-            # 若更新 Status 失敗，嘗試更新 Select 類型
             try:
                 client.pages.update(
                     page_id=page_id,
@@ -174,7 +153,6 @@ try:
     def get_credentials():
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         if "gcp_service_account" not in st.secrets:
-            st.error("❌ 找不到 secrets 設定")
             return None
         return ServiceAccountCredentials.from_json_keyfile_dict(dict(st.secrets["gcp_service_account"]), scope)
 
@@ -229,7 +207,7 @@ try:
             folder_id = st.secrets["system_config"]["drive_folder_id"]
             file = service.files().create(
                 body={'name': filename, 'parents': [folder_id]},
-                media_body=MediaIoBaseUpload(file_obj, mimetype='image/jpeg', resumable=True),
+                media_body=MediaIoBaseUpload(file_obj, mimetype='image/jpeg', resumable=False), 
                 fields='id', supportsAllDrives=True
             ).execute()
             try: service.permissions().create(fileId=file.get('id'), body={'role': 'reader', 'type': 'anyone'}).execute()
@@ -242,7 +220,7 @@ try:
         except: return str(val).strip()
 
     # ==========================================
-    # SQLite 背景佇列
+    # SQLite 背景佇列 & 本地防重複機制
     # ==========================================
     _queue_lock = threading.Lock()
 
@@ -252,6 +230,7 @@ try:
         try: conn.execute("PRAGMA journal_mode=WAL;"); conn.execute("PRAGMA busy_timeout=30000;")
         except: pass
         conn.execute("CREATE TABLE IF NOT EXISTS task_queue (id TEXT PRIMARY KEY, task_type TEXT, created_ts TEXT, payload_json TEXT, status TEXT, attempts INTEGER, last_error TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS service_issued (date TEXT, sid TEXT, category TEXT, PRIMARY KEY(date, sid, category))")
         conn.commit()
         return conn
 
@@ -307,36 +286,27 @@ try:
         def _action():
             ws = get_worksheet(SHEET_TABS["main"])
             if not ws: return
-            all_vals = ws.get_all_values()
-            if not all_vals: ws.append_row(EXPECTED_COLUMNS)
-            row = []
-            for col in EXPECTED_COLUMNS:
-                val = entry.get(col, "")
-                if isinstance(val, bool): val = str(val).upper()
-                if col == "日期": val = str(val)
-                row.append(val)
+            row = [str(entry.get(col, "")).upper() if isinstance(entry.get(col, ""), bool) else str(entry.get(col, "")) for col in EXPECTED_COLUMNS]
             ws.append_row(row)
         execute_with_retry(_action)
     
     def _append_service_row_unique(entry):
+        conn = get_queue_connection()
+        t_date = str(entry.get("日期", ""))
+        t_sid = str(entry.get("學號", ""))
+        t_cat = str(entry.get("類別", ""))
+        
+        try:
+            with _queue_lock:
+                conn.execute("INSERT INTO service_issued VALUES (?, ?, ?)", (t_date, t_sid, t_cat))
+                conn.commit()
+        except sqlite3.IntegrityError:
+            return 
+            
         def _action():
             ws = get_worksheet(SHEET_TABS["service_hours"])
             if not ws: return
-            all_vals = ws.get_all_values()
-            
-            t_date = str(entry.get("日期", ""))
-            t_sid = str(entry.get("學號", ""))
-            t_cat = str(entry.get("類別", ""))
-            
-            for row in reversed(all_vals):
-                if len(row) >= 4:
-                    if row[0] == t_date and row[1] == t_sid and row[3] == t_cat:
-                        return 
-                        
-            new_row = [
-                t_date, t_sid, str(entry.get("班級", "")),
-                t_cat, str(entry.get("時數", "")), str(entry.get("紀錄ID", ""))
-            ]
+            new_row = [t_date, t_sid, str(entry.get("班級", "")), t_cat, str(entry.get("時數", "")), str(entry.get("紀錄ID", ""))]
             ws.append_row(new_row)
         execute_with_retry(_action)
 
@@ -417,11 +387,14 @@ try:
 
     @st.cache_resource
     def ensure_worker_started():
-        stop_event = threading.Event()
-        t = threading.Thread(target=background_worker, args=(stop_event,), daemon=True)
-        add_script_run_ctx(t)
-        t.start()
-        return stop_event
+        # [V5.2 修改] 退回最穩定的單工模式 (1 Thread)，避免 60 人上傳時 RAM 撐爆 OOM
+        if "workers_started" not in st.session_state:
+            stop_event = threading.Event()
+            t = threading.Thread(target=background_worker, args=(stop_event,), daemon=True)
+            add_script_run_ctx(t)
+            t.start()
+            st.session_state["workers_started"] = True
+            return stop_event
     _ = ensure_worker_started()
 
     # ==========================================
@@ -579,7 +552,9 @@ try:
                     m_data = ws_main.get_all_records()
                     m_row = next((j + 2 for j, mr in enumerate(m_data) if str(mr.get("紀錄ID")) == str(record_id)), None)
                     if m_row: ws_main.update_cell(m_row, EXPECTED_COLUMNS.index("修正") + 1, "TRUE")
-                st.cache_data.clear(); return True, "更新成功"
+                load_main_data.clear()
+                load_appeals.clear()
+                return True, "更新成功"
             return False, "找不到對應的申訴列"
         except Exception as e: return False, str(e)
 
@@ -589,7 +564,9 @@ try:
         try:
             rows = sorted([i + 2 for i, r in enumerate(ws.get_all_records()) if str(r.get("紀錄ID")) in ids], reverse=True)
             for r in rows: ws.delete_rows(r)
-            time.sleep(0.8); st.cache_data.clear(); return True
+            time.sleep(0.8); 
+            load_main_data.clear()
+            return True
         except Exception as e: st.error(f"刪除失敗: {e}"); return False
 
     @st.cache_data(ttl=21600)
@@ -705,18 +682,18 @@ try:
 
     st.sidebar.title("🏫 功能選單")
     
-    # [V5.0 新增] 左側選單加入愛校服務認領
     menu_options = ["糾察底家👀", "班級負責人🥸", "晨掃志工隊🧹", "愛校任務認領 🤝", "組長ㄉ窩💃"]
     app_mode = st.sidebar.radio("請選擇模式", menu_options)
 
-    # --- Mode: 愛校任務認領 🤝 [V5.0 新增] ---
+    # --- Mode: 愛校任務認領 🤝 ---
     if app_mode == "愛校任務認領 🤝":
         st.title("🤝 愛校服務認領區")
         st.info("💡 這裡的任務清單與 Notion 行事曆即時同步！成功認領後，任務會自動標記並更新。")
         
+        n_token = st.secrets.get("notion_token") or st.secrets.get("system_config", {}).get("notion_token")
         if not NOTION_INSTALLED:
             st.error("⚠️ 系統偵測到未安裝 `notion-client` 套件，請通知管理員檢查系統設定。")
-        elif "system_config" not in st.secrets or "notion_token" not in st.secrets["system_config"]:
+        elif not n_token:
             st.warning("⚠️ Notion 金鑰尚未設定，請通知管理員至後台設定 `notion_token`。")
         else:
             with st.spinner("正在向 Notion 獲取最新任務..."):
@@ -1209,7 +1186,8 @@ try:
                             if str(r["紀錄ID"]) in id_list:
                                 ridx = id_list.index(str(r["紀錄ID"])) + 1
                                 ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, 2)
-                                st.cache_data.clear(); st.rerun()
+                                load_main_data.clear()
+                                st.rerun()
                         if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}"): delete_rows_by_ids([str(r["紀錄ID"])]); st.rerun()
 
             with t_settings:
@@ -1218,7 +1196,6 @@ try:
                 nd = st.date_input("開學日", datetime.strptime(curr, "%Y-%m-%d").date() if curr else today_tw)
                 if st.button("更新開學日"): save_setting("semester_start", str(nd))
                 
-                # [V4.8] 系統狀態與快取按鈕移至設定分頁
                 st.markdown("---")
                 st.write("🔧 系統連線狀態")
                 if get_gspread_client(): st.success("✅ Google Sheets 連線正常")
