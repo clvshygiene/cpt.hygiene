@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import os
+import smtplib
 import time
 import io
 import traceback
@@ -10,6 +11,9 @@ import re
 import sqlite3
 import json
 import random
+import concurrent.futures  # [V5.3 新增] 用來處理硬超時
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, date, timedelta
 from datetime import timezone
 import pytz
@@ -28,12 +32,12 @@ except ImportError:
     NOTION_INSTALLED = False
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="中壢家商，衛愛而生 V5.2", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
 
 # --- 2. 核心參數與全域設定 ---
 try:
     TW_TZ = pytz.timezone('Asia/Taipei')
-    MAX_IMAGE_BYTES = 10 * 1024 * 1024
+    MAX_IMAGE_BYTES = 200 * 1024 * 1024  # [V5.4 修改] 放寬至 200MB
     QUEUE_DB_PATH = "task_queue_v4_wal.db"
     IMG_DIR = "evidence_photos"
     os.makedirs(IMG_DIR, exist_ok=True)
@@ -54,7 +58,7 @@ try:
     APPEAL_COLUMNS = ["申訴日期", "班級", "違規日期", "違規項目", "原始扣分", "申訴理由", "佐證照片", "處理狀態", "登錄時間", "對應紀錄ID", "審核回覆"]
 
     # ==========================================
-    # Notion API 輔助函式 
+    # Notion API 輔助函式 [V5.4 欄位名稱與 Emoji 修正]
     # ==========================================
     @st.cache_resource
     def get_notion_client():
@@ -71,40 +75,25 @@ try:
         try:
             response = client.databases.query(
                 database_id=db_id,
-                filter={"property": "任務狀態", "status": {"equals": "待認領"}}
+                filter={"property": "任務狀態", "status": {"equals": "等待認領中😿"}}
             )
             tasks = []
             for page in response.get("results", []):
                 props = page.get("properties", {})
                 title = props.get("任務名稱", {}).get("title", [{}])
                 title_text = title[0].get("text", {}).get("content", "未命名任務") if title else "未命名任務"
-                date_obj = props.get("執行日期", {}).get("date", {})
+                
+                date_obj = props.get("任務日期", {}).get("date", {})
                 date_val = date_obj.get("start", "未定") if date_obj else "未定"
-                area = props.get("打掃區域", {}).get("rich_text", [{}])
+                
+                area = props.get("任務內容", {}).get("rich_text", [{}])
                 area_text = area[0].get("text", {}).get("content", "未填寫") if area else "未填寫"
                 
                 tasks.append({"id": page["id"], "title": title_text, "date": date_val, "area": area_text})
             return tasks
         except Exception as e:
-            try:
-                response = client.databases.query(
-                    database_id=db_id,
-                    filter={"property": "任務狀態", "select": {"equals": "待認領"}}
-                )
-                tasks = []
-                for page in response.get("results", []):
-                    props = page.get("properties", {})
-                    title = props.get("任務名稱", {}).get("title", [{}])
-                    title_text = title[0].get("text", {}).get("content", "未命名任務") if title else "未命名任務"
-                    date_obj = props.get("執行日期", {}).get("date", {})
-                    date_val = date_obj.get("start", "未定") if date_obj else "未定"
-                    area = props.get("打掃區域", {}).get("rich_text", [{}])
-                    area_text = area[0].get("text", {}).get("content", "未填寫") if area else "未填寫"
-                    tasks.append({"id": page["id"], "title": title_text, "date": date_val, "area": area_text})
-                return tasks
-            except Exception as e2:
-                print(f"Notion API 讀取失敗: {e2}")
-                return []
+            print(f"Notion API 讀取失敗: {e}")
+            return []
 
     def claim_notion_task(page_id, student_id):
         client = get_notion_client()
@@ -112,32 +101,31 @@ try:
             client.pages.update(
                 page_id=page_id,
                 properties={
-                    "任務狀態": {"status": {"name": "已認領"}},
+                    "任務狀態": {"status": {"name": "被認領走了! 😼"}},
                     "認領學號": {"rich_text": [{"text": {"content": str(student_id)}}]}
                 }
             )
             return True, ""
         except Exception as e:
-            try:
-                client.pages.update(
-                    page_id=page_id,
-                    properties={
-                        "任務狀態": {"select": {"name": "已認領"}},
-                        "認領學號": {"rich_text": [{"text": {"content": str(student_id)}}]}
-                    }
-                )
-                return True, ""
-            except Exception as e2:
-                return False, str(e2)
+            return False, str(e)
 
     # ==========================================
-    # SRE Utils: 重試機制
+    # SRE Utils: 重試機制 [V5.3 神級進化：30秒硬超時防假死]
     # ==========================================
-    def execute_with_retry(func, max_retries=5, base_delay=1.0):
+    def execute_with_retry(func, max_retries=5, base_delay=1.0, timeout=30):
         for attempt in range(max_retries):
             try:
                 time.sleep(0.3 + random.uniform(0, 0.2)) 
-                return func()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(func)
+                    return future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                print(f"API Hard Timeout on attempt {attempt+1}")
+                if attempt < max_retries - 1:
+                    sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0, 1)
+                    time.sleep(sleep_time)
+                else: 
+                    raise Exception("API 連線超時，請稍後再試")
             except Exception as e:
                 error_str = str(e).lower()
                 is_retryable = any(x in error_str for x in ['429', '500', '503', 'quota', 'rate limit', 'timed out', 'connection'])
@@ -220,10 +208,8 @@ try:
         except: return str(val).strip()
 
     # ==========================================
-    # SQLite 背景佇列 & 本地防重複機制
+    # SQLite 背景佇列 & 本地防重複機制 [V5.4 移除全域鎖，改為原子搶任務]
     # ==========================================
-    _queue_lock = threading.Lock()
-
     @st.cache_resource
     def get_queue_connection():
         conn = sqlite3.connect(QUEUE_DB_PATH, check_same_thread=False, timeout=30.0, isolation_level="IMMEDIATE")
@@ -237,16 +223,15 @@ try:
     def enqueue_task(task_type, payload):
         conn = get_queue_connection()
         task_id = str(uuid.uuid4())
-        with _queue_lock:
-            conn.execute("INSERT INTO task_queue VALUES (?, ?, ?, ?, 'PENDING', 0, NULL)",
-                (task_id, task_type, datetime.now(timezone.utc).isoformat(), json.dumps(payload, ensure_ascii=False)))
-            conn.commit()
+        conn.execute("INSERT INTO task_queue VALUES (?, ?, ?, ?, 'PENDING', 0, NULL)",
+            (task_id, task_type, datetime.now(timezone.utc).isoformat(), json.dumps(payload, ensure_ascii=False)))
+        conn.commit()
         return task_id
 
     def get_queue_metrics():
         conn = get_queue_connection()
         metrics = {"pending": 0, "retry": 0, "failed": 0, "oldest_pending_sec": 0, "recent_errors": []}
-        with _queue_lock:
+        try:
             cur = conn.cursor()
             cur.execute("SELECT status, COUNT(*) FROM task_queue GROUP BY status")
             for s, c in cur.fetchall():
@@ -261,23 +246,36 @@ try:
                 except: pass
             cur.execute("SELECT last_error, created_ts FROM task_queue WHERE status='FAILED' OR status='RETRY' ORDER BY created_ts DESC LIMIT 5")
             metrics["recent_errors"] = cur.fetchall()
+        except: pass
         return metrics
 
     def fetch_next_task(max_attempts=6):
         conn = get_queue_connection()
-        with _queue_lock:
+        try:
             cur = conn.cursor()
-            cur.execute("SELECT id, task_type, created_ts, payload_json, status, attempts, last_error FROM task_queue WHERE status IN ('PENDING', 'RETRY') AND attempts < ? ORDER BY created_ts ASC LIMIT 1", (max_attempts,))
+            # 利用 SQLite 3.35+ 的 RETURNING 達成原子性搶奪任務，完全無須 Python Lock
+            cur.execute("""
+                UPDATE task_queue 
+                SET status = 'IN_PROGRESS', attempts = attempts + 1 
+                WHERE id = (
+                    SELECT id FROM task_queue 
+                    WHERE status IN ('PENDING', 'RETRY') AND attempts < ?
+                    ORDER BY created_ts ASC LIMIT 1
+                )
+                RETURNING id, task_type, created_ts, payload_json, status, attempts, last_error
+            """, (max_attempts,))
             row = cur.fetchone()
-            if not row: return None
-            cur.execute("UPDATE task_queue SET status = 'IN_PROGRESS', attempts = attempts + 1 WHERE id = ?", (row[0],))
             conn.commit()
-            return {"id": row[0], "task_type": row[1], "payload": json.loads(row[3]) if row[3] else {}, "attempts": row[5] + 1}
+            
+            if not row: return None
+            return {"id": row[0], "task_type": row[1], "payload": json.loads(row[3]) if row[3] else {}, "attempts": row[5]}
+        except Exception as e:
+            print(f"抓取任務時發生錯誤: {e}")
+            return None
 
     def update_task_status(task_id, status, attempts, last_error):
-        with _queue_lock:
-            get_queue_connection().execute("UPDATE task_queue SET status = ?, attempts = ?, last_error = ? WHERE id = ?", (status, attempts, last_error, task_id))
-            get_queue_connection().commit()
+        get_queue_connection().execute("UPDATE task_queue SET status = ?, attempts = ?, last_error = ? WHERE id = ?", (status, attempts, last_error, task_id))
+        get_queue_connection().commit()
 
     # ==========================================
     # 背景處理邏輯
@@ -297,9 +295,8 @@ try:
         t_cat = str(entry.get("類別", ""))
         
         try:
-            with _queue_lock:
-                conn.execute("INSERT INTO service_issued VALUES (?, ?, ?)", (t_date, t_sid, t_cat))
-                conn.commit()
+            conn.execute("INSERT INTO service_issued VALUES (?, ?, ?)", (t_date, t_sid, t_cat))
+            conn.commit()
         except sqlite3.IntegrityError:
             return 
             
@@ -387,7 +384,6 @@ try:
 
     @st.cache_resource
     def ensure_worker_started():
-        # [V5.2 修改] 退回最穩定的單工模式 (1 Thread)，避免 60 人上傳時 RAM 撐爆 OOM
         if "workers_started" not in st.session_state:
             stop_event = threading.Event()
             t = threading.Thread(target=background_worker, args=(stop_event,), daemon=True)
@@ -564,8 +560,7 @@ try:
         try:
             rows = sorted([i + 2 for i, r in enumerate(ws.get_all_records()) if str(r.get("紀錄ID")) in ids], reverse=True)
             for r in rows: ws.delete_rows(r)
-            time.sleep(0.8); 
-            load_main_data.clear()
+            time.sleep(0.8); load_main_data.clear()
             return True
         except Exception as e: st.error(f"刪除失敗: {e}"); return False
 
@@ -700,7 +695,7 @@ try:
                 tasks = fetch_available_notion_tasks()
                 
             if not tasks:
-                st.success("🎉 目前沒有待認領的愛校服務任務喔！大家都非常棒！")
+                st.success("🎉 目前沒有待認領的愛校服務任務喔")
                 st.balloons()
             else:
                 st.write(f"目前共有 **{len(tasks)}** 個待認領的任務：")
@@ -711,7 +706,7 @@ try:
                         with col1:
                             st.subheader(f"📌 {t['title']}")
                             st.write(f"📅 **執行日期:** {t['date']}")
-                            st.write(f"🧹 **打掃區域:** {t['area']}")
+                            st.write(f"🧹 **任務內容:** {t['area']}")
                         
                         with col2:
                             with st.form(f"claim_form_{t['id']}"):
@@ -730,7 +725,7 @@ try:
                                             time.sleep(2)
                                             st.rerun()
                                         else:
-                                            st.error(f"認領失敗，請確認 Notion 欄位名稱是否為「任務狀態」與「認領學號」。錯誤代碼：{err}")
+                                            st.error(f"認領失敗，請確認 Notion 欄位名稱設定是否正確。錯誤代碼：{err}")
 
     # --- Mode 1: 糾察評分 ---
     elif app_mode == "糾察底家👀":
@@ -981,10 +976,11 @@ try:
     elif app_mode == "組長ㄉ窩💃":
         st.title("⚙️ 管理後台")
         metrics = get_queue_metrics()
-        c1, c2, c3 = st.columns(3)
-        c1.metric("待處理", metrics["pending"])
-        c2.metric("失敗", metrics["failed"])
-        c3.metric("延遲(s)", int(metrics["oldest_pending_sec"]))
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("待處理", metrics.get("pending", 0))
+        col2.metric("失敗", metrics.get("failed", 0))
+        col3.metric("延遲(s)", int(metrics.get("oldest_pending_sec", 0)))
 
         pwd_input = st.text_input("管理密碼", type="password", key="admin_pwd")
         if pwd_input == st.secrets["system_config"]["admin_password"]:
@@ -1162,7 +1158,7 @@ try:
                             rep = full.groupby("班級")["總扣分"].sum().reset_index()
                             cls_df = pd.DataFrame(structured_classes).rename(columns={"grade":"年級","name":"班級"})
                             fin = pd.merge(cls_df, rep, on="班級", how="left").fillna(0)
-                            fin["總成績"] = 90 - fin["總扣分"] 
+                            fin["總成績"] = 90 - full["總扣分"] 
                             
                             if sem_rank_mode == "全校": st.dataframe(fin.sort_values("總成績", ascending=False))
                             else:
