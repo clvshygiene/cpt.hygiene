@@ -21,10 +21,10 @@ from oauth2client.service_account import ServiceAccountCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
-from PIL import Image
+from PIL import Image, ImageOps
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="中壢家商，衛愛而生 V4.6.1", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="中壢家商，衛愛而生 V4.8", layout="wide", page_icon="🧹")
 
 # --- 2. 核心參數與全域設定 ---
 try:
@@ -47,7 +47,6 @@ try:
         "內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數",
         "備註", "違規細項", "照片路徑", "登錄時間", "修正", "晨掃未到者", "紀錄ID"
     ]
-    # [V4.6] 申訴欄位增加 "審核回覆"
     APPEAL_COLUMNS = ["申訴日期", "班級", "違規日期", "違規項目", "原始扣分", "申訴理由", "佐證照片", "處理狀態", "登錄時間", "對應紀錄ID", "審核回覆"]
 
     # ==========================================
@@ -111,6 +110,7 @@ try:
     def compress_image_bytes(file_bytes, quality=70):
         try:
             img = Image.open(io.BytesIO(file_bytes))
+            img = ImageOps.exif_transpose(img)
             if img.mode != "RGB": img = img.convert("RGB")
             if img.width > 1600:
                 ratio = 1600 / float(img.width)
@@ -162,7 +162,6 @@ try:
             conn.commit()
         return task_id
 
-    # 🚨 [V4.6.1 修復] 補回被誤刪的 get_queue_metrics 函式
     def get_queue_metrics():
         conn = get_queue_connection()
         metrics = {"pending": 0, "retry": 0, "failed": 0, "oldest_pending_sec": 0, "recent_errors": []}
@@ -324,7 +323,7 @@ try:
     _ = ensure_worker_started()
 
     # ==========================================
-    # 前端資料讀取 (全數掛上 TTL Cache 降低請求)
+    # 前端資料讀取 
     # ==========================================
     @st.cache_data(ttl=21600)
     def load_holidays():
@@ -464,7 +463,6 @@ try:
         st.success("📩 申訴已排入背景處理")
         return True
     
-    # [V4.6] 支援寫入申訴回覆
     def update_appeal_status(idx, status, record_id, reply_text=""):
         ws_appeals, ws_main = get_worksheet(SHEET_TABS["appeals"]), get_worksheet(SHEET_TABS["main"])
         try:
@@ -472,7 +470,6 @@ try:
             t_row = next((i + 2 for i, r in enumerate(data) if str(r.get("對應紀錄ID")) == str(record_id) and str(r.get("處理狀態")) == "待處理"), None)
             if t_row:
                 ws_appeals.update_cell(t_row, APPEAL_COLUMNS.index("處理狀態") + 1, status)
-                # 寫入回覆
                 if "審核回覆" in APPEAL_COLUMNS:
                     ws_appeals.update_cell(t_row, APPEAL_COLUMNS.index("審核回覆") + 1, reply_text)
                     
@@ -493,7 +490,6 @@ try:
             time.sleep(0.8); st.cache_data.clear(); return True
         except Exception as e: st.error(f"刪除失敗: {e}"); return False
 
-    # [V4.6] 權限與分類雙軌制過濾
     @st.cache_data(ttl=21600)
     def load_inspector_list():
         ws = get_worksheet(SHEET_TABS["inspectors"])
@@ -507,7 +503,6 @@ try:
                 for _, row in df.iterrows():
                     sid, s_role = clean_id(row[id_c]), str(row[r_c]).strip() if r_c else ""
                     
-                    # 判斷基礎權限
                     allowed = []
                     if "組長" in s_role:
                         allowed = ["內掃檢查", "外掃檢查", "垃圾/回收檢查", "晨間打掃"]
@@ -517,7 +512,6 @@ try:
                         if "晨" in s_role: allowed.append("晨間打掃")
                         if "內掃" in s_role: allowed.append("內掃檢查")
                         
-                        # 覆蓋特殊權限
                         if "衛生糾察隊長" in s_role or "機動" in s_role:
                             allowed = [r for r in allowed if r != "垃圾/回收檢查"]
                             if not allowed: allowed = ["內掃檢查", "外掃檢查"]
@@ -548,6 +542,8 @@ try:
     def save_entry(new_entry, uploaded_files=None, student_list=None, custom_hours=0.5, custom_category="晨掃志工"):
         new_entry["日期"] = str(new_entry.get("日期", str(date.today())))
         new_entry["紀錄ID"] = new_entry.get("紀錄ID", f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}")
+        if "登錄時間" not in new_entry or not new_entry["登錄時間"]:
+            new_entry["登錄時間"] = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
         image_paths, file_names = [], []
         if uploaded_files:
@@ -590,6 +586,10 @@ try:
     now_tw = datetime.now(TW_TZ)
     today_tw = now_tw.date()
     
+    # [V4.8] 初始化防連點 Session State
+    if "last_action_time" not in st.session_state:
+        st.session_state.last_action_time = 0
+    
     SYSTEM_CONFIG, ROSTER_DICT, INSPECTOR_LIST = load_settings(), load_roster_dict(), load_inspector_list()
     all_classes, structured_classes = load_sorted_classes()
     if not all_classes: all_classes, structured_classes = ["測試班級"], [{"grade": "其他", "name": "測試班級"}]
@@ -605,20 +605,21 @@ try:
     st.sidebar.title("🏫 功能選單")
     app_mode = st.sidebar.radio("請選擇模式", ["糾察底家👀", "班級負責人🥸", "晨掃志工隊🧹", "組長ㄉ窩💃"])
 
-    with st.sidebar.expander("🔧 系統狀態 (名單異常請點此)", expanded=True):
-        if get_gspread_client(): st.success("✅ Google Sheets 連線正常")
-        else: st.error("❌ Google Sheets 連線失敗")
-        if st.button("🔄 重讀名單 (清除快取)"): st.cache_data.clear(); st.rerun()
-
     # --- Mode 1: 糾察評分 ---
     if app_mode == "糾察底家👀":
         st.title("📝 衛生糾察評分系統")
         if "team_logged_in" not in st.session_state: st.session_state["team_logged_in"] = False
         
+        # [V4.8] 改為直接按 Enter 登入
         if not st.session_state["team_logged_in"]:
             with st.expander("🔐 身份驗證", expanded=True):
-                if st.button("登入") if st.text_input("請輸入隊伍通行碼", type="password") == st.secrets["system_config"]["team_password"] else False:
-                    st.session_state["team_logged_in"] = True; st.rerun()
+                pwd_input = st.text_input("請輸入隊伍通行碼", type="password", key="m1_login_pwd")
+                if pwd_input:
+                    if pwd_input == st.secrets["system_config"]["team_password"]:
+                        st.session_state["team_logged_in"] = True
+                        st.rerun()
+                    else:
+                        st.error("通行碼錯誤")
         
         if st.session_state["team_logged_in"]:
             prefixes = sorted(list(set([p["id_prefix"] for p in INSPECTOR_LIST])))
@@ -637,7 +638,6 @@ try:
                 main_df = load_main_data()
 
                 if role == "垃圾/回收檢查":
-                    # [V4.6.1] 垃圾檢查分步驟，動態顯示選項
                     st.info("🗑️ 資源回收與垃圾檢查 (每日每班此項目總扣分上限2分將於結算時自動卡控)")
                     
                     step_a = st.radio("步驟 A: 選擇垃圾類別", ["一般垃圾", "紙類", "網袋aka塑膠鐵鋁", "其他"], horizontal=True, key="m1_trash_a")
@@ -659,7 +659,6 @@ try:
                             if step_a != "一般垃圾": row_data["未倒垃圾"] = is_dump_bad
                             rows.append(row_data)
                             
-                        # 動態欄位設定
                         col_config = {"處室/區域": st.column_config.TextColumn(disabled=True), "負責班級": st.column_config.TextColumn(disabled=True)}
                         if step_a != "一般垃圾": col_config["未倒垃圾"] = st.column_config.CheckboxColumn("🗑️ 未倒垃圾", help="扣1分")
                         col_config["未做好分類"] = st.column_config.CheckboxColumn("♻️ 未做好分類", help="扣1分")
@@ -667,23 +666,28 @@ try:
                         edited_df = st.data_editor(pd.DataFrame(rows), column_config=col_config, hide_index=True, width="stretch", key="ed_offices")
                         
                         if st.button(f"💾 登記違規 ({step_a} - 各處室)"):
-                            cnt = 0
-                            for _, row in edited_df.iterrows():
-                                off, cls = row["處室/區域"], row["負責班級"]
-                                b_sort = row.get("未做好分類", False)
-                                b_dump = row.get("未倒垃圾", False)
-                                
-                                orig = next((x for x in rows if x["處室/區域"] == off), None)
-                                v_list = []
-                                if b_dump and not orig.get("未倒垃圾", False): v_list.append("未倒垃圾")
-                                if b_sort and not orig.get("未做好分類", False): v_list.append("未做好分類")
-                                
-                                if v_list:
-                                    score = len(v_list)
-                                    base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "班級": cls, "評分項目": role, "垃圾內掃原始分": 0, "垃圾外掃原始分": score}
-                                    save_entry({**base, "備註": f"外掃({off})-{step_a}({','.join(v_list)})", "違規細項": step_a})
-                                    cnt += 1
-                            if cnt: st.success(f"✅ 已登記 {cnt} 筆違規！"); time.sleep(1); st.rerun()
+                            # [V4.8 防連點保護]
+                            if time.time() - st.session_state.last_action_time < 3:
+                                st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                            else:
+                                st.session_state.last_action_time = time.time()
+                                cnt = 0
+                                for _, row in edited_df.iterrows():
+                                    off, cls = row["處室/區域"], row["負責班級"]
+                                    b_sort = row.get("未做好分類", False)
+                                    b_dump = row.get("未倒垃圾", False)
+                                    
+                                    orig = next((x for x in rows if x["處室/區域"] == off), None)
+                                    v_list = []
+                                    if b_dump and not orig.get("未倒垃圾", False): v_list.append("未倒垃圾")
+                                    if b_sort and not orig.get("未做好分類", False): v_list.append("未做好分類")
+                                    
+                                    if v_list:
+                                        score = len(v_list)
+                                        base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "班級": cls, "評分項目": role, "垃圾內掃原始分": 0, "垃圾外掃原始分": score}
+                                        save_entry({**base, "備註": f"外掃({off})-{step_a}({','.join(v_list)})", "違規細項": step_a})
+                                        cnt += 1
+                                if cnt: st.success(f"✅ 已登記 {cnt} 筆違規！"); time.sleep(1.5); st.rerun()
 
                     else:
                         for cls_name in [c["name"] for c in structured_classes if c["grade"] == sel_filter]:
@@ -701,24 +705,30 @@ try:
                         col_config["未做好分類"] = st.column_config.CheckboxColumn("♻️ 未做好分類", help="扣1分")
                             
                         edited_df = st.data_editor(pd.DataFrame(rows), column_config=col_config, hide_index=True, width="stretch", key=f"ed_{sel_filter}")
+                        
                         if st.button(f"💾 登記違規 ({step_a} - {sel_filter})"):
-                            cnt = 0
-                            for _, row in edited_df.iterrows():
-                                cls = row["班級"]
-                                b_sort = row.get("未做好分類", False)
-                                b_dump = row.get("未倒垃圾", False)
-                                
-                                orig = next((x for x in rows if x["班級"] == cls), None)
-                                v_list = []
-                                if b_dump and not orig.get("未倒垃圾", False): v_list.append("未倒垃圾")
-                                if b_sort and not orig.get("未做好分類", False): v_list.append("未做好分類")
-                                
-                                if v_list:
-                                    score = len(v_list)
-                                    base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "班級": cls, "評分項目": role, "垃圾內掃原始分": score, "垃圾外掃原始分": 0}
-                                    save_entry({**base, "備註": f"內掃-{step_a}({','.join(v_list)})", "違規細項": step_a})
-                                    cnt += 1
-                            if cnt: st.success(f"✅ 已登記 {cnt} 筆違規！"); time.sleep(1); st.rerun()
+                            # [V4.8 防連點保護]
+                            if time.time() - st.session_state.last_action_time < 3:
+                                st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                            else:
+                                st.session_state.last_action_time = time.time()
+                                cnt = 0
+                                for _, row in edited_df.iterrows():
+                                    cls = row["班級"]
+                                    b_sort = row.get("未做好分類", False)
+                                    b_dump = row.get("未倒垃圾", False)
+                                    
+                                    orig = next((x for x in rows if x["班級"] == cls), None)
+                                    v_list = []
+                                    if b_dump and not orig.get("未倒垃圾", False): v_list.append("未倒垃圾")
+                                    if b_sort and not orig.get("未做好分類", False): v_list.append("未做好分類")
+                                    
+                                    if v_list:
+                                        score = len(v_list)
+                                        base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "班級": cls, "評分項目": role, "垃圾內掃原始分": score, "垃圾外掃原始分": 0}
+                                        save_entry({**base, "備註": f"內掃-{step_a}({','.join(v_list)})", "違規細項": step_a})
+                                        cnt += 1
+                                if cnt: st.success(f"✅ 已登記 {cnt} 筆違規！"); time.sleep(1.5); st.rerun()
 
                 else:
                     assigned_classes = curr_inspector.get("assigned_classes", [])
@@ -743,11 +753,20 @@ try:
                                     note = " ".join([x for x in [st.selectbox("區域", ["", "走廊", "樓梯", "廁所", "操場"]), st.selectbox("狀況", ["", "很髒", "沒掃"]), st.text_input("補充")] if x])
                             is_fix = st.checkbox("🚩 這是修正單")
                             files = st.file_uploader("📸 違規照片", accept_multiple_files=True)
+                            
                             if st.form_submit_button("送出"):
-                                if (in_s + out_s) > 0 and not files: st.error("扣分需照片")
+                                # [V4.8 防連點保護]
+                                if time.time() - st.session_state.last_action_time < 3:
+                                    st.warning("⚠️ 系統處理中，請勿連續點擊！")
                                 else:
-                                    save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note}, uploaded_files=files)
-                                    st.success("✅ 送出成功！系統將自動排程發放本日 0.25 小時。"); st.rerun()
+                                    st.session_state.last_action_time = time.time()
+                                    if (in_s + out_s) > 0 and not files: 
+                                        st.error("扣分需照片")
+                                    else:
+                                        save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note}, uploaded_files=files)
+                                        st.success("✅ 送出成功！系統將自動排程發放本日 0.25 小時。")
+                                        time.sleep(1.5)
+                                        st.rerun()
 
     # --- Mode 2: 班級負責人 ---
     elif app_mode == "班級負責人🥸":
@@ -773,10 +792,12 @@ try:
                     
                     icon = "✅" if ap_st=="已核可" else "🚫" if ap_st=="已駁回" else "⏳" if ap_st=="待處理" else "🛠️" if str(r['修正'])=="TRUE" else ""
                     
-                    time_str = str(r.get('登錄時間', '')).split(' ')[-1] if str(r.get('登錄時間', '')) else ''
+                    disp_time = str(r.get('登錄時間', ''))
+                    time_str = disp_time.split(' ')[-1] if disp_time else ''
                     with st.expander(f"{icon} {r['日期']} {time_str} - {r['評分項目']} (扣:{tot})"):
-                        st.caption(f"登錄時間：{r['登錄時間']}") 
-                        st.write(f"備註: {r['備註']}")
+                        st.caption(f"登錄時間：{disp_time if disp_time else '未紀錄'}") 
+                        st.write(f"🧑‍✈️ **評分人員:** {r.get('檢查人員', '未知')}")
+                        st.write(f"📝 **備註:** {r['備註']}")
                         
                         if ap_st:
                             if ap_st == "待處理": st.info("⏳ 申訴審核中...")
@@ -788,8 +809,14 @@ try:
                             with st.form(f"ap_{rid}"):
                                 rsn, pf = st.text_area("理由"), st.file_uploader("佐證", type=['jpg','png'])
                                 if st.form_submit_button("申訴") and rsn and pf:
-                                    save_appeal({"班級": cls, "違規日期": str(r["日期"]), "違規項目": r['評分項目'], "原始扣分": str(tot), "申訴理由": rsn, "對應紀錄ID": rid}, pf)
-                                    st.rerun()
+                                    # [V4.8 防連點保護]
+                                    if time.time() - st.session_state.last_action_time < 3:
+                                        st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                                    else:
+                                        st.session_state.last_action_time = time.time()
+                                        save_appeal({"班級": cls, "違規日期": str(r["日期"]), "違規項目": r['評分項目'], "原始扣分": str(tot), "申訴理由": rsn, "對應紀錄ID": rid}, pf)
+                                        time.sleep(1.5)
+                                        st.rerun()
 
     # --- Mode 3: 晨掃志工隊 ---
     elif app_mode == "晨掃志工隊🧹":
@@ -814,9 +841,18 @@ try:
                 with st.form("vol_form"):
                     present = st.multiselect("✅ 實到同學", [s for s, c in ROSTER_DICT.items() if c == my_cls])
                     files = st.file_uploader("📸 成果照片", accept_multiple_files=True, type=['jpg','png'])
-                    if st.form_submit_button("送出") and present and files:
-                        save_entry({"日期": str(today_tw), "班級": my_cls, "評分項目": "晨間打掃", "檢查人員": f"志工(實到:{len(present)})", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "晨間打掃原始分": 0, "備註": f"名單:{','.join(present)}"}, uploaded_files=files, student_list=present, custom_hours=0.5, custom_category="晨掃志工")
-                        st.success("✅ 回報成功！"); st.rerun()
+                    if st.form_submit_button("送出"):
+                        # [V4.8 防連點保護]
+                        if time.time() - st.session_state.last_action_time < 3:
+                            st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                        elif present and files:
+                            st.session_state.last_action_time = time.time()
+                            save_entry({"日期": str(today_tw), "班級": my_cls, "評分項目": "晨間打掃", "檢查人員": f"志工(實到:{len(present)})", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "晨間打掃原始分": 0, "備註": f"名單:{','.join(present)}"}, uploaded_files=files, student_list=present, custom_hours=0.5, custom_category="晨掃志工")
+                            st.success("✅ 回報成功！")
+                            time.sleep(1.5)
+                            st.rerun()
+                        else:
+                            st.error("請勾選名單並上傳照片")
 
     # --- Mode 4: 組長後台 ---
     elif app_mode == "組長ㄉ窩💃":
@@ -827,9 +863,10 @@ try:
         c2.metric("失敗", metrics["failed"])
         c3.metric("延遲(s)", int(metrics["oldest_pending_sec"]))
 
-        if st.text_input("管理密碼", type="password", key="admin_pwd") == st.secrets["system_config"]["admin_password"]:
+        # [V4.8] 改為直接按 Enter 登入
+        pwd_input = st.text_input("管理密碼", type="password", key="admin_pwd")
+        if pwd_input == st.secrets["system_config"]["admin_password"]:
             
-            # [V4.6.1] 依照您的要求調整標籤名稱與順序
             t_mon, t_rollcall, t4, t_appeal, t2, t1, t_settings, t3 = st.tabs([
                 "👀 衛生糾察", "👮 環保糾察", "📝 扣分明細", "📣 申訴", "📊 成績總表", 
                 "🧹 晨掃審核", "⚙️ 設定", "🏫 返校打掃"
@@ -891,19 +928,26 @@ try:
                         st.write(f"✅ 預計發放對象：共 {len(present_insps)} 人 (每人 0.25 小時)")
                         
                         if st.form_submit_button("🚀 發放環保糾察時數"):
-                            present_ids = [name.split("學號:")[1].strip() for name in present_insps if "學號:" in name]
-                            if present_ids:
-                                payload = {
-                                    "student_list": present_ids,
-                                    "date": str(rc_date),
-                                    "class_name": "糾察隊",
-                                    "category": "資源回收糾察",
-                                    "hours": 0.25
-                                }
-                                enqueue_task("service_hours_only", payload)
-                                st.success(f"✅ 已排程發放 {len(present_ids)} 人的出勤時數！(系統會自動阻擋同一天的重複發放)")
+                            # [V4.8 防連點保護]
+                            if time.time() - st.session_state.last_action_time < 3:
+                                st.warning("⚠️ 系統處理中，請勿連續點擊！")
                             else:
-                                st.warning("沒有可發放時數的對象")
+                                st.session_state.last_action_time = time.time()
+                                present_ids = [name.split("學號:")[1].strip() for name in present_insps if "學號:" in name]
+                                if present_ids:
+                                    payload = {
+                                        "student_list": present_ids,
+                                        "date": str(rc_date),
+                                        "class_name": "糾察隊",
+                                        "category": "資源回收糾察",
+                                        "hours": 0.25
+                                    }
+                                    enqueue_task("service_hours_only", payload)
+                                    st.success(f"✅ 已排程發放 {len(present_ids)} 人的出勤時數！(系統會自動阻擋同一天的重複發放)")
+                                    time.sleep(1.5)
+                                    st.rerun()
+                                else:
+                                    st.warning("沒有可發放時數的對象")
 
             with t4:
                 df = load_main_data()
@@ -1025,11 +1069,17 @@ try:
                         if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}"): delete_rows_by_ids([str(r["紀錄ID"])]); st.rerun()
 
             with t_settings:
+                st.subheader("⚙️ 系統設定與維護")
                 curr = SYSTEM_CONFIG.get("semester_start")
                 nd = st.date_input("開學日", datetime.strptime(curr, "%Y-%m-%d").date() if curr else today_tw)
                 if st.button("更新開學日"): save_setting("semester_start", str(nd))
+                
+                st.markdown("---")
+                st.write("🔧 系統連線狀態")
+                if get_gspread_client(): st.success("✅ Google Sheets 連線正常")
+                else: st.error("❌ Google Sheets 連線失敗")
                 st.info("若需修改名單請直接至 Google Sheet 修改 inspectors / roster / office_areas 分頁")
-                if st.button("清除快取"): st.cache_data.clear(); st.success("Done")
+                if st.button("🔄 重讀名單 (清除快取)"): st.cache_data.clear(); st.success("已清除快取！")
 
             with t3:
                 c1, c2 = st.columns(2)
@@ -1043,12 +1093,23 @@ try:
                         spec = st.multiselect("加強組", pool)
                         spec_h = st.number_input("特別時數", value=3.0, step=0.5)
                         pf = st.file_uploader("照片", type=['jpg','png'])
-                        if st.form_submit_button("發放") and pf:
-                            pf.seek(0); fb = pf.read()
-                            norm = [m for m in pool if m not in spec]
-                            if norm: pf_n = io.BytesIO(fb); pf_n.name="p.jpg"; save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")}, [pf_n], norm, base_h, "返校打掃(一般)")
-                            if spec: pf_s = io.BytesIO(fb); pf_s.name="p.jpg"; save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")}, [pf_s], spec, spec_h, "返校打掃(加強)")
-                            st.success("已登記！"); st.rerun()
+                        
+                        if st.form_submit_button("發放"):
+                            # [V4.8 防連點保護]
+                            if time.time() - st.session_state.last_action_time < 3:
+                                st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                            elif pf:
+                                st.session_state.last_action_time = time.time()
+                                pf.seek(0); fb = pf.read()
+                                norm = [m for m in pool if m not in spec]
+                                if norm: pf_n = io.BytesIO(fb); pf_n.name="p.jpg"; save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")}, [pf_n], norm, base_h, "返校打掃(一般)")
+                                if spec: pf_s = io.BytesIO(fb); pf_s.name="p.jpg"; save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")}, [pf_s], spec, spec_h, "返校打掃(加強)")
+                                st.success("已登記！"); time.sleep(1.5); st.rerun()
+                            else:
+                                st.error("需上傳照片")
+
+        elif pwd_input != "":
+            st.error("密碼錯誤")
 
 except Exception as e:
     st.error(f"❌ 系統發生錯誤: {str(e)}")
