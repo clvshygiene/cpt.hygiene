@@ -23,8 +23,15 @@ from googleapiclient.http import MediaIoBaseUpload
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 from PIL import Image, ImageOps
 
+# [V5.0 新增] 嘗試載入 Notion API 套件
+try:
+    from notion_client import Client
+    NOTION_INSTALLED = True
+except ImportError:
+    NOTION_INSTALLED = False
+
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="中壢家商，衛愛而生 V4.8", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="中壢家商，衛愛而生 V5.0", layout="wide", page_icon="🧹")
 
 # --- 2. 核心參數與全域設定 ---
 try:
@@ -48,6 +55,101 @@ try:
         "備註", "違規細項", "照片路徑", "登錄時間", "修正", "晨掃未到者", "紀錄ID"
     ]
     APPEAL_COLUMNS = ["申訴日期", "班級", "違規日期", "違規項目", "原始扣分", "申訴理由", "佐證照片", "處理狀態", "登錄時間", "對應紀錄ID", "審核回覆"]
+
+    # ==========================================
+    # Notion API 輔助函式 [V5.0 新增]
+    # ==========================================
+    @st.cache_resource
+    def get_notion_client():
+        if NOTION_INSTALLED and "system_config" in st.secrets and "notion_token" in st.secrets["system_config"]:
+            return Client(auth=st.secrets["system_config"]["notion_token"])
+        return None
+
+    def fetch_available_notion_tasks():
+        client = get_notion_client()
+        db_id = st.secrets["system_config"].get("notion_db_id", "") if "system_config" in st.secrets else ""
+        if not client or not db_id: return []
+        
+        try:
+            # 篩選出「任務狀態」為「待認領」的任務
+            response = client.databases.query(
+                database_id=db_id,
+                filter={
+                    "property": "任務狀態",
+                    "status": {"equals": "待認領"}
+                }
+            )
+            tasks = []
+            for page in response.get("results", []):
+                props = page.get("properties", {})
+                
+                # 安全解析 Notion 格式
+                title = props.get("任務名稱", {}).get("title", [{}])
+                title_text = title[0].get("text", {}).get("content", "未命名任務") if title else "未命名任務"
+                
+                date_obj = props.get("執行日期", {}).get("date", {})
+                date_val = date_obj.get("start", "未定") if date_obj else "未定"
+                
+                area = props.get("打掃區域", {}).get("rich_text", [{}])
+                area_text = area[0].get("text", {}).get("content", "未填寫") if area else "未填寫"
+                
+                tasks.append({
+                    "id": page["id"],
+                    "title": title_text,
+                    "date": date_val,
+                    "area": area_text
+                })
+            return tasks
+        except Exception as e:
+            # 若 status 篩選失敗，嘗試用 select 格式過濾 (兼容 Notion 兩種屬性設定)
+            try:
+                response = client.databases.query(
+                    database_id=db_id,
+                    filter={
+                        "property": "任務狀態",
+                        "select": {"equals": "待認領"}
+                    }
+                )
+                tasks = []
+                for page in response.get("results", []):
+                    props = page.get("properties", {})
+                    title = props.get("任務名稱", {}).get("title", [{}])
+                    title_text = title[0].get("text", {}).get("content", "未命名任務") if title else "未命名任務"
+                    date_obj = props.get("執行日期", {}).get("date", {})
+                    date_val = date_obj.get("start", "未定") if date_obj else "未定"
+                    area = props.get("打掃區域", {}).get("rich_text", [{}])
+                    area_text = area[0].get("text", {}).get("content", "未填寫") if area else "未填寫"
+                    tasks.append({"id": page["id"], "title": title_text, "date": date_val, "area": area_text})
+                return tasks
+            except Exception as e2:
+                print(f"Notion API 讀取失敗: {e2}")
+                return []
+
+    def claim_notion_task(page_id, student_id):
+        client = get_notion_client()
+        try:
+            # 嘗試更新 Status 類型與填寫認領學號
+            client.pages.update(
+                page_id=page_id,
+                properties={
+                    "任務狀態": {"status": {"name": "已認領"}},
+                    "認領學號": {"rich_text": [{"text": {"content": str(student_id)}}]}
+                }
+            )
+            return True, ""
+        except Exception as e:
+            # 若更新 Status 失敗，嘗試更新 Select 類型
+            try:
+                client.pages.update(
+                    page_id=page_id,
+                    properties={
+                        "任務狀態": {"select": {"name": "已認領"}},
+                        "認領學號": {"rich_text": [{"text": {"content": str(student_id)}}]}
+                    }
+                )
+                return True, ""
+            except Exception as e2:
+                return False, str(e2)
 
     # ==========================================
     # SRE Utils: 重試機制
@@ -586,7 +688,6 @@ try:
     now_tw = datetime.now(TW_TZ)
     today_tw = now_tw.date()
     
-    # [V4.8] 初始化防連點 Session State
     if "last_action_time" not in st.session_state:
         st.session_state.last_action_time = 0
     
@@ -603,14 +704,62 @@ try:
         except: return 0
 
     st.sidebar.title("🏫 功能選單")
-    app_mode = st.sidebar.radio("請選擇模式", ["糾察底家👀", "班級負責人🥸", "晨掃志工隊🧹", "組長ㄉ窩💃"])
+    
+    # [V5.0 新增] 左側選單加入愛校服務認領
+    menu_options = ["糾察底家👀", "班級負責人🥸", "晨掃志工隊🧹", "愛校任務認領 🤝", "組長ㄉ窩💃"]
+    app_mode = st.sidebar.radio("請選擇模式", menu_options)
+
+    # --- Mode: 愛校任務認領 🤝 [V5.0 新增] ---
+    if app_mode == "愛校任務認領 🤝":
+        st.title("🤝 愛校服務認領區")
+        st.info("💡 這裡的任務清單與 Notion 行事曆即時同步！成功認領後，任務會自動標記並更新。")
+        
+        if not NOTION_INSTALLED:
+            st.error("⚠️ 系統偵測到未安裝 `notion-client` 套件，請通知管理員檢查系統設定。")
+        elif "system_config" not in st.secrets or "notion_token" not in st.secrets["system_config"]:
+            st.warning("⚠️ Notion 金鑰尚未設定，請通知管理員至後台設定 `notion_token`。")
+        else:
+            with st.spinner("正在向 Notion 獲取最新任務..."):
+                tasks = fetch_available_notion_tasks()
+                
+            if not tasks:
+                st.success("🎉 目前沒有待認領的愛校服務任務喔！大家都非常棒！")
+                st.balloons()
+            else:
+                st.write(f"目前共有 **{len(tasks)}** 個待認領的任務：")
+                
+                for t in tasks:
+                    with st.container(border=True):
+                        col1, col2 = st.columns([2, 1])
+                        with col1:
+                            st.subheader(f"📌 {t['title']}")
+                            st.write(f"📅 **執行日期:** {t['date']}")
+                            st.write(f"🧹 **打掃區域:** {t['area']}")
+                        
+                        with col2:
+                            with st.form(f"claim_form_{t['id']}"):
+                                s_id = st.text_input("請輸入您的【學號】來認領：", placeholder="例如：112001")
+                                if st.form_submit_button("🚀 確認認領", use_container_width=True):
+                                    if time.time() - st.session_state.last_action_time < 3:
+                                        st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                                    elif not s_id:
+                                        st.error("學號不能為空！")
+                                    else:
+                                        st.session_state.last_action_time = time.time()
+                                        with st.spinner("連線至 Notion 更新看板中..."):
+                                            success, err = claim_notion_task(t['id'], s_id)
+                                        if success:
+                                            st.success(f"✅ 學號 {s_id} 認領成功！任務已自動從看板更新。")
+                                            time.sleep(2)
+                                            st.rerun()
+                                        else:
+                                            st.error(f"認領失敗，請確認 Notion 欄位名稱是否為「任務狀態」與「認領學號」。錯誤代碼：{err}")
 
     # --- Mode 1: 糾察評分 ---
-    if app_mode == "糾察底家👀":
+    elif app_mode == "糾察底家👀":
         st.title("📝 衛生糾察評分系統")
         if "team_logged_in" not in st.session_state: st.session_state["team_logged_in"] = False
         
-        # [V4.8] 改為直接按 Enter 登入
         if not st.session_state["team_logged_in"]:
             with st.expander("🔐 身份驗證", expanded=True):
                 pwd_input = st.text_input("請輸入隊伍通行碼", type="password", key="m1_login_pwd")
@@ -666,7 +815,6 @@ try:
                         edited_df = st.data_editor(pd.DataFrame(rows), column_config=col_config, hide_index=True, width="stretch", key="ed_offices")
                         
                         if st.button(f"💾 登記違規 ({step_a} - 各處室)"):
-                            # [V4.8 防連點保護]
                             if time.time() - st.session_state.last_action_time < 3:
                                 st.warning("⚠️ 系統處理中，請勿連續點擊！")
                             else:
@@ -707,7 +855,6 @@ try:
                         edited_df = st.data_editor(pd.DataFrame(rows), column_config=col_config, hide_index=True, width="stretch", key=f"ed_{sel_filter}")
                         
                         if st.button(f"💾 登記違規 ({step_a} - {sel_filter})"):
-                            # [V4.8 防連點保護]
                             if time.time() - st.session_state.last_action_time < 3:
                                 st.warning("⚠️ 系統處理中，請勿連續點擊！")
                             else:
@@ -755,7 +902,6 @@ try:
                             files = st.file_uploader("📸 違規照片", accept_multiple_files=True)
                             
                             if st.form_submit_button("送出"):
-                                # [V4.8 防連點保護]
                                 if time.time() - st.session_state.last_action_time < 3:
                                     st.warning("⚠️ 系統處理中，請勿連續點擊！")
                                 else:
@@ -808,15 +954,16 @@ try:
                         if not ap_st and is_within_appeal_period(r['日期']) and (tot > 0 or r['手機人數'] > 0):
                             with st.form(f"ap_{rid}"):
                                 rsn, pf = st.text_area("理由"), st.file_uploader("佐證", type=['jpg','png'])
-                                if st.form_submit_button("申訴") and rsn and pf:
-                                    # [V4.8 防連點保護]
+                                if st.form_submit_button("申訴"):
                                     if time.time() - st.session_state.last_action_time < 3:
                                         st.warning("⚠️ 系統處理中，請勿連續點擊！")
-                                    else:
+                                    elif rsn and pf:
                                         st.session_state.last_action_time = time.time()
                                         save_appeal({"班級": cls, "違規日期": str(r["日期"]), "違規項目": r['評分項目'], "原始扣分": str(tot), "申訴理由": rsn, "對應紀錄ID": rid}, pf)
                                         time.sleep(1.5)
                                         st.rerun()
+                                    else:
+                                        st.error("請填寫理由並上傳照片")
 
     # --- Mode 3: 晨掃志工隊 ---
     elif app_mode == "晨掃志工隊🧹":
@@ -842,7 +989,6 @@ try:
                     present = st.multiselect("✅ 實到同學", [s for s, c in ROSTER_DICT.items() if c == my_cls])
                     files = st.file_uploader("📸 成果照片", accept_multiple_files=True, type=['jpg','png'])
                     if st.form_submit_button("送出"):
-                        # [V4.8 防連點保護]
                         if time.time() - st.session_state.last_action_time < 3:
                             st.warning("⚠️ 系統處理中，請勿連續點擊！")
                         elif present and files:
@@ -863,7 +1009,6 @@ try:
         c2.metric("失敗", metrics["failed"])
         c3.metric("延遲(s)", int(metrics["oldest_pending_sec"]))
 
-        # [V4.8] 改為直接按 Enter 登入
         pwd_input = st.text_input("管理密碼", type="password", key="admin_pwd")
         if pwd_input == st.secrets["system_config"]["admin_password"]:
             
@@ -928,7 +1073,6 @@ try:
                         st.write(f"✅ 預計發放對象：共 {len(present_insps)} 人 (每人 0.25 小時)")
                         
                         if st.form_submit_button("🚀 發放環保糾察時數"):
-                            # [V4.8 防連點保護]
                             if time.time() - st.session_state.last_action_time < 3:
                                 st.warning("⚠️ 系統處理中，請勿連續點擊！")
                             else:
@@ -1074,10 +1218,15 @@ try:
                 nd = st.date_input("開學日", datetime.strptime(curr, "%Y-%m-%d").date() if curr else today_tw)
                 if st.button("更新開學日"): save_setting("semester_start", str(nd))
                 
+                # [V4.8] 系統狀態與快取按鈕移至設定分頁
                 st.markdown("---")
                 st.write("🔧 系統連線狀態")
                 if get_gspread_client(): st.success("✅ Google Sheets 連線正常")
                 else: st.error("❌ Google Sheets 連線失敗")
+                
+                if NOTION_INSTALLED: st.success("✅ Notion 模組載入正常")
+                else: st.warning("⚠️ 尚未安裝 Notion 模組")
+                
                 st.info("若需修改名單請直接至 Google Sheet 修改 inspectors / roster / office_areas 分頁")
                 if st.button("🔄 重讀名單 (清除快取)"): st.cache_data.clear(); st.success("已清除快取！")
 
@@ -1095,7 +1244,6 @@ try:
                         pf = st.file_uploader("照片", type=['jpg','png'])
                         
                         if st.form_submit_button("發放"):
-                            # [V4.8 防連點保護]
                             if time.time() - st.session_state.last_action_time < 3:
                                 st.warning("⚠️ 系統處理中，請勿連續點擊！")
                             elif pf:
