@@ -11,7 +11,8 @@ import re
 import sqlite3
 import json
 import random
-import concurrent.futures  # [V5.3 新增] 用來處理硬超時
+import concurrent.futures
+from contextlib import closing  # [V5.5 新增] 用於確保資料庫連線安全關閉
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, date, timedelta
@@ -32,7 +33,7 @@ except ImportError:
     NOTION_INSTALLED = False
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="中壢家商，衛愛而生 V5.5", layout="wide", page_icon="🧹")
 
 # --- 2. 核心參數與全域設定 ---
 try:
@@ -58,7 +59,7 @@ try:
     APPEAL_COLUMNS = ["申訴日期", "班級", "違規日期", "違規項目", "原始扣分", "申訴理由", "佐證照片", "處理狀態", "登錄時間", "對應紀錄ID", "審核回覆"]
 
     # ==========================================
-    # Notion API 輔助函式 [V5.4 欄位名稱與 Emoji 修正]
+    # Notion API 輔助函式 [V5.5 增加錯誤回傳機制]
     # ==========================================
     @st.cache_resource
     def get_notion_client():
@@ -70,7 +71,8 @@ try:
     def fetch_available_notion_tasks():
         client = get_notion_client()
         db_id = st.secrets.get("notion_db_id") or st.secrets.get("system_config", {}).get("notion_db_id")
-        if not client or not db_id: return []
+        if not client or not db_id: 
+            return [], "系統尚未設定 Notion Token 或 Database ID"
         
         try:
             response = client.databases.query(
@@ -90,10 +92,9 @@ try:
                 area_text = area[0].get("text", {}).get("content", "未填寫") if area else "未填寫"
                 
                 tasks.append({"id": page["id"], "title": title_text, "date": date_val, "area": area_text})
-            return tasks
+            return tasks, None
         except Exception as e:
-            print(f"Notion API 讀取失敗: {e}")
-            return []
+            return [], f"Notion API 讀取失敗詳細錯誤: {str(e)}"
 
     def claim_notion_task(page_id, student_id):
         client = get_notion_client()
@@ -110,7 +111,7 @@ try:
             return False, str(e)
 
     # ==========================================
-    # SRE Utils: 重試機制 [V5.3 神級進化：30秒硬超時防假死]
+    # SRE Utils: 重試機制
     # ==========================================
     def execute_with_retry(func, max_retries=5, base_delay=1.0, timeout=30):
         for attempt in range(max_retries):
@@ -208,74 +209,80 @@ try:
         except: return str(val).strip()
 
     # ==========================================
-    # SQLite 背景佇列 & 本地防重複機制 [V5.4 移除全域鎖，改為原子搶任務]
+    # SQLite 背景佇列 (V5.5: 短連線 + BEGIN IMMEDIATE 原子操作)
     # ==========================================
-    @st.cache_resource
-    def get_queue_connection():
-        conn = sqlite3.connect(QUEUE_DB_PATH, check_same_thread=False, timeout=30.0, isolation_level="IMMEDIATE")
-        try: conn.execute("PRAGMA journal_mode=WAL;"); conn.execute("PRAGMA busy_timeout=30000;")
-        except: pass
+    def open_queue_conn():
+        # isolation_level=None 代表開啟 autocommit 模式，讓我們可以手動控制 Transaction
+        conn = sqlite3.connect(QUEUE_DB_PATH, timeout=30.0, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
         conn.execute("CREATE TABLE IF NOT EXISTS task_queue (id TEXT PRIMARY KEY, task_type TEXT, created_ts TEXT, payload_json TEXT, status TEXT, attempts INTEGER, last_error TEXT)")
         conn.execute("CREATE TABLE IF NOT EXISTS service_issued (date TEXT, sid TEXT, category TEXT, PRIMARY KEY(date, sid, category))")
-        conn.commit()
         return conn
 
     def enqueue_task(task_type, payload):
-        conn = get_queue_connection()
         task_id = str(uuid.uuid4())
-        conn.execute("INSERT INTO task_queue VALUES (?, ?, ?, ?, 'PENDING', 0, NULL)",
-            (task_id, task_type, datetime.now(timezone.utc).isoformat(), json.dumps(payload, ensure_ascii=False)))
-        conn.commit()
+        with closing(open_queue_conn()) as conn:
+            conn.execute(
+                "INSERT INTO task_queue VALUES (?, ?, ?, ?, 'PENDING', 0, NULL)",
+                (task_id, task_type, datetime.now(timezone.utc).isoformat(), json.dumps(payload, ensure_ascii=False))
+            )
         return task_id
 
     def get_queue_metrics():
-        conn = get_queue_connection()
         metrics = {"pending": 0, "retry": 0, "failed": 0, "oldest_pending_sec": 0, "recent_errors": []}
         try:
-            cur = conn.cursor()
-            cur.execute("SELECT status, COUNT(*) FROM task_queue GROUP BY status")
-            for s, c in cur.fetchall():
-                if s == 'PENDING': metrics["pending"] = c
-                elif s == 'RETRY': metrics["retry"] = c
-                elif s == 'FAILED': metrics["failed"] = c
-            
-            cur.execute("SELECT MIN(created_ts) FROM task_queue WHERE status IN ('PENDING', 'RETRY')")
-            oldest = cur.fetchone()[0]
-            if oldest:
-                try: metrics["oldest_pending_sec"] = (datetime.now(pytz.utc) - datetime.fromisoformat(oldest.replace("Z", "+00:00"))).total_seconds()
-                except: pass
-            cur.execute("SELECT last_error, created_ts FROM task_queue WHERE status='FAILED' OR status='RETRY' ORDER BY created_ts DESC LIMIT 5")
-            metrics["recent_errors"] = cur.fetchall()
+            with closing(open_queue_conn()) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT status, COUNT(*) FROM task_queue GROUP BY status")
+                for s, c in cur.fetchall():
+                    if s == 'PENDING': metrics["pending"] = c
+                    elif s == 'RETRY': metrics["retry"] = c
+                    elif s == 'FAILED': metrics["failed"] = c
+                
+                cur.execute("SELECT MIN(created_ts) FROM task_queue WHERE status IN ('PENDING', 'RETRY')")
+                oldest = cur.fetchone()[0]
+                if oldest:
+                    try: metrics["oldest_pending_sec"] = (datetime.now(pytz.utc) - datetime.fromisoformat(oldest.replace("Z", "+00:00"))).total_seconds()
+                    except: pass
+                cur.execute("SELECT last_error, created_ts FROM task_queue WHERE status='FAILED' OR status='RETRY' ORDER BY created_ts DESC LIMIT 5")
+                metrics["recent_errors"] = cur.fetchall()
         except: pass
         return metrics
 
     def fetch_next_task(max_attempts=6):
-        conn = get_queue_connection()
         try:
-            cur = conn.cursor()
-            # 利用 SQLite 3.35+ 的 RETURNING 達成原子性搶奪任務，完全無須 Python Lock
-            cur.execute("""
-                UPDATE task_queue 
-                SET status = 'IN_PROGRESS', attempts = attempts + 1 
-                WHERE id = (
-                    SELECT id FROM task_queue 
+            with closing(open_queue_conn()) as conn:
+                # BEGIN IMMEDIATE 確保了資料庫層級的排他鎖定，不會有搶任務衝突
+                conn.execute("BEGIN IMMEDIATE")
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT id, task_type, payload_json, attempts 
+                    FROM task_queue 
                     WHERE status IN ('PENDING', 'RETRY') AND attempts < ?
                     ORDER BY created_ts ASC LIMIT 1
-                )
-                RETURNING id, task_type, created_ts, payload_json, status, attempts, last_error
-            """, (max_attempts,))
-            row = cur.fetchone()
-            conn.commit()
-            
-            if not row: return None
-            return {"id": row[0], "task_type": row[1], "payload": json.loads(row[3]) if row[3] else {}, "attempts": row[5]}
+                """, (max_attempts,))
+                
+                row = cur.fetchone()
+                if not row:
+                    conn.execute("COMMIT")
+                    return None
+                    
+                task_id = row[0]
+                cur.execute("UPDATE task_queue SET status='IN_PROGRESS', attempts=attempts+1 WHERE id=?", (task_id,))
+                conn.execute("COMMIT")
+                
+                return {"id": task_id, "task_type": row[1], "payload": json.loads(row[2] or "{}"), "attempts": row[3]}
         except Exception as e:
             print(f"抓取任務時發生錯誤: {e}")
             return None
 
     def update_task_status(task_id, status, attempts, last_error):
-        get_queue_connection().execute("UPDATE task_queue SET status = ?, attempts = ?, last_error = ? WHERE id = ?", (status, attempts, last_error, task_id))
-        get_queue_connection().commit()
+        with closing(open_queue_conn()) as conn:
+            conn.execute(
+                "UPDATE task_queue SET status=?, attempts=?, last_error=? WHERE id=?",
+                (status, attempts, last_error, task_id)
+            )
 
     # ==========================================
     # 背景處理邏輯
@@ -289,14 +296,13 @@ try:
         execute_with_retry(_action)
     
     def _append_service_row_unique(entry):
-        conn = get_queue_connection()
         t_date = str(entry.get("日期", ""))
         t_sid = str(entry.get("學號", ""))
         t_cat = str(entry.get("類別", ""))
         
         try:
-            conn.execute("INSERT INTO service_issued VALUES (?, ?, ?)", (t_date, t_sid, t_cat))
-            conn.commit()
+            with closing(open_queue_conn()) as conn:
+                conn.execute("INSERT INTO service_issued VALUES (?, ?, ?)", (t_date, t_sid, t_cat))
         except sqlite3.IntegrityError:
             return 
             
@@ -692,10 +698,12 @@ try:
             st.warning("⚠️ Notion 金鑰尚未設定，請通知管理員至後台設定 `notion_token`。")
         else:
             with st.spinner("正在向 Notion 獲取最新任務..."):
-                tasks = fetch_available_notion_tasks()
+                tasks, error_msg = fetch_available_notion_tasks() # 這裡接收錯誤訊息
                 
-            if not tasks:
-                st.success("🎉 目前沒有待認領的愛校服務任務喔")
+            if error_msg:
+                st.error(f"⚠️ 讀取 Notion 發生錯誤！請檢查以下錯誤訊息：\n\n{error_msg}")
+            elif not tasks:
+                st.success("🎉 目前沒有待認領的愛校服務任務喔！大家都非常棒！")
                 st.balloons()
             else:
                 st.write(f"目前共有 **{len(tasks)}** 個待認領的任務：")
