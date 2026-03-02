@@ -86,7 +86,20 @@ try:
                 title_text = title[0].get("text", {}).get("content", "未命名任務") if title else "未命名任務"
                 
                 date_obj = props.get("任務日期", {}).get("date", {})
-                date_val = date_obj.get("start", "未定") if date_obj else "未定"
+                raw_date = date_obj.get("start", "未定") if date_obj else "未定"
+                
+                # 將醜醜的機器時間轉換為人類好讀的格式
+                if raw_date != "未定":
+                    try:
+                        parsed_date = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                        if len(raw_date) <= 10:  # 如果 Notion 上只有設定日期 (例如 2026-03-02)
+                            date_val = parsed_date.strftime("%Y-%m-%d")
+                        else:  # 如果有設定具體時間 (例如 12:30)
+                            date_val = parsed_date.strftime("%Y-%m-%d %H:%M")
+                    except Exception:
+                        date_val = raw_date
+                else:
+                    date_val = "未定"
                 
                 area = props.get("任務內容", {}).get("rich_text", [{}])
                 area_text = area[0].get("text", {}).get("content", "未填寫") if area else "未填寫"
