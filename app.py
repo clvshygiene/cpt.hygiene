@@ -32,13 +32,13 @@ except ImportError:
     NOTION_INSTALLED = False
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="中壢家商，衛愛而生 V5.7", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="中壢家商，衛愛而生 V5.8", layout="wide", page_icon="🧹")
 
 # --- 2. 核心參數與全域設定 ---
 try:
     TW_TZ = pytz.timezone('Asia/Taipei')
-    MAX_IMAGE_BYTES = 20 * 1024 * 1024  # [V5.6] 20MB 完美防 OOM
-    UPLOAD_SEM = threading.Semaphore(4) # [V5.7] 建立 semaphore，限制並發讀取照片數量，避免記憶體撐爆
+    MAX_IMAGE_BYTES = 20 * 1024 * 1024  
+    UPLOAD_SEM = threading.BoundedSemaphore(4) 
     QUEUE_DB_PATH = "task_queue_v4_wal.db"
     IMG_DIR = "evidence_photos"
     os.makedirs(IMG_DIR, exist_ok=True)
@@ -252,7 +252,7 @@ try:
         except: return str(val).strip()
 
     # ==========================================
-    # SQLite 背景佇列 (V5.6: Heartbeat, 節流, Fast-fail)
+    # SQLite 背景佇列 (V5.8: Two-stage Throttling & Last Success Time)
     # ==========================================
     def open_queue_conn():
         conn = sqlite3.connect(QUEUE_DB_PATH, timeout=30.0, isolation_level=None)
@@ -277,6 +277,13 @@ try:
                 conn.execute("INSERT OR REPLACE INTO system_status VALUES ('worker_heartbeat', ?)", (datetime.now(timezone.utc).isoformat(),))
         except: pass
 
+    # [V5.8] 新增紀錄最後成功處理時間
+    def update_last_success_time():
+        try:
+            with closing(open_queue_conn()) as conn:
+                conn.execute("INSERT OR REPLACE INTO system_status VALUES ('last_success_time', ?)", (datetime.now(timezone.utc).isoformat(),))
+        except: pass
+
     def get_worker_heartbeat_sec():
         try:
             with closing(open_queue_conn()) as conn:
@@ -286,6 +293,19 @@ try:
                 if row:
                     hb_time = datetime.fromisoformat(row[0])
                     return (datetime.now(timezone.utc) - hb_time).total_seconds()
+        except: pass
+        return 999999
+
+    # [V5.8] 獲取最後成功處理任務至今的秒數
+    def get_last_success_sec():
+        try:
+            with closing(open_queue_conn()) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT val FROM system_status WHERE key='last_success_time'")
+                row = cur.fetchone()
+                if row:
+                    ls_time = datetime.fromisoformat(row[0])
+                    return (datetime.now(timezone.utc) - ls_time).total_seconds()
         except: pass
         return 999999
 
@@ -454,6 +474,10 @@ try:
                 if not task: time.sleep(2.0); continue
                 ok, err = process_task(task)
                 
+                # [V5.8] 如果成功，更新成功時間指示器
+                if ok:
+                    update_last_success_time()
+
                 try:
                     paths = task["payload"].get("image_paths", []) + ([task["payload"]["image_file"]["path"]] if "image_file" in task["payload"] else [])
                     for p in paths:
@@ -497,7 +521,8 @@ try:
             if current_date.weekday() < 5 and current_date not in holidays: workdays += 1
         return today <= current_date
 
-    @st.cache_data(ttl=300)
+    # [V5.8] TTL 延長至 360 秒，有效節省 API 呼叫次數
+    @st.cache_data(ttl=360)
     def load_main_data():
         ws = get_worksheet(SHEET_TABS["main"])
         if not ws: return pd.DataFrame(columns=EXPECTED_COLUMNS)
@@ -600,14 +625,17 @@ try:
         except: return pd.DataFrame(columns=APPEAL_COLUMNS)
 
     def save_appeal(entry, proof_file=None):
-        if get_pending_count() > 500:
-            st.error("⚠️ 系統目前排隊任務過多，請稍等幾分鐘後再送出申訴！")
+        pending_count = get_pending_count()
+        # [V5.8] 兩段式熔斷：超過 300 阻擋，超過 150 警告但放行
+        if pending_count > 300:
+            st.error("⚠️ 系統目前排隊任務過多 (大於 300 筆)，為保護系統，請稍等幾分鐘後再送出申訴！")
             return False
+        elif pending_count > 150:
+            st.warning("⏳ 系統目前正在大量處理照片中，您的申訴將會安全送出，但審核進度可能會稍有延遲喔！")
 
         image_info = None
         if proof_file:
             try:
-                # [V5.7] 在讀取申訴照片時包住 semaphore 限制記憶體用量
                 print(f"Waiting for UPLOAD slot... (Appeal: {proof_file.name})")
                 with UPLOAD_SEM:
                     print(f"UPLOAD slot acquired (Appeal: {proof_file.name})")
@@ -707,9 +735,13 @@ try:
         except: return False
 
     def save_entry(new_entry, uploaded_files=None, student_list=None, custom_hours=0.5, custom_category="晨掃志工"):
-        if get_pending_count() > 500:
-            st.error("⚠️ 系統目前排隊上傳的任務過多 (大於 500 筆)，為保護系統，請稍等幾分鐘後再送出！")
+        pending_count = get_pending_count()
+        # [V5.8] 兩段式熔斷保護
+        if pending_count > 300:
+            st.error("⚠️ 系統目前排隊上傳的任務過多 (大於 300 筆)，為保護系統，請稍等幾分鐘後再送出！")
             return False
+        elif pending_count > 150:
+            st.warning("⏳ 系統目前正在大量處理照片中，您的資料將會安全送出，但更新至成績表可能會稍有延遲喔！")
 
         new_entry["日期"] = str(new_entry.get("日期", str(date.today())))
         new_entry["紀錄ID"] = new_entry.get("紀錄ID", f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}")
@@ -721,7 +753,6 @@ try:
             for i, up_file in enumerate(uploaded_files):
                 if not up_file: continue
                 try:
-                    # [V5.7] 在讀取評分照片時包住 semaphore，限制並發造成的記憶體暴增
                     print(f"Waiting for UPLOAD slot... ({up_file.name})")
                     with UPLOAD_SEM:
                         print(f"UPLOAD slot acquired ({up_file.name})")
@@ -740,7 +771,8 @@ try:
         enqueue_task("volunteer_report" if student_list is not None else "main_entry", payload)
         return True
 
-    @st.cache_data(ttl=300)
+    # [V5.8] TTL 延長至 360 秒
+    @st.cache_data(ttl=360)
     def load_full_semester_data_for_export():
         ws = get_worksheet(SHEET_TABS["main"])
         if not ws: return pd.DataFrame(columns=EXPECTED_COLUMNS)
@@ -749,7 +781,7 @@ try:
             if df.empty: return pd.DataFrame(columns=EXPECTED_COLUMNS)
             for col in EXPECTED_COLUMNS:
                 if col not in df.columns: df[col] = ""
-            for col in ["備註", "違規細項", "班級", "檢查人員", "修正", "晨掃未到者", "照片路徑", "紀錄ID"]:
+            for col in ["備註", "違 ক্যাম", "班級", "檢查人員", "修正", "晨掃未到者", "照片路徑", "紀錄ID"]:
                 if col in df.columns: df[col] = df[col].fillna("").astype(str)
             for col in ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數", "週次"]:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
@@ -1084,15 +1116,24 @@ try:
         st.title("⚙️ 管理後台")
         metrics = get_queue_metrics()
         hb_sec = get_worker_heartbeat_sec()
+        ls_sec = get_last_success_sec()
         
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("待處理", metrics.get("pending", 0))
         col2.metric("失敗", metrics.get("failed", 0))
         col3.metric("延遲(s)", int(metrics.get("oldest_pending_sec", 0)))
         
-        # [V5.6] 顯示 Worker 心跳燈號
+        # [V5.8] 進階狀態監控：心跳與最後成功時間
         hb_status = "🟢 正常運作" if hb_sec < 60 else "🔴 已休眠/停止"
-        col4.metric("背景 Worker", f"{hb_status}", f"最後更新: {int(hb_sec)}秒前" if hb_sec != 999999 else "無紀錄")
+        
+        if ls_sec == 999999:
+            ls_text = "無紀錄"
+        elif ls_sec < 120:
+            ls_text = f"✅ {int(ls_sec)}秒前"
+        else:
+            ls_text = f"⚠️ {int(ls_sec//60)}分鐘前 (API可能卡住)"
+            
+        col4.metric("背景 Worker", f"{hb_status}", f"心跳: {int(hb_sec)}秒前 | 成功: {ls_text}")
 
         pwd_input = st.text_input("管理密碼", type="password", key="admin_pwd")
         if pwd_input == st.secrets["system_config"]["admin_password"]:
