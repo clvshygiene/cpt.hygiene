@@ -1338,12 +1338,9 @@ try:
                         c1, c2, c3 = st.columns([2,2,1])
                         c1.write(f"**{r['班級']}** | {r['檢查人員']}")
                         c1.caption(f"登錄時間：{r['登錄時間']}") 
+                        if "http" in str(r['照片路徑']): c2.image(str(r['照片路徑']).split(";")[0], width=150) 
                         
-                        # [修改] 拔掉 [0]，改用陣列讀取所有照片網址，這樣就能顯示多張照片
-                        if "http" in str(r['照片路徑']): 
-                            c2.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=150) 
-                        
-                            if c3.button("✅ 通過(+2)", key=f"p_{r['紀錄ID']}"):
+                        if c3.button("✅ 通過(+2)", key=f"p_{r['紀錄ID']}"):
 
             with t_settings:
                 st.subheader("⚙️ 系統設定與維護")
