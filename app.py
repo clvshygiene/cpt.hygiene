@@ -1343,7 +1343,15 @@ try:
                         if "http" in str(r['照片路徑']): 
                             c2.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=150) 
                         
-                        if c3.button("✅ 通過(+2)", key=f"p_{r['紀錄ID']}"):
+                        if c3.button("✅ 通過(+2)", key=f"p_{r['紀錄ID']}"): 
+                            ws = get_worksheet(SHEET_TABS["main"])
+                            id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
+                            if str(r["紀錄ID"]) in id_list:
+                                ridx = id_list.index(str(r["紀錄ID"])) + 1
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, 2)
+                                load_main_data.clear()
+                                st.rerun()
+                        if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}"): delete_rows_by_ids([str(r["紀錄ID"])]); st.rerun()
 
             with t_settings:
                 st.subheader("⚙️ 系統設定與維護")
