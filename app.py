@@ -1340,17 +1340,47 @@ try:
                         c1, c2, c3 = st.columns([2,2,1])
                         c1.write(f"**{r['班級']}** | {r['檢查人員']}")
                         c1.caption(f"登錄時間：{r['登錄時間']}") 
-                        if "http" in str(r['照片路徑']): c2.image(str(r['照片路徑']).split(";")[0], width=150) 
                         
+                        if "http" in str(r['照片路徑']): 
+                            c2.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=150) 
+                        
+                        # [V5.11 Patch] 新增回應輸入框
+                        reply_msg = c1.text_input("💬 給予回應 (可留白)", key=f"rm_{r['紀錄ID']}")
+
                         if c3.button("✅ 通過(+2)", key=f"p_{r['紀錄ID']}"): 
                             ws = get_worksheet(SHEET_TABS["main"])
                             id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
                             if str(r["紀錄ID"]) in id_list:
                                 ridx = id_list.index(str(r["紀錄ID"])) + 1
                                 ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, 2)
+                                
+                                # 將回覆附加到備註欄位
+                                if reply_msg:
+                                    old_note = str(r['備註'])
+                                    new_note = f"{old_note} \n組長回覆: {reply_msg}"
+                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
+                                
                                 load_main_data.clear()
                                 st.rerun()
-                        if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}"): delete_rows_by_ids([str(r["紀錄ID"])]); st.rerun()
+                                
+                        if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}"): 
+                            # [V5.11 Patch] 改為保留紀錄並標註駁回，而不是直接刪除
+                            ws = get_worksheet(SHEET_TABS["main"])
+                            id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
+                            if str(r["紀錄ID"]) in id_list:
+                                ridx = id_list.index(str(r["紀錄ID"])) + 1
+                                
+                                # 更改項目名稱，讓它從待審核清單消失，但在成績查詢能看到
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(已駁回)")
+                                
+                                # 將駁回理由寫入備註
+                                old_note = str(r['備註'])
+                                rej_msg = reply_msg if reply_msg else "未達標準，請見諒"
+                                new_note = f"{old_note} \n組長駁回: {rej_msg}"
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
+                                
+                                load_main_data.clear()
+                                st.rerun()
 
             with t_settings:
                 st.subheader("⚙️ 系統設定與維護")
