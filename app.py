@@ -1343,9 +1343,9 @@ try:
                         if "http" in str(r['照片路徑']): 
                             c2.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=150) 
                         
-                        if c3.button("✅ 通過(+2)", key=f"p_{r['紀錄ID']}"):
+                            if c3.button("✅ 通過(+2)", key=f"p_{r['紀錄ID']}"):
 
-        with t_settings:
+            with t_settings:
                 st.subheader("⚙️ 系統設定與維護")
                 curr = SYSTEM_CONFIG.get("semester_start")
                 nd = st.date_input("開學日", datetime.strptime(curr, "%Y-%m-%d").date() if curr else today_tw)
