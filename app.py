@@ -38,7 +38,7 @@ st.set_page_config(page_title="中壢家商，衛愛而生 V5.5", layout="wide",
 # --- 2. 核心參數與全域設定 ---
 try:
     TW_TZ = pytz.timezone('Asia/Taipei')
-    MAX_IMAGE_BYTES = 200 * 1024 * 1024  # [V5.4 修改] 放寬至 200MB
+    MAX_IMAGE_BYTES = 20 * 1024 * 1024  # [V5.4 修改] 放寬至 20MB
     QUEUE_DB_PATH = "task_queue_v4_wal.db"
     IMG_DIR = "evidence_photos"
     os.makedirs(IMG_DIR, exist_ok=True)
