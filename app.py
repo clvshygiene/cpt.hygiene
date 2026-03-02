@@ -12,7 +12,7 @@ import sqlite3
 import json
 import random
 import concurrent.futures
-from contextlib import closing  # [V5.5 新增] 用於確保資料庫連線安全關閉
+from contextlib import closing
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, date, timedelta
@@ -25,7 +25,6 @@ from googleapiclient.http import MediaIoBaseUpload
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 from PIL import Image, ImageOps
 
-# [V5.0 新增] 嘗試載入 Notion API 套件
 try:
     from notion_client import Client
     NOTION_INSTALLED = True
@@ -33,12 +32,13 @@ except ImportError:
     NOTION_INSTALLED = False
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="中壢家商，衛愛而生 V5.5", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="中壢家商，衛愛而生 V5.7", layout="wide", page_icon="🧹")
 
 # --- 2. 核心參數與全域設定 ---
 try:
     TW_TZ = pytz.timezone('Asia/Taipei')
-    MAX_IMAGE_BYTES = 20 * 1024 * 1024  # [V5.4 修改] 放寬至 20MB
+    MAX_IMAGE_BYTES = 20 * 1024 * 1024  # [V5.6] 20MB 完美防 OOM
+    UPLOAD_SEM = threading.Semaphore(4) # [V5.7] 建立 semaphore，限制並發讀取照片數量，避免記憶體撐爆
     QUEUE_DB_PATH = "task_queue_v4_wal.db"
     IMG_DIR = "evidence_photos"
     os.makedirs(IMG_DIR, exist_ok=True)
@@ -59,7 +59,7 @@ try:
     APPEAL_COLUMNS = ["申訴日期", "班級", "違規日期", "違規項目", "原始扣分", "申訴理由", "佐證照片", "處理狀態", "登錄時間", "對應紀錄ID", "審核回覆"]
 
     # ==========================================
-    # Notion API 輔助函式 [V5.5 增加錯誤回傳機制]
+    # Notion API 輔助函式 
     # ==========================================
     @st.cache_resource
     def get_notion_client():
@@ -85,7 +85,6 @@ try:
                 title = props.get("任務名稱", {}).get("title", [{}])
                 title_text = title[0].get("text", {}).get("content", "未命名任務") if title else "未命名任務"
                 
-                # 時間美化：把機器碼變成人類好讀的格式
                 date_obj = props.get("任務日期", {}).get("date", {})
                 raw_date = date_obj.get("start", "未定") if date_obj else "未定"
                 if raw_date != "未定":
@@ -103,9 +102,8 @@ try:
                 area = props.get("任務內容", {}).get("rich_text", [{}])
                 area_text = area[0].get("text", {}).get("content", "未填寫") if area else "未填寫"
 
-                # [揪團升級] 讀取需求人數與已認領人數
                 req_num_obj = props.get("需求人數", {}).get("number")
-                req_num = req_num_obj if req_num_obj else 1  # 若未填寫預設為 1 人
+                req_num = req_num_obj if req_num_obj else 1  
                 
                 claimed_obj = props.get("認領學號", {}).get("rich_text", [])
                 claimed_str = claimed_obj[0].get("text", {}).get("content", "") if claimed_obj else ""
@@ -123,7 +121,6 @@ try:
     def claim_notion_task(page_id, student_id):
         client = get_notion_client()
         try:
-            # 1. 先取得該任務「當下」的最新狀態，避免多人同時按的時候覆蓋資料
             page = client.pages.retrieve(page_id=page_id)
             props = page.get("properties", {})
             
@@ -134,28 +131,19 @@ try:
             claimed_str = claimed_obj[0].get("text", {}).get("content", "") if claimed_obj else ""
             current_claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
             
-            # 2. 防呆檢查：該學號是否已經認領過？
             if str(student_id) in current_claimants:
                 return False, f"學號 {student_id} 已經認領過此任務囉！"
                 
-            # 3. 將新學號加入清單
             current_claimants.append(str(student_id))
             new_claimed_str = ", ".join(current_claimants)
             
-            # 4. 判斷加入這個人之後，滿團了沒？
             is_full = len(current_claimants) >= req_num
-            
-            # 準備更新的資料包
             update_props = {
                 "認領學號": {"rich_text": [{"text": {"content": new_claimed_str}}]}
             }
-            
             if is_full:
-                # ⚠️ 這裡的字串必須與妳 Notion 上的完成狀態「一模一樣」
-                # 上次妳決定改成純文字，所以這邊寫 "已認領"。如果有改回 Emoji，請自行替換引號內的文字！
                 update_props["任務狀態"] = {"status": {"name": "已認領"}}
 
-            # 5. 送出更新到 Notion
             client.pages.update(
                 page_id=page_id,
                 properties=update_props
@@ -264,16 +252,42 @@ try:
         except: return str(val).strip()
 
     # ==========================================
-    # SQLite 背景佇列 (V5.5: 短連線 + BEGIN IMMEDIATE 原子操作)
+    # SQLite 背景佇列 (V5.6: Heartbeat, 節流, Fast-fail)
     # ==========================================
     def open_queue_conn():
-        # isolation_level=None 代表開啟 autocommit 模式，讓我們可以手動控制 Transaction
         conn = sqlite3.connect(QUEUE_DB_PATH, timeout=30.0, isolation_level=None)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA busy_timeout=30000;")
         conn.execute("CREATE TABLE IF NOT EXISTS task_queue (id TEXT PRIMARY KEY, task_type TEXT, created_ts TEXT, payload_json TEXT, status TEXT, attempts INTEGER, last_error TEXT)")
         conn.execute("CREATE TABLE IF NOT EXISTS service_issued (date TEXT, sid TEXT, category TEXT, PRIMARY KEY(date, sid, category))")
+        conn.execute("CREATE TABLE IF NOT EXISTS system_status (key TEXT PRIMARY KEY, val TEXT)") 
         return conn
+
+    def get_pending_count():
+        try:
+            with closing(open_queue_conn()) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM task_queue WHERE status='PENDING'")
+                return cur.fetchone()[0]
+        except: return 0
+
+    def update_worker_heartbeat():
+        try:
+            with closing(open_queue_conn()) as conn:
+                conn.execute("INSERT OR REPLACE INTO system_status VALUES ('worker_heartbeat', ?)", (datetime.now(timezone.utc).isoformat(),))
+        except: pass
+
+    def get_worker_heartbeat_sec():
+        try:
+            with closing(open_queue_conn()) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT val FROM system_status WHERE key='worker_heartbeat'")
+                row = cur.fetchone()
+                if row:
+                    hb_time = datetime.fromisoformat(row[0])
+                    return (datetime.now(timezone.utc) - hb_time).total_seconds()
+        except: pass
+        return 999999
 
     def enqueue_task(task_type, payload):
         task_id = str(uuid.uuid4())
@@ -308,7 +322,6 @@ try:
     def fetch_next_task(max_attempts=6):
         try:
             with closing(open_queue_conn()) as conn:
-                # BEGIN IMMEDIATE 確保了資料庫層級的排他鎖定，不會有搶任務衝突
                 conn.execute("BEGIN IMMEDIATE")
                 cur = conn.cursor()
                 cur.execute("""
@@ -387,6 +400,11 @@ try:
         entry = payload.get("entry", {})
         try:
             image_paths, filenames, drive_links = payload.get("image_paths", []), payload.get("filenames", []), []
+            
+            for path in image_paths:
+                if path and not os.path.exists(path):
+                    return False, "FILE_NOT_FOUND: 找不到實體圖片檔案，直接放棄"
+
             for path, fname in zip(image_paths, filenames):
                 if os.path.exists(path):
                     with open(path, "rb") as f:
@@ -416,7 +434,9 @@ try:
 
             elif task_type == "appeal_entry":
                 image_info = payload.get("image_file")
-                if image_info and os.path.exists(image_info["path"]):
+                if image_info:
+                    if not os.path.exists(image_info["path"]):
+                        return False, "FILE_NOT_FOUND: 找不到佐證照片檔案，直接放棄"
                     with open(image_info["path"], "rb") as f:
                         entry["佐證照片"] = upload_image_to_drive(compress_image_bytes(f.read()), image_info["filename"])
                 execute_with_retry(lambda: get_worksheet(SHEET_TABS["appeals"]).append_row([str(entry.get(c, "")) for c in APPEAL_COLUMNS]))
@@ -428,6 +448,7 @@ try:
         except: pass
         while True:
             if stop_event and stop_event.is_set(): break
+            update_worker_heartbeat() 
             try:
                 task = fetch_next_task()
                 if not task: time.sleep(2.0); continue
@@ -438,6 +459,9 @@ try:
                     for p in paths:
                         if p and os.path.exists(p): os.remove(p)
                 except: pass
+
+                if not ok and err and "FILE_NOT_FOUND" in str(err):
+                    task["attempts"] = 999
 
                 update_task_status(task["id"], "DONE" if ok else ("FAILED" if task["attempts"] >= 6 else "RETRY"), task["attempts"], err)
                 time.sleep(0.5)
@@ -576,15 +600,23 @@ try:
         except: return pd.DataFrame(columns=APPEAL_COLUMNS)
 
     def save_appeal(entry, proof_file=None):
+        if get_pending_count() > 500:
+            st.error("⚠️ 系統目前排隊任務過多，請稍等幾分鐘後再送出申訴！")
+            return False
+
         image_info = None
         if proof_file:
             try:
-                data = proof_file.read()
-                if len(data) > MAX_IMAGE_BYTES: st.error("照片過大"); return False
-                fname = f"Appeal_{entry.get('班級', '')}_{datetime.now(TW_TZ).strftime('%H%M%S')}.jpg"
-                l_path = os.path.join(IMG_DIR, f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}_{fname}")
-                with open(l_path, "wb") as f: f.write(data)
-                image_info = {"path": l_path, "filename": fname}
+                # [V5.7] 在讀取申訴照片時包住 semaphore 限制記憶體用量
+                print(f"Waiting for UPLOAD slot... (Appeal: {proof_file.name})")
+                with UPLOAD_SEM:
+                    print(f"UPLOAD slot acquired (Appeal: {proof_file.name})")
+                    data = proof_file.read()
+                    if len(data) > MAX_IMAGE_BYTES: st.error("照片過大"); return False
+                    fname = f"Appeal_{entry.get('班級', '')}_{datetime.now(TW_TZ).strftime('%H%M%S')}.jpg"
+                    l_path = os.path.join(IMG_DIR, f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}_{fname}")
+                    with open(l_path, "wb") as f: f.write(data)
+                    image_info = {"path": l_path, "filename": fname}
             except Exception as e: st.error(f"寫入失敗: {e}"); return False
 
         entry.update({"申訴日期": entry.get("申訴日期", datetime.now(TW_TZ).strftime("%Y-%m-%d")), "處理狀態": entry.get("處理狀態", "待處理"),
@@ -675,6 +707,10 @@ try:
         except: return False
 
     def save_entry(new_entry, uploaded_files=None, student_list=None, custom_hours=0.5, custom_category="晨掃志工"):
+        if get_pending_count() > 500:
+            st.error("⚠️ 系統目前排隊上傳的任務過多 (大於 500 筆)，為保護系統，請稍等幾分鐘後再送出！")
+            return False
+
         new_entry["日期"] = str(new_entry.get("日期", str(date.today())))
         new_entry["紀錄ID"] = new_entry.get("紀錄ID", f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}")
         if "登錄時間" not in new_entry or not new_entry["登錄時間"]:
@@ -685,19 +721,24 @@ try:
             for i, up_file in enumerate(uploaded_files):
                 if not up_file: continue
                 try:
-                    data = up_file.getvalue()
-                    if len(data) > MAX_IMAGE_BYTES: st.warning(f"檔案略過 (過大): {up_file.name}"); continue
-                    fname = f"{new_entry['紀錄ID']}_{i}.jpg"
-                    local_path = os.path.join(IMG_DIR, fname)
-                    with open(local_path, "wb") as f: f.write(data)
-                    image_paths.append(local_path); file_names.append(fname)
+                    # [V5.7] 在讀取評分照片時包住 semaphore，限制並發造成的記憶體暴增
+                    print(f"Waiting for UPLOAD slot... ({up_file.name})")
+                    with UPLOAD_SEM:
+                        print(f"UPLOAD slot acquired ({up_file.name})")
+                        data = up_file.getvalue()
+                        if len(data) > MAX_IMAGE_BYTES: st.warning(f"檔案略過 (過大): {up_file.name}"); continue
+                        fname = f"{new_entry['紀錄ID']}_{i}.jpg"
+                        local_path = os.path.join(IMG_DIR, fname)
+                        with open(local_path, "wb") as f: f.write(data)
+                        image_paths.append(local_path); file_names.append(fname)
                 except Exception as e: print(f"Save Error: {e}")
 
         payload = {
             "entry": new_entry, "image_paths": image_paths, "filenames": file_names,
             "student_list": student_list or [], "custom_hours": custom_hours, "custom_category": custom_category
         }
-        return enqueue_task("volunteer_report" if student_list is not None else "main_entry", payload)
+        enqueue_task("volunteer_report" if student_list is not None else "main_entry", payload)
+        return True
 
     @st.cache_data(ttl=300)
     def load_full_semester_data_for_export():
@@ -767,8 +808,7 @@ try:
                     with st.container(border=True):
                         col1, col2 = st.columns([2, 1])
                         with col1:
-                            # [揪團升級] 顯示目前人數
-                            st.subheader(f"📌 {t['title']} (人數: {t['current_count']} / {t['req_num']} 人)")
+                            st.subheader(f"📌 {t['title']} (進度: {t['current_count']} / {t['req_num']} 人)")
                             st.write(f"📅 **執行日期:** {t['date']}")
                             st.write(f"🧹 **任務內容:** {t['area']}")
                         
@@ -783,7 +823,6 @@ try:
                                     else:
                                         st.session_state.last_action_time = time.time()
                                         with st.spinner("連線至 Notion 更新看板中..."):
-                                            # [揪團升級] 接收滿團狀態
                                             success, msg = claim_notion_task(t['id'], s_id)
                                         if success:
                                             if msg == "滿團":
@@ -873,8 +912,8 @@ try:
                                     if v_list:
                                         score = len(v_list)
                                         base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "班級": cls, "評分項目": role, "垃圾內掃原始分": 0, "垃圾外掃原始分": score}
-                                        save_entry({**base, "備註": f"外掃({off})-{step_a}({','.join(v_list)})", "違規細項": step_a})
-                                        cnt += 1
+                                        if save_entry({**base, "備註": f"外掃({off})-{step_a}({','.join(v_list)})", "違規細項": step_a}):
+                                            cnt += 1
                                 if cnt: st.success(f"✅ 已登記 {cnt} 筆違規！"); time.sleep(1.5); st.rerun()
 
                     else:
@@ -913,8 +952,8 @@ try:
                                     if v_list:
                                         score = len(v_list)
                                         base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "班級": cls, "評分項目": role, "垃圾內掃原始分": score, "垃圾外掃原始分": 0}
-                                        save_entry({**base, "備註": f"內掃-{step_a}({','.join(v_list)})", "違規細項": step_a})
-                                        cnt += 1
+                                        if save_entry({**base, "備註": f"內掃-{step_a}({','.join(v_list)})", "違規細項": step_a}):
+                                            cnt += 1
                                 if cnt: st.success(f"✅ 已登記 {cnt} 筆違規！"); time.sleep(1.5); st.rerun()
 
                 else:
@@ -949,10 +988,10 @@ try:
                                     if (in_s + out_s) > 0 and not files: 
                                         st.error("扣分需照片")
                                     else:
-                                        save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note}, uploaded_files=files)
-                                        st.success("✅ 送出成功！系統將自動排程發放本日 0.25 小時。")
-                                        time.sleep(1.5)
-                                        st.rerun()
+                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note}, uploaded_files=files):
+                                            st.success("✅ 送出成功！系統將自動排程發放本日 0.25 小時。")
+                                            time.sleep(1.5)
+                                            st.rerun()
 
     # --- Mode 2: 班級負責人 ---
     elif app_mode == "班級負責人🥸":
@@ -999,9 +1038,9 @@ try:
                                         st.warning("⚠️ 系統處理中，請勿連續點擊！")
                                     elif rsn and pf:
                                         st.session_state.last_action_time = time.time()
-                                        save_appeal({"班級": cls, "違規日期": str(r["日期"]), "違規項目": r['評分項目'], "原始扣分": str(tot), "申訴理由": rsn, "對應紀錄ID": rid}, pf)
-                                        time.sleep(1.5)
-                                        st.rerun()
+                                        if save_appeal({"班級": cls, "違規日期": str(r["日期"]), "違規項目": r['評分項目'], "原始扣分": str(tot), "申訴理由": rsn, "對應紀錄ID": rid}, pf):
+                                            time.sleep(1.5)
+                                            st.rerun()
                                     else:
                                         st.error("請填寫理由並上傳照片")
 
@@ -1033,10 +1072,10 @@ try:
                             st.warning("⚠️ 系統處理中，請勿連續點擊！")
                         elif present and files:
                             st.session_state.last_action_time = time.time()
-                            save_entry({"日期": str(today_tw), "班級": my_cls, "評分項目": "晨間打掃", "檢查人員": f"志工(實到:{len(present)})", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "晨間打掃原始分": 0, "備註": f"名單:{','.join(present)}"}, uploaded_files=files, student_list=present, custom_hours=0.5, custom_category="晨掃志工")
-                            st.success("✅ 回報成功！")
-                            time.sleep(1.5)
-                            st.rerun()
+                            if save_entry({"日期": str(today_tw), "班級": my_cls, "評分項目": "晨間打掃", "檢查人員": f"志工(實到:{len(present)})", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "晨間打掃原始分": 0, "備註": f"名單:{','.join(present)}"}, uploaded_files=files, student_list=present, custom_hours=0.5, custom_category="晨掃志工"):
+                                st.success("✅ 回報成功！")
+                                time.sleep(1.5)
+                                st.rerun()
                         else:
                             st.error("請勾選名單並上傳照片")
 
@@ -1044,11 +1083,16 @@ try:
     elif app_mode == "組長ㄉ窩💃":
         st.title("⚙️ 管理後台")
         metrics = get_queue_metrics()
+        hb_sec = get_worker_heartbeat_sec()
         
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         col1.metric("待處理", metrics.get("pending", 0))
         col2.metric("失敗", metrics.get("failed", 0))
         col3.metric("延遲(s)", int(metrics.get("oldest_pending_sec", 0)))
+        
+        # [V5.6] 顯示 Worker 心跳燈號
+        hb_status = "🟢 正常運作" if hb_sec < 60 else "🔴 已休眠/停止"
+        col4.metric("背景 Worker", f"{hb_status}", f"最後更新: {int(hb_sec)}秒前" if hb_sec != 999999 else "無紀錄")
 
         pwd_input = st.text_input("管理密碼", type="password", key="admin_pwd")
         if pwd_input == st.secrets["system_config"]["admin_password"]:
@@ -1291,9 +1335,16 @@ try:
                                 st.session_state.last_action_time = time.time()
                                 pf.seek(0); fb = pf.read()
                                 norm = [m for m in pool if m not in spec]
-                                if norm: pf_n = io.BytesIO(fb); pf_n.name="p.jpg"; save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")}, [pf_n], norm, base_h, "返校打掃(一般)")
-                                if spec: pf_s = io.BytesIO(fb); pf_s.name="p.jpg"; save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")}, [pf_s], spec, spec_h, "返校打掃(加強)")
-                                st.success("已登記！"); time.sleep(1.5); st.rerun()
+                                ok_norm, ok_spec = True, True
+                                if norm: 
+                                    pf_n = io.BytesIO(fb); pf_n.name="p.jpg"
+                                    ok_norm = save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")}, [pf_n], norm, base_h, "返校打掃(一般)")
+                                if spec: 
+                                    pf_s = io.BytesIO(fb); pf_s.name="p.jpg"
+                                    ok_spec = save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")}, [pf_s], spec, spec_h, "返校打掃(加強)")
+                                
+                                if ok_norm and ok_spec:
+                                    st.success("已登記！"); time.sleep(1.5); st.rerun()
                             else:
                                 st.error("需上傳照片")
 
