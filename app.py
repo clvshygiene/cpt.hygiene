@@ -767,8 +767,8 @@ try:
                     with st.container(border=True):
                         col1, col2 = st.columns([2, 1])
                         with col1:
-                            # [揪團升級] 顯示目前進度
-                            st.subheader(f"📌 {t['title']} (進度: {t['current_count']} / {t['req_num']} 人)")
+                            # [揪團升級] 顯示目前人數
+                            st.subheader(f"📌 {t['title']} (人數: {t['current_count']} / {t['req_num']} 人)")
                             st.write(f"📅 **執行日期:** {t['date']}")
                             st.write(f"🧹 **任務內容:** {t['area']}")
                         
