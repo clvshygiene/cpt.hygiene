@@ -85,16 +85,15 @@ try:
                 title = props.get("任務名稱", {}).get("title", [{}])
                 title_text = title[0].get("text", {}).get("content", "未命名任務") if title else "未命名任務"
                 
+                # 時間美化：把機器碼變成人類好讀的格式
                 date_obj = props.get("任務日期", {}).get("date", {})
                 raw_date = date_obj.get("start", "未定") if date_obj else "未定"
-                
-                # 將醜醜的機器時間轉換為人類好讀的格式
                 if raw_date != "未定":
                     try:
                         parsed_date = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
-                        if len(raw_date) <= 10:  # 如果 Notion 上只有設定日期 (例如 2026-03-02)
+                        if len(raw_date) <= 10:
                             date_val = parsed_date.strftime("%Y-%m-%d")
-                        else:  # 如果有設定具體時間 (例如 12:30)
+                        else:
                             date_val = parsed_date.strftime("%Y-%m-%d %H:%M")
                     except Exception:
                         date_val = raw_date
@@ -103,8 +102,20 @@ try:
                 
                 area = props.get("任務內容", {}).get("rich_text", [{}])
                 area_text = area[0].get("text", {}).get("content", "未填寫") if area else "未填寫"
+
+                # [揪團升級] 讀取需求人數與已認領人數
+                req_num_obj = props.get("需求人數", {}).get("number")
+                req_num = req_num_obj if req_num_obj else 1  # 若未填寫預設為 1 人
                 
-                tasks.append({"id": page["id"], "title": title_text, "date": date_val, "area": area_text})
+                claimed_obj = props.get("認領學號", {}).get("rich_text", [])
+                claimed_str = claimed_obj[0].get("text", {}).get("content", "") if claimed_obj else ""
+                current_claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
+                current_count = len(current_claimants)
+                
+                tasks.append({
+                    "id": page["id"], "title": title_text, "date": date_val, "area": area_text,
+                    "req_num": req_num, "current_count": current_count
+                })
             return tasks, None
         except Exception as e:
             return [], f"Notion API 讀取失敗詳細錯誤: {str(e)}"
@@ -112,14 +123,45 @@ try:
     def claim_notion_task(page_id, student_id):
         client = get_notion_client()
         try:
+            # 1. 先取得該任務「當下」的最新狀態，避免多人同時按的時候覆蓋資料
+            page = client.pages.retrieve(page_id=page_id)
+            props = page.get("properties", {})
+            
+            req_num_obj = props.get("需求人數", {}).get("number")
+            req_num = req_num_obj if req_num_obj else 1
+            
+            claimed_obj = props.get("認領學號", {}).get("rich_text", [])
+            claimed_str = claimed_obj[0].get("text", {}).get("content", "") if claimed_obj else ""
+            current_claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
+            
+            # 2. 防呆檢查：該學號是否已經認領過？
+            if str(student_id) in current_claimants:
+                return False, f"學號 {student_id} 已經認領過此任務囉！"
+                
+            # 3. 將新學號加入清單
+            current_claimants.append(str(student_id))
+            new_claimed_str = ", ".join(current_claimants)
+            
+            # 4. 判斷加入這個人之後，滿團了沒？
+            is_full = len(current_claimants) >= req_num
+            
+            # 準備更新的資料包
+            update_props = {
+                "認領學號": {"rich_text": [{"text": {"content": new_claimed_str}}]}
+            }
+            
+            if is_full:
+                # ⚠️ 這裡的字串必須與妳 Notion 上的完成狀態「一模一樣」
+                # 上次妳決定改成純文字，所以這邊寫 "已認領"。如果有改回 Emoji，請自行替換引號內的文字！
+                update_props["任務狀態"] = {"status": {"name": "已認領"}}
+
+            # 5. 送出更新到 Notion
             client.pages.update(
                 page_id=page_id,
-                properties={
-                    "任務狀態": {"status": {"name": "被認領走了! 😼"}},
-                    "認領學號": {"rich_text": [{"text": {"content": str(student_id)}}]}
-                }
+                properties=update_props
             )
-            return True, ""
+            return True, "滿團" if is_full else "未滿"
+            
         except Exception as e:
             return False, str(e)
 
@@ -711,7 +753,7 @@ try:
             st.warning("⚠️ Notion 金鑰尚未設定，請通知管理員至後台設定 `notion_token`。")
         else:
             with st.spinner("正在向 Notion 獲取最新任務..."):
-                tasks, error_msg = fetch_available_notion_tasks() # 這裡接收錯誤訊息
+                tasks, error_msg = fetch_available_notion_tasks()
                 
             if error_msg:
                 st.error(f"⚠️ 讀取 Notion 發生錯誤！請檢查以下錯誤訊息：\n\n{error_msg}")
@@ -719,13 +761,14 @@ try:
                 st.success("🎉 目前沒有待認領的愛校服務任務喔！大家都非常棒！")
                 st.balloons()
             else:
-                st.write(f"目前共有 **{len(tasks)}** 個待認領的任務：")
+                st.write(f"目前共有 **{len(tasks)}** 項待認領的任務：")
                 
                 for t in tasks:
                     with st.container(border=True):
                         col1, col2 = st.columns([2, 1])
                         with col1:
-                            st.subheader(f"📌 {t['title']}")
+                            # [揪團升級] 顯示目前進度
+                            st.subheader(f"📌 {t['title']} (進度: {t['current_count']} / {t['req_num']} 人)")
                             st.write(f"📅 **執行日期:** {t['date']}")
                             st.write(f"🧹 **任務內容:** {t['area']}")
                         
@@ -740,13 +783,17 @@ try:
                                     else:
                                         st.session_state.last_action_time = time.time()
                                         with st.spinner("連線至 Notion 更新看板中..."):
-                                            success, err = claim_notion_task(t['id'], s_id)
+                                            # [揪團升級] 接收滿團狀態
+                                            success, msg = claim_notion_task(t['id'], s_id)
                                         if success:
-                                            st.success(f"✅ 學號 {s_id} 認領成功！任務已自動從看板更新。")
+                                            if msg == "滿團":
+                                                st.success(f"✅ 學號 {s_id} 認領成功！此任務已額滿，自動從看板隱藏。")
+                                            else:
+                                                st.success(f"✅ 學號 {s_id} 認領成功！目前還缺人，趕緊揪同學來認領！")
                                             time.sleep(2)
                                             st.rerun()
                                         else:
-                                            st.error(f"認領失敗，請確認 Notion 欄位名稱設定是否正確。錯誤代碼：{err}")
+                                            st.error(f"認領失敗：{msg}")
 
     # --- Mode 1: 糾察評分 ---
     elif app_mode == "糾察底家👀":
