@@ -401,9 +401,34 @@ try:
             ws.append_row(new_row)
         execute_with_retry(_action)
 
+    # [V5.9 Patch] 實作 Dry Run 與 Error Summary
+    def update_last_error_summary(err_msg):
+        try:
+            with closing(open_queue_conn()) as conn:
+                short_msg = str(err_msg)[:120]
+                conn.execute("INSERT OR REPLACE INTO system_status VALUES ('last_error_summary', ?)", (short_msg,))
+        except: pass
+
+    def get_last_error_summary():
+        try:
+            with closing(open_queue_conn()) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT val FROM system_status WHERE key='last_error_summary'")
+                row = cur.fetchone()
+                return row[0] if row else "無紀錄"
+        except: return "無紀錄"
+
     def process_task(task):
         task_type, payload = task["task_type"], task["payload"]
         
+        # 1. 檢查是否開啟「演習模式 (Dry Run)」
+        is_dry_run = str(st.secrets.get("system_config", {}).get("dry_run", "false")).lower() in ["true", "1"]
+        if is_dry_run:
+            # 演習模式：假裝很忙，暫停 0.3~0.6 秒，然後直接回報成功
+            time.sleep(random.uniform(0.3, 0.6))
+            return True, "DRY_RUN_SUCCESS"
+
+        # 2. 正常執行邏輯 (以下保留原有邏輯不變)
         if task_type == "service_hours_only":
             try:
                 for sid in payload.get("student_list", []):
@@ -414,17 +439,13 @@ try:
                     }
                     _append_service_row_unique(log_entry) 
                 return True, None
-            except Exception as e:
-                return False, str(e)
+            except Exception as e: return False, str(e)
 
         entry = payload.get("entry", {})
         try:
             image_paths, filenames, drive_links = payload.get("image_paths", []), payload.get("filenames", []), []
-            
             for path in image_paths:
-                if path and not os.path.exists(path):
-                    return False, "FILE_NOT_FOUND: 找不到實體圖片檔案，直接放棄"
-
+                if path and not os.path.exists(path): return False, "FILE_NOT_FOUND: 找不到實體圖片檔案，直接放棄"
             for path, fname in zip(image_paths, filenames):
                 if os.path.exists(path):
                     with open(path, "rb") as f:
@@ -433,32 +454,20 @@ try:
 
             if task_type in ["main_entry", "volunteer_report"]:
                 _append_main_entry_row(entry)
-
                 inspector_name = entry.get("檢查人員", "")
                 if "學號:" in inspector_name:
                     sid = inspector_name.split("學號:")[1].strip()
-                    log_entry = {
-                        "日期": entry.get("日期"), "學號": sid,
-                        "班級": "", "類別": "整潔評分糾察", "時數": 0.25, "紀錄ID": uuid.uuid4().hex[:8]
-                    }
-                    _append_service_row_unique(log_entry) 
+                    _append_service_row_unique({"日期": entry.get("日期"), "學號": sid, "班級": "", "類別": "整潔評分糾察", "時數": 0.25, "紀錄ID": uuid.uuid4().hex[:8]}) 
                 
                 if task_type == "volunteer_report":
                     for sid in payload.get("student_list", []):
-                        v_entry = {
-                            "日期": entry.get("日期", str(date.today())), "學號": sid, 
-                            "班級": entry.get("班級", ""), "類別": payload.get("custom_category", "晨掃志工"), 
-                            "時數": payload.get("custom_hours", 0.5), "紀錄ID": uuid.uuid4().hex[:8]
-                        }
-                        _append_service_row_unique(v_entry)
+                        _append_service_row_unique({"日期": entry.get("日期", str(date.today())), "學號": sid, "班級": entry.get("班級", ""), "類別": payload.get("custom_category", "晨掃志工"), "時數": payload.get("custom_hours", 0.5), "紀錄ID": uuid.uuid4().hex[:8]})
 
             elif task_type == "appeal_entry":
                 image_info = payload.get("image_file")
                 if image_info:
-                    if not os.path.exists(image_info["path"]):
-                        return False, "FILE_NOT_FOUND: 找不到佐證照片檔案，直接放棄"
-                    with open(image_info["path"], "rb") as f:
-                        entry["佐證照片"] = upload_image_to_drive(compress_image_bytes(f.read()), image_info["filename"])
+                    if not os.path.exists(image_info["path"]): return False, "FILE_NOT_FOUND: 找不到佐證照片檔案，直接放棄"
+                    with open(image_info["path"], "rb") as f: entry["佐證照片"] = upload_image_to_drive(compress_image_bytes(f.read()), image_info["filename"])
                 execute_with_retry(lambda: get_worksheet(SHEET_TABS["appeals"]).append_row([str(entry.get(c, "")) for c in APPEAL_COLUMNS]))
             return True, None
         except Exception as e: return False, str(e)
@@ -474,9 +483,10 @@ try:
                 if not task: time.sleep(2.0); continue
                 ok, err = process_task(task)
                 
-                # [V5.8] 如果成功，更新成功時間指示器
-                if ok:
-                    update_last_success_time()
+                if ok: update_last_success_time()
+                else: 
+                    # 紀錄最後一次失敗原因
+                    if err and "DRY_RUN" not in err: update_last_error_summary(err)
 
                 try:
                     paths = task["payload"].get("image_paths", []) + ([task["payload"]["image_file"]["path"]] if "image_file" in task["payload"] else [])
@@ -484,9 +494,7 @@ try:
                         if p and os.path.exists(p): os.remove(p)
                 except: pass
 
-                if not ok and err and "FILE_NOT_FOUND" in str(err):
-                    task["attempts"] = 999
-
+                if not ok and err and "FILE_NOT_FOUND" in str(err): task["attempts"] = 999
                 update_task_status(task["id"], "DONE" if ok else ("FAILED" if task["attempts"] >= 6 else "RETRY"), task["attempts"], err)
                 time.sleep(0.5)
             except Exception as e: time.sleep(3.0)
@@ -1123,17 +1131,22 @@ try:
         col2.metric("失敗", metrics.get("failed", 0))
         col3.metric("延遲(s)", int(metrics.get("oldest_pending_sec", 0)))
         
-        # [V5.8] 進階狀態監控：心跳與最後成功時間
+        # [V5.9 Patch] 儀表板更新
         hb_status = "🟢 正常運作" if hb_sec < 60 else "🔴 已休眠/停止"
+        is_dry_run = str(st.secrets.get("system_config", {}).get("dry_run", "false")).lower() in ["true", "1"]
         
-        if ls_sec == 999999:
-            ls_text = "無紀錄"
-        elif ls_sec < 120:
-            ls_text = f"✅ {int(ls_sec)}秒前"
-        else:
-            ls_text = f"⚠️ {int(ls_sec//60)}分鐘前 (API可能卡住)"
+        if is_dry_run: hb_status = "🟡 演習模式 (Dry Run)"
+        
+        if ls_sec == 999999: ls_text = "無紀錄"
+        elif ls_sec < 120: ls_text = f"✅ {int(ls_sec)}秒前"
+        else: ls_text = f"⚠️ {int(ls_sec//60)}分鐘前 (API可能卡住)"
             
         col4.metric("背景 Worker", f"{hb_status}", f"心跳: {int(hb_sec)}秒前 | 成功: {ls_text}")
+        
+        # 顯示最後錯誤
+        last_err = get_last_error_summary()
+        if last_err != "無紀錄":
+            st.error(f"🚨 **最後錯誤紀錄:** {last_err}")
 
         pwd_input = st.text_input("管理密碼", type="password", key="admin_pwd")
         if pwd_input == st.secrets["system_config"]["admin_password"]:
