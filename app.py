@@ -884,6 +884,39 @@ try:
     elif app_mode == "糾察底家👀":
         st.title("📝 衛生糾察評分系統")
         if "team_logged_in" not in st.session_state: st.session_state["team_logged_in"] = False
+
+        # [V5.22 Patch 2] 衛生糾察專屬：藍色公仔大聲公
+        daily_hygiene = SYSTEM_CONFIG.get("daily_hygiene_task", "")
+        if daily_hygiene:
+            formatted_hygiene = daily_hygiene.replace('\n', '<br>')
+            mascot_url = "https://drive.google.com/thumbnail?id=128ITPXtpGNuI-wLIt6p-qd4ZNNhCGbhd" 
+            
+            # 這裡把對話框改成代表糾察隊的「水藍色系」，用 class 名稱區隔避免衝突
+            bubble_html_h = f"""
+            <style>
+            .mascot-container-h {{ display: flex; align-items: flex-start; margin-bottom: 20px; gap: 15px; }}
+            .mascot-img-h {{ width: 200px; flex-shrink: 0; }}
+            .speech-bubble-h {{
+                position: relative; background: #D0E8F2; /* 淡淡的水藍色 */
+                border-radius: 15px; padding: 15px 20px; color: #05445E; font-size: 16px;
+                box-shadow: 2px 4px 10px rgba(0,0,0,0.1); border: 2px solid #189AB4; flex-grow: 1;
+            }}
+            .speech-bubble-h::before {{ content: ''; position: absolute; left: -20px; top: 30px; border: 10px solid transparent; border-right-color: #189AB4; }}
+            .speech-bubble-h::after {{ content: ''; position: absolute; left: -16px; top: 30px; border: 10px solid transparent; border-right-color: #D0E8F2; }}
+            @media (max-width: 500px) {{
+                .mascot-img-h {{ width: 120px; }}
+                .speech-bubble-h {{ font-size: 14px; padding: 10px 15px; }}
+            }}
+            </style>
+            <div class="mascot-container-h">
+                <img src="{mascot_url}" class="mascot-img-h" />
+                <div class="speech-bubble-h">
+                    <strong>📢 組長廣播 / 糾察重點：</strong><br><br>
+                    {formatted_hygiene}
+                </div>
+            </div>
+            """
+            st.markdown(bubble_html_h, unsafe_allow_html=True)
         
         if not st.session_state["team_logged_in"]:
             with st.expander("🔐 身份驗證", expanded=True):
@@ -1484,7 +1517,33 @@ try:
                                         st.write(f"#### {g}")
                                         st.dataframe(fin[fin["年級"]==g].sort_values("總成績", ascending=False))
             with t1:
-                df = load_main_data()
+                # [V5.22 Patch 3] 晨掃未完成名單追蹤
+                st.subheader("🕵️‍♀️ 今日晨掃進度追蹤")
+                today_str = str(today_tw)
+                duty_df, _ = get_daily_duty(today_tw)
+                main_df = load_main_data()
+                
+                if not duty_df.empty:
+                    # 取得今天有排班的班級
+                    assigned_classes = set(duty_df["負責班級"].dropna().astype(str).tolist())
+                    # 取得今天已經回報的班級 (只要項目包含晨間打掃就算)
+                    reported_classes = set(main_df[(main_df["日期"].astype(str) == today_str) & (main_df["評分項目"].astype(str).str.contains("晨間打掃"))]["班級"].astype(str).tolist())
+                    
+                    # 互相抵銷，抓出還沒掃的班級
+                    missing_classes = assigned_classes - reported_classes
+                    
+                    if missing_classes:
+                        st.error(f"🚨 **尚未回報班級 ({len(missing_classes)}班)：** {', '.join(sorted(list(missing_classes)))}")
+                    else:
+                        st.success("🎉 太棒了！今日所有排定班級皆已完成晨掃回報！")
+                else:
+                    st.info("今日無晨掃排班任務。")
+                    
+                st.markdown("---")
+                st.subheader("📝 待審核回報列表")
+                
+                # 維持原有的審核迴圈
+                df = main_df 
                 for i, r in df[(df["評分項目"]=="晨間打掃") & (df["晨間打掃原始分"]==0) & (df["修正"]!="TRUE")].iterrows():
                     with st.container(border=True):
                         c1, c2, c3 = st.columns([2,2,1.3])
@@ -1559,6 +1618,16 @@ try:
                     if save_setting("daily_morning_task", new_task):
                         st.success("✅ 每日任務已更新！學生現在起會看到最新廣播。")
                 
+                st.markdown("---")
+                
+                # [V5.22 Patch 1] 新增衛生糾察廣播設定
+                st.write("📢 衛生糾察每日廣播/提醒")
+                current_hygiene_task = SYSTEM_CONFIG.get("daily_hygiene_task", "今日無特殊任務，請確實完成各區檢查即可！")
+                new_hygiene_task = st.text_area("請輸入想給糾察隊看的話（例如：今天重點檢查黑板、窗台）", value=current_hygiene_task)
+                if st.button("💾 更新糾察任務"): 
+                    if save_setting("daily_hygiene_task", new_hygiene_task):
+                        st.success("✅ 糾察任務已更新！糾察隊現在起會看到最新廣播。")
+
                 st.markdown("---")
                 st.write("🔧 系統連線狀態")
                 if get_gspread_client(): st.success("✅ Google Sheets 連線正常")
