@@ -1139,7 +1139,7 @@ try:
                         }}
                         /* 🌟 調整 1：把電腦版的公仔從 80px 放大到 110px */
                         .mascot-img {{
-                            width: 110px; 
+                            width: 160px; 
                             flex-shrink: 0; 
                         }}
                         .speech-bubble {{
@@ -1177,7 +1177,7 @@ try:
                         /* 📱 調整 2：把手機版的公仔從 60px 放大到 85px */
                         @media (max-width: 500px) {{
                             .mascot-img {{
-                                width: 85px; 
+                                width: 120px; 
                             }}
                             .speech-bubble {{
                                 font-size: 14px;
