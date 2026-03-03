@@ -1121,19 +1121,82 @@ try:
                     
                     st.info(f"📍 本班任務總應到: {n_std} 人")
                     
-                    # [V5.18 Patch] 公仔大聲公版面
+                    # [V5.20 Patch] 手機完美版：公仔與對話泡泡
                     daily_task = SYSTEM_CONFIG.get("daily_morning_task", "")
                     if daily_task:
-                        # 切割成左右兩欄，比例為 1 : 5 (左邊放公仔，右邊放文字)
-                        col_img, col_text = st.columns([1, 5]) 
+                        formatted_task = daily_task.replace('\n', '<br>')
+                        mascot_url = "https://drive.google.com/uc?id=128ITPXtpGNuI-wLIt6p-qd4ZNNhCGbhd"
                         
-                        with col_img:
-                            # 👉 請把下面引號裡的網址，換成妳的公仔圖片網址 (或是 GitHub 裡的檔名如 "mascot.png")
-                            mascot_url = "https://drive.google.com/file/d/128ITPXtpGNuI-wLIt6p-qd4ZNNhCGbhd" # 這是我暫時幫妳找的可愛柴犬圖，記得換掉！
-                            st.image(mascot_url, use_container_width=True)
-                            
-                        with col_text:
-                            st.warning(f"**組長廣播/今日任務：**\n\n{daily_task}", icon="📢")
+                        bubble_html = f"""
+                        <style>
+                        /* 建立一個彈性容器，強制公仔和泡泡永遠左右並排 */
+                        .mascot-container {{
+                            display: flex;
+                            align-items: flex-start;
+                            margin-bottom: 20px;
+                            gap: 15px;
+                        }}
+                        /* 設定公仔的寬度 */
+                        .mascot-img {{
+                            width: 80px; 
+                            flex-shrink: 0; /* 防止螢幕太小時公仔被擠扁 */
+                        }}
+                        /* 泡泡主體設定 */
+                        .speech-bubble {{
+                            position: relative;
+                            background: #FFF3CD;
+                            border-radius: 15px;
+                            padding: 15px 20px;
+                            color: #664d03;
+                            font-size: 16px;
+                            box-shadow: 2px 4px 10px rgba(0,0,0,0.1);
+                            border: 2px solid #ffecb5;
+                            flex-grow: 1; /* 讓泡泡自動填滿剩下的空間 */
+                        }}
+                        /* 畫出指向左邊的尾巴外框 */
+                        .speech-bubble::before {{
+                            content: '';
+                            position: absolute;
+                            left: -20px;
+                            top: 20px;
+                            width: 0;
+                            height: 0;
+                            border: 10px solid transparent;
+                            border-right-color: #ffecb5;
+                        }}
+                        /* 畫出指向左邊的尾巴內色 */
+                        .speech-bubble::after {{
+                            content: '';
+                            position: absolute;
+                            left: -16px;
+                            top: 20px;
+                            width: 0;
+                            height: 0;
+                            border: 10px solid transparent;
+                            border-right-color: #FFF3CD;
+                        }}
+                        /* 📱 手機版專屬微調：螢幕太小時稍微縮小公仔和字體 */
+                        @media (max-width: 500px) {{
+                            .mascot-img {{
+                                width: 60px;
+                            }}
+                            .speech-bubble {{
+                                font-size: 14px;
+                                padding: 10px 15px;
+                            }}
+                        }}
+                        </style>
+                        
+                        <div class="mascot-container">
+                            <img src="{mascot_url}" class="mascot-img" />
+                            <div class="speech-bubble">
+                                <strong>📢 組長廣播 / 今日任務：</strong><br><br>
+                                {formatted_task}
+                            </div>
+                        </div>
+                        """
+                        # 將畫好的完美版型渲染到畫面上
+                        st.markdown(bubble_html, unsafe_allow_html=True)
                     
                     with st.form("vol_form"):
                         st.write("請依照下方分配的區域，分別填寫打掃同學並上傳照片：")
