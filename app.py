@@ -1129,7 +1129,7 @@ try:
                         
                         with col_img:
                             # 👉 請把下面引號裡的網址，換成妳的公仔圖片網址 (或是 GitHub 裡的檔名如 "mascot.png")
-                            mascot_url = "https://drive.google.com/file/d/12e5ZQEr14vX3-7ZZPiYR2mm8GrGqEKZV/view?usp=sharing" # 這是我暫時幫妳找的可愛柴犬圖，記得換掉！
+                            mascot_url = "https://drive.google.com/file/d/128ITPXtpGNuI-wLIt6p-qd4ZNNhCGbhd" # 這是我暫時幫妳找的可愛柴犬圖，記得換掉！
                             st.image(mascot_url, use_container_width=True)
                             
                         with col_text:
