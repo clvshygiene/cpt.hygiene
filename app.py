@@ -1093,8 +1093,10 @@ try:
         else:
             my_cls = st.selectbox("選擇班級", all_classes, key="m3_cls_select")
             main_df = load_main_data()
-            if not main_df[(main_df["日期"].astype(str)==str(today_tw)) & (main_df["班級"]==my_cls) & (main_df["評分項目"]=="晨間打掃")].empty: 
-                st.warning(f"⚠️ {my_cls} 今日已回報過囉！")
+            # [V5.16 Patch] 改用 str.contains 模糊比對，只要包含「晨間打掃」一律擋下
+            if not main_df[(main_df["日期"].astype(str)==str(today_tw)) & (main_df["班級"]==my_cls) & (main_df["評分項目"].astype(str).str.contains("晨間打掃"))].empty: 
+                st.warning(f"⚠️ {my_cls} 今日已回報或已審核完畢囉！")
+            else:
             else:
                 duty_df, _ = get_daily_duty(today_tw)
                 
