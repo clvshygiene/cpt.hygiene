@@ -274,14 +274,15 @@ try:
     def update_worker_heartbeat():
         try:
             with closing(open_queue_conn()) as conn:
-                conn.execute("INSERT OR REPLACE INTO system_status VALUES ('worker_heartbeat', ?)", (datetime.now(timezone.utc).isoformat(),))
+                # 改用最單純的 time.time() 記錄秒數，避免雲端解析字串失敗
+                conn.execute("INSERT OR REPLACE INTO system_status VALUES ('worker_heartbeat', ?)", (str(time.time()),))
         except: pass
 
     # [V5.8] 新增紀錄最後成功處理時間
     def update_last_success_time():
         try:
             with closing(open_queue_conn()) as conn:
-                conn.execute("INSERT OR REPLACE INTO system_status VALUES ('last_success_time', ?)", (datetime.now(timezone.utc).isoformat(),))
+                conn.execute("INSERT OR REPLACE INTO system_status VALUES ('last_success_time', ?)", (str(time.time()),))
         except: pass
 
     def get_worker_heartbeat_sec():
@@ -291,8 +292,7 @@ try:
                 cur.execute("SELECT val FROM system_status WHERE key='worker_heartbeat'")
                 row = cur.fetchone()
                 if row:
-                    hb_time = datetime.fromisoformat(row[0])
-                    return (datetime.now(timezone.utc) - hb_time).total_seconds()
+                    return time.time() - float(row[0])
         except: pass
         return 999999
 
@@ -304,8 +304,7 @@ try:
                 cur.execute("SELECT val FROM system_status WHERE key='last_success_time'")
                 row = cur.fetchone()
                 if row:
-                    ls_time = datetime.fromisoformat(row[0])
-                    return (datetime.now(timezone.utc) - ls_time).total_seconds()
+                    return time.time() - float(row[0])
         except: pass
         return 999999
 
@@ -499,15 +498,14 @@ try:
                 time.sleep(0.5)
             except Exception as e: time.sleep(3.0)
 
+    # [V5.10 Patch] 修正 Streamlit 新版快取機制的潛在衝突
     @st.cache_resource
     def ensure_worker_started():
-        if "workers_started" not in st.session_state:
-            stop_event = threading.Event()
-            t = threading.Thread(target=background_worker, args=(stop_event,), daemon=True)
-            add_script_run_ctx(t)
-            t.start()
-            st.session_state["workers_started"] = True
-            return stop_event
+        stop_event = threading.Event()
+        t = threading.Thread(target=background_worker, args=(stop_event,), daemon=True)
+        add_script_run_ctx(t)
+        t.start()
+        return stop_event
     _ = ensure_worker_started()
 
     # ==========================================
@@ -1340,6 +1338,10 @@ try:
                         c1, c2, c3 = st.columns([2,2,1])
                         c1.write(f"**{r['班級']}** | {r['檢查人員']}")
                         c1.caption(f"登錄時間：{r['登錄時間']}") 
+                        
+                        # [修改] 拔掉 [0]，改用陣列讀取所有照片網址，這樣就能顯示多張照片
+                        if "http" in str(r['照片路徑']): 
+                            c2.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=150) 
                         
                         if "http" in str(r['照片路徑']): 
                             c2.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=150) 
