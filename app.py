@@ -1253,7 +1253,7 @@ try:
                                 with col2:
                                     files_dict[area] = st.file_uploader(f"📸 {area} 成果照片", accept_multiple_files=True, type=['jpg','png'], key=f"fu_{idx}")
                                     
-                        if st.form_submit_button("🚀 確認送出全部回報", use_container_width=True):
+                        if st.form_submit_button("🚀 確認送出全部回報"):
                             if time.time() - st.session_state.last_action_time < 3:
                                 st.warning("⚠️ 系統處理中，請勿連續點擊！")
                             else:
