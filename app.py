@@ -1134,8 +1134,16 @@ try:
     # --- Mode 3: 晨掃志工隊🧹 ---
     elif app_mode == "晨掃志工隊🧹":
         st.title("🧹 晨掃志工回報專區")
-        if now_tw.hour >= 16: st.error("🚫 今日回報已截止 (16:00)")
+        
+        # [V5.25 Patch] 測試機特權：DEV 環境設定為 24 點關門，PROD 正式環境維持 16 點關門
+        cutoff_hour = 24 if sys_env == "DEV" else 16
+        
+        if now_tw.hour >= cutoff_hour: 
+            st.error("🚫 今日回報已截止 (16:00)")
         else:
+            if sys_env == "DEV" and now_tw.hour >= 16:
+                st.info("🔧 **[測試機特權開啟]** 目前已超過 16:00，但因為是 DEV 環境，允許繼續測試！")
+                
             my_cls = st.selectbox("選擇班級", all_classes, key="m3_cls_select")
             main_df = load_main_data()
             # [V5.16 Patch] 改用 str.contains 模糊比對，只要包含「晨間打掃」一律擋下
