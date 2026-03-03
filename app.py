@@ -32,7 +32,15 @@ except ImportError:
     NOTION_INSTALLED = False
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
+
+# 透過 Streamlit Secrets 判斷目前是測試區還是正式區 (預設為正式區)
+sys_env = st.secrets.get("ENV", "PROD")
+
+if sys_env == "DEV":
+    st.set_page_config(page_title="🔧測試版-中壢家商，衛愛而生", layout="wide", page_icon="🧹")
+else:
+    st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
+
 
 # --- 2. 核心參數與全域設定 ---
 try:
@@ -1121,10 +1129,80 @@ try:
                     
                     st.info(f"📍 本班任務總應到: {n_std} 人")
                     
-                    # [V5.17 Patch] 顯示組長每日廣播
+                    # [V5.21 Patch] 放大公仔版面
                     daily_task = SYSTEM_CONFIG.get("daily_morning_task", "")
                     if daily_task:
-                        st.warning(f"**組長廣播/今日任務：**\n\n{daily_task}", icon="📢")
+                        formatted_task = daily_task.replace('\n', '<br>')
+                        
+                        # 這裡放妳的公仔網址 (ImgBB 或 GitHub Raw 網址)
+                        mascot_url = "https://drive.google.com/thumbnail?id=128ITPXtpGNuI-wLIt6p-qd4ZNNhCGbhd"
+                        
+                        bubble_html = f"""
+                        <style>
+                        .mascot-container {{
+                            display: flex;
+                            align-items: flex-start;
+                            margin-bottom: 20px;
+                            gap: 15px;
+                        }}
+                        /* 🌟 調整 1：把電腦版的公仔從 80px 放大到 110px */
+                        .mascot-img {{
+                            width: 160px; 
+                            flex-shrink: 0; 
+                        }}
+                        .speech-bubble {{
+                            position: relative;
+                            background: #FFF3CD;
+                            border-radius: 15px;
+                            padding: 15px 20px;
+                            color: #664d03;
+                            font-size: 16px;
+                            box-shadow: 2px 4px 10px rgba(0,0,0,0.1);
+                            border: 2px solid #ffecb5;
+                            flex-grow: 1; 
+                        }}
+                        .speech-bubble::before {{
+                            content: '';
+                            position: absolute;
+                            left: -20px;
+                            top: 30px; /* 為了配合變大的公仔，把對話尾巴稍微往下移一點對齊嘴巴 */
+                            width: 0;
+                            height: 0;
+                            border: 10px solid transparent;
+                            border-right-color: #ffecb5;
+                        }}
+                        .speech-bubble::after {{
+                            content: '';
+                            position: absolute;
+                            left: -16px;
+                            top: 30px; /* 同上，跟著下移 */
+                            width: 0;
+                            height: 0;
+                            border: 10px solid transparent;
+                            border-right-color: #FFF3CD;
+                        }}
+                        
+                        /* 📱 調整 2：把手機版的公仔從 60px 放大到 85px */
+                        @media (max-width: 500px) {{
+                            .mascot-img {{
+                                width: 120px; 
+                            }}
+                            .speech-bubble {{
+                                font-size: 14px;
+                                padding: 10px 15px;
+                            }}
+                        }}
+                        </style>
+                        
+                        <div class="mascot-container">
+                            <img src="{mascot_url}" class="mascot-img" />
+                            <div class="speech-bubble">
+                                <strong>📢 組長廣播 / 今日任務：</strong><br><br>
+                                {formatted_task}
+                            </div>
+                        </div>
+                        """
+                        st.markdown(bubble_html, unsafe_allow_html=True)
                     
                     with st.form("vol_form"):
                         st.write("請依照下方分配的區域，分別填寫打掃同學並上傳照片：")
