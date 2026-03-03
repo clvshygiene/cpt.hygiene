@@ -1125,7 +1125,7 @@ try:
                     daily_task = SYSTEM_CONFIG.get("daily_morning_task", "")
                     if daily_task:
                         formatted_task = daily_task.replace('\n', '<br>')
-                        mascot_url = "https://drive.google.com/uc?id=128ITPXtpGNuI-wLIt6p-qd4ZNNhCGbhd"
+                        mascot_url = "https://drive.google.com/thumbnail?id=128ITPXtpGNuI-wLIt6p-qd4ZNNhCGbhd&sz=w800"
                         
                         bubble_html = f"""
                         <style>
