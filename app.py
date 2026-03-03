@@ -1093,8 +1093,9 @@ try:
         else:
             my_cls = st.selectbox("選擇班級", all_classes, key="m3_cls_select")
             main_df = load_main_data()
-            if not main_df[(main_df["日期"].astype(str)==str(today_tw)) & (main_df["班級"]==my_cls) & (main_df["評分項目"]=="晨間打掃")].empty: 
-                st.warning(f"⚠️ {my_cls} 今日已回報過囉！")
+            # [V5.16 Patch] 改用 str.contains 模糊比對，只要包含「晨間打掃」一律擋下
+            if not main_df[(main_df["日期"].astype(str)==str(today_tw)) & (main_df["班級"]==my_cls) & (main_df["評分項目"].astype(str).str.contains("晨間打掃"))].empty: 
+                st.warning(f"⚠️ {my_cls} 今日已回報或已審核完畢囉！")
             else:
                 duty_df, _ = get_daily_duty(today_tw)
                 
@@ -1119,6 +1120,11 @@ try:
                     if not areas: areas = ["打掃區域"]
                     
                     st.info(f"📍 本班任務總應到: {n_std} 人")
+                    
+                    # [V5.17 Patch] 顯示組長每日廣播
+                    daily_task = SYSTEM_CONFIG.get("daily_morning_task", "")
+                    if daily_task:
+                        st.warning(f"**組長廣播/今日任務：**\n\n{daily_task}", icon="📢")
                     
                     with st.form("vol_form"):
                         st.write("請依照下方分配的區域，分別填寫打掃同學並上傳照片：")
@@ -1465,6 +1471,15 @@ try:
                 curr = SYSTEM_CONFIG.get("semester_start")
                 nd = st.date_input("開學日", datetime.strptime(curr, "%Y-%m-%d").date() if curr else today_tw)
                 if st.button("更新開學日"): save_setting("semester_start", str(nd))
+                
+                st.markdown("---")
+                # [V5.17 Patch] 新增晨掃每日任務廣播
+                st.write("📢 晨掃志工每日廣播/任務")
+                current_task = SYSTEM_CONFIG.get("daily_morning_task", "今日無特殊任務，請確實完成各區打掃即可！")
+                new_task = st.text_area("請輸入想給志工看的話（例如：拍照請比 YA、今天請加強拖地等）", value=current_task)
+                if st.button("💾 更新每日任務"): 
+                    if save_setting("daily_morning_task", new_task):
+                        st.success("✅ 每日任務已更新！學生現在起會看到最新廣播。")
                 
                 st.markdown("---")
                 st.write("🔧 系統連線狀態")
