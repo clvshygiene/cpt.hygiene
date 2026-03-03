@@ -1121,13 +1121,13 @@ try:
                     
                     st.info(f"📍 本班任務總應到: {n_std} 人")
                     
-# [V5.21 Patch] 放大公仔版面
+                    # [V5.21 Patch] 放大公仔版面
                     daily_task = SYSTEM_CONFIG.get("daily_morning_task", "")
                     if daily_task:
                         formatted_task = daily_task.replace('\n', '<br>')
                         
                         # 這裡放妳的公仔網址 (ImgBB 或 GitHub Raw 網址)
-                        mascot_url = "妳的公仔圖片網址"
+                        mascot_url = "https://drive.google.com/thumbnail?id=128ITPXtpGNuI-wLIt6p-qd4ZNNhCGbhd"
                         
                         bubble_html = f"""
                         <style>
