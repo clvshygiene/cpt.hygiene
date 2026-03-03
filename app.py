@@ -36,6 +36,10 @@ except ImportError:
 # 透過 Streamlit Secrets 判斷目前是測試區還是正式區 (預設為正式區)
 sys_env = st.secrets.get("ENV", "PROD")
 
+# 👇 [抓蟲專用] 讓系統在側邊欄大聲說出它拿到的身分證是什麼！
+import streamlit as st # 確保有載入
+st.sidebar.info(f"🕵️‍♀️ 系統目前抓到的身分證是：[{sys_env}]")
+
 if sys_env == "DEV":
     st.set_page_config(page_title="🔧測試版-中壢家商，衛愛而生", layout="wide", page_icon="🧹")
 else:
