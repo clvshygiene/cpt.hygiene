@@ -1121,10 +1121,19 @@ try:
                     
                     st.info(f"📍 本班任務總應到: {n_std} 人")
                     
-                    # [V5.17 Patch] 顯示組長每日廣播
+                    # [V5.18 Patch] 公仔大聲公版面
                     daily_task = SYSTEM_CONFIG.get("daily_morning_task", "")
                     if daily_task:
-                        st.warning(f"**組長廣播/今日任務：**\n\n{daily_task}", icon="📢")
+                        # 切割成左右兩欄，比例為 1 : 5 (左邊放公仔，右邊放文字)
+                        col_img, col_text = st.columns([1, 5]) 
+                        
+                        with col_img:
+                            # 👉 請把下面引號裡的網址，換成妳的公仔圖片網址 (或是 GitHub 裡的檔名如 "mascot.png")
+                            mascot_url = "https://drive.google.com/file/d/12e5ZQEr14vX3-7ZZPiYR2mm8GrGqEKZV/view?usp=sharing" # 這是我暫時幫妳找的可愛柴犬圖，記得換掉！
+                            st.image(mascot_url, use_container_width=True)
+                            
+                        with col_text:
+                            st.warning(f"**組長廣播/今日任務：**\n\n{daily_task}", icon="📢")
                     
                     with st.form("vol_form"):
                         st.write("請依照下方分配的區域，分別填寫打掃同學並上傳照片：")
