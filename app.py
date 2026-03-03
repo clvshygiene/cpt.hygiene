@@ -32,7 +32,7 @@ except ImportError:
     NOTION_INSTALLED = False
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="中壢家商，衛愛而生 V5.8", layout="wide", page_icon="🧹")
+st.set_page_config(page_title="測試-中壢家商，衛愛而生", layout="wide", page_icon="🧹")
 
 # --- 2. 核心參數與全域設定 ---
 try:
