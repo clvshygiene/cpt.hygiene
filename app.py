@@ -1121,27 +1121,27 @@ try:
                     
                     st.info(f"📍 本班任務總應到: {n_std} 人")
                     
-                    # [V5.20 Patch] 手機完美版：公仔與對話泡泡
+# [V5.21 Patch] 放大公仔版面
                     daily_task = SYSTEM_CONFIG.get("daily_morning_task", "")
                     if daily_task:
                         formatted_task = daily_task.replace('\n', '<br>')
-                        mascot_url = "https://drive.google.com/thumbnail?id=128ITPXtpGNuI-wLIt6p-qd4ZNNhCGbhd&sz=w800"
+                        
+                        # 這裡放妳的公仔網址 (ImgBB 或 GitHub Raw 網址)
+                        mascot_url = "妳的公仔圖片網址"
                         
                         bubble_html = f"""
                         <style>
-                        /* 建立一個彈性容器，強制公仔和泡泡永遠左右並排 */
                         .mascot-container {{
                             display: flex;
                             align-items: flex-start;
                             margin-bottom: 20px;
                             gap: 15px;
                         }}
-                        /* 設定公仔的寬度 */
+                        /* 🌟 調整 1：把電腦版的公仔從 80px 放大到 110px */
                         .mascot-img {{
-                            width: 80px; 
-                            flex-shrink: 0; /* 防止螢幕太小時公仔被擠扁 */
+                            width: 110px; 
+                            flex-shrink: 0; 
                         }}
-                        /* 泡泡主體設定 */
                         .speech-bubble {{
                             position: relative;
                             background: #FFF3CD;
@@ -1151,34 +1151,33 @@ try:
                             font-size: 16px;
                             box-shadow: 2px 4px 10px rgba(0,0,0,0.1);
                             border: 2px solid #ffecb5;
-                            flex-grow: 1; /* 讓泡泡自動填滿剩下的空間 */
+                            flex-grow: 1; 
                         }}
-                        /* 畫出指向左邊的尾巴外框 */
                         .speech-bubble::before {{
                             content: '';
                             position: absolute;
                             left: -20px;
-                            top: 20px;
+                            top: 30px; /* 為了配合變大的公仔，把對話尾巴稍微往下移一點對齊嘴巴 */
                             width: 0;
                             height: 0;
                             border: 10px solid transparent;
                             border-right-color: #ffecb5;
                         }}
-                        /* 畫出指向左邊的尾巴內色 */
                         .speech-bubble::after {{
                             content: '';
                             position: absolute;
                             left: -16px;
-                            top: 20px;
+                            top: 30px; /* 同上，跟著下移 */
                             width: 0;
                             height: 0;
                             border: 10px solid transparent;
                             border-right-color: #FFF3CD;
                         }}
-                        /* 📱 手機版專屬微調：螢幕太小時稍微縮小公仔和字體 */
+                        
+                        /* 📱 調整 2：把手機版的公仔從 60px 放大到 85px */
                         @media (max-width: 500px) {{
                             .mascot-img {{
-                                width: 60px;
+                                width: 85px; 
                             }}
                             .speech-bubble {{
                                 font-size: 14px;
@@ -1195,7 +1194,6 @@ try:
                             </div>
                         </div>
                         """
-                        # 將畫好的完美版型渲染到畫面上
                         st.markdown(bubble_html, unsafe_allow_html=True)
                     
                     with st.form("vol_form"):
