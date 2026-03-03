@@ -1082,40 +1082,95 @@ try:
                                     else:
                                         st.error("請填寫理由並上傳照片")
 
-    # --- Mode 3: 晨掃志工隊 ---
+    # --- Mode 3: 晨掃志工隊🧹 ---
     elif app_mode == "晨掃志工隊🧹":
         st.title("🧹 晨掃志工回報專區")
         if now_tw.hour >= 16: st.error("🚫 今日回報已截止 (16:00)")
         else:
             my_cls = st.selectbox("選擇班級", all_classes, key="m3_cls_select")
             main_df = load_main_data()
-            if not main_df[(main_df["日期"].astype(str)==str(today_tw)) & (main_df["班級"]==my_cls) & (main_df["評分項目"]=="晨間打掃")].empty: st.warning(f"⚠️ {my_cls} 已回報！")
+            if not main_df[(main_df["日期"].astype(str)==str(today_tw)) & (main_df["班級"]==my_cls) & (main_df["評分項目"]=="晨間打掃")].empty: 
+                st.warning(f"⚠️ {my_cls} 今日已回報過囉！")
             else:
                 duty_df, _ = get_daily_duty(today_tw)
-                area_name = "無"
+                area_name_str = "未指定區域"
                 n_std = 4
                 if not duty_df.empty:
                     m_d = duty_df[duty_df["負責班級"]==my_cls]
                     if not m_d.empty:
-                        area_name = m_d.iloc[0].get('掃地區域', '無')
+                        area_name_str = str(m_d.iloc[0].get('掃地區域', '未指定區域'))
                         try: n_std = int(m_d.iloc[0].get('標準人數', 4))
                         except: n_std = 4
                 
-                st.info(f"📍 任務: {area_name} (應到:{n_std}人)")
+                # [V5.12 Patch] 將區域字串用「、」分割成清單
+                areas = [a.strip() for a in area_name_str.split('、') if a.strip()]
+                if not areas: areas = ["打掃區域"]
+                
+                st.info(f"📍 本班任務總應到: {n_std} 人")
+                
                 with st.form("vol_form"):
-                    present = st.multiselect("✅ 實到同學", [s for s, c in ROSTER_DICT.items() if c == my_cls])
-                    files = st.file_uploader("📸 成果照片", accept_multiple_files=True, type=['jpg','png'])
-                    if st.form_submit_button("送出"):
+                    st.write("請依照下方分配的區域，分別填寫打掃同學並上傳照片：")
+                    
+                    present_dict = {}
+                    files_dict = {}
+                    class_roster = [s for s, c in ROSTER_DICT.items() if c == my_cls]
+                    
+                    # 動態產生每個區域的專屬區塊
+                    for idx, area in enumerate(areas):
+                        with st.container(border=True):
+                            st.markdown(f"#### 🏷️ 區域 {idx+1}: **{area}**")
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                # 讓學生在這個區域選擇負責的同學
+                                present_dict[area] = st.multiselect(f"✅ 負責此區同學", class_roster, key=f"ms_{idx}")
+                            with col2:
+                                # 讓學生在這個區域上傳照片 (不限張數)
+                                files_dict[area] = st.file_uploader(f"📸 {area} 成果照片", accept_multiple_files=True, type=['jpg','png'], key=f"fu_{idx}")
+                                
+                    if st.form_submit_button("🚀 確認送出全部回報", use_container_width=True):
                         if time.time() - st.session_state.last_action_time < 3:
                             st.warning("⚠️ 系統處理中，請勿連續點擊！")
-                        elif present and files:
-                            st.session_state.last_action_time = time.time()
-                            if save_entry({"日期": str(today_tw), "班級": my_cls, "評分項目": "晨間打掃", "檢查人員": f"志工(實到:{len(present)})", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "晨間打掃原始分": 0, "備註": f"名單:{','.join(present)}"}, uploaded_files=files, student_list=present, custom_hours=0.5, custom_category="晨掃志工"):
-                                st.success("✅ 回報成功！")
-                                time.sleep(1.5)
-                                st.rerun()
                         else:
-                            st.error("請勾選名單並上傳照片")
+                            st.session_state.last_action_time = time.time()
+                            
+                            # 彙整所有區域的資料
+                            all_present = []
+                            all_files = []
+                            note_parts = []
+                            
+                            for area in areas:
+                                if present_dict[area]:
+                                    all_present.extend(present_dict[area])
+                                    note_parts.append(f"[{area}] 負責:{','.join(present_dict[area])}")
+                                if files_dict[area]:
+                                    all_files.extend(files_dict[area])
+                                    
+                            # 去除重複的學號 (防呆：萬一同一個學生被點選負責兩個區域)
+                            all_present = list(set(all_present))
+                            final_note = " | ".join(note_parts)
+                            
+                            if not all_present or not all_files:
+                                st.error("❌ 請至少選擇一位打掃同學，並上傳至少一張照片！")
+                            else:
+                                ok = save_entry(
+                                    {
+                                        "日期": str(today_tw), 
+                                        "班級": my_cls, 
+                                        "評分項目": "晨間打掃", 
+                                        "檢查人員": f"志工(實到:{len(all_present)})", 
+                                        "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), 
+                                        "晨間打掃原始分": 0, 
+                                        "備註": final_note
+                                    }, 
+                                    uploaded_files=all_files, 
+                                    student_list=all_present, 
+                                    custom_hours=0.5, 
+                                    custom_category="晨掃志工"
+                                )
+                                if ok:
+                                    st.success("✅ 回報成功！所有區域皆已記錄，辛苦了！")
+                                    time.sleep(1.5)
+                                    st.rerun()
 
     # --- Mode 4: 組長後台 ---
     elif app_mode == "組長ㄉ窩💃":
