@@ -837,7 +837,7 @@ try:
             if error_msg:
                 st.error(f"⚠️ 讀取 Notion 發生錯誤！請檢查以下錯誤訊息：\n\n{error_msg}")
             elif not tasks:
-                st.success("🎉 目前沒有待認領的愛校服務任務喔！大家都非常棒！")
+                st.success("🎉 娃，目前沒有任務！")
                 st.balloons()
             else:
                 st.write(f"目前共有 **{len(tasks)}** 項待認領的任務：")
@@ -1082,40 +1082,98 @@ try:
                                     else:
                                         st.error("請填寫理由並上傳照片")
 
-    # --- Mode 3: 晨掃志工隊 ---
+    # --- Mode 3: 晨掃志工隊🧹 ---
     elif app_mode == "晨掃志工隊🧹":
         st.title("🧹 晨掃志工回報專區")
         if now_tw.hour >= 16: st.error("🚫 今日回報已截止 (16:00)")
         else:
             my_cls = st.selectbox("選擇班級", all_classes, key="m3_cls_select")
             main_df = load_main_data()
-            if not main_df[(main_df["日期"].astype(str)==str(today_tw)) & (main_df["班級"]==my_cls) & (main_df["評分項目"]=="晨間打掃")].empty: st.warning(f"⚠️ {my_cls} 已回報！")
+            if not main_df[(main_df["日期"].astype(str)==str(today_tw)) & (main_df["班級"]==my_cls) & (main_df["評分項目"]=="晨間打掃")].empty: 
+                st.warning(f"⚠️ {my_cls} 今日已回報過囉！")
             else:
                 duty_df, _ = get_daily_duty(today_tw)
-                area_name = "無"
-                n_std = 4
+                
+                # [V5.13 Patch] 預設狀態為「沒有任務」
+                has_duty = False 
+                
                 if not duty_df.empty:
                     m_d = duty_df[duty_df["負責班級"]==my_cls]
                     if not m_d.empty:
-                        area_name = m_d.iloc[0].get('掃地區域', '無')
+                        has_duty = True
+                        area_name_str = str(m_d.iloc[0].get('掃地區域', '未指定區域'))
                         try: n_std = int(m_d.iloc[0].get('標準人數', 4))
                         except: n_std = 4
                 
-                st.info(f"📍 任務: {area_name} (應到:{n_std}人)")
-                with st.form("vol_form"):
-                    present = st.multiselect("✅ 實到同學", [s for s, c in ROSTER_DICT.items() if c == my_cls])
-                    files = st.file_uploader("📸 成果照片", accept_multiple_files=True, type=['jpg','png'])
-                    if st.form_submit_button("送出"):
-                        if time.time() - st.session_state.last_action_time < 3:
-                            st.warning("⚠️ 系統處理中，請勿連續點擊！")
-                        elif present and files:
-                            st.session_state.last_action_time = time.time()
-                            if save_entry({"日期": str(today_tw), "班級": my_cls, "評分項目": "晨間打掃", "檢查人員": f"志工(實到:{len(present)})", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "晨間打掃原始分": 0, "備註": f"名單:{','.join(present)}"}, uploaded_files=files, student_list=present, custom_hours=0.5, custom_category="晨掃志工"):
-                                st.success("✅ 回報成功！")
-                                time.sleep(1.5)
-                                st.rerun()
-                        else:
-                            st.error("請勾選名單並上傳照片")
+                # 判斷：如果今天沒有任務，直接擋下並給予歡呼
+                if not has_duty:
+                    st.success(f"🎉 系統顯示 **{my_cls}** 今日沒有被分配到打掃任務，好好休息吧！")
+                    st.balloons() # 畫面放氣球慶祝一下
+                else:
+                    # 有任務才會顯示下方的填寫與上傳區塊
+                    areas = [a.strip() for a in area_name_str.split('、') if a.strip()]
+                    if not areas: areas = ["打掃區域"]
+                    
+                    st.info(f"📍 本班任務總應到: {n_std} 人")
+                    
+                    with st.form("vol_form"):
+                        st.write("請依照下方分配的區域，分別填寫打掃同學並上傳照片：")
+                        
+                        present_dict = {}
+                        files_dict = {}
+                        class_roster = [s for s, c in ROSTER_DICT.items() if c == my_cls]
+                        
+                        for idx, area in enumerate(areas):
+                            with st.container(border=True):
+                                st.markdown(f"#### 🏷️ 區域 {idx+1}: **{area}**")
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    present_dict[area] = st.multiselect(f"✅ 負責此區同學", class_roster, key=f"ms_{idx}")
+                                with col2:
+                                    files_dict[area] = st.file_uploader(f"📸 {area} 成果照片", accept_multiple_files=True, type=['jpg','png'], key=f"fu_{idx}")
+                                    
+                        if st.form_submit_button("🚀 確認送出全部回報", use_container_width=True):
+                            if time.time() - st.session_state.last_action_time < 3:
+                                st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                            else:
+                                st.session_state.last_action_time = time.time()
+                                
+                                all_present = []
+                                all_files = []
+                                note_parts = []
+                                
+                                for area in areas:
+                                    if present_dict[area]:
+                                        all_present.extend(present_dict[area])
+                                        note_parts.append(f"[{area}]負責:{','.join(present_dict[area])}")
+                                    if files_dict[area]:
+                                        all_files.extend(files_dict[area])
+                                        
+                                all_present = list(set(all_present))
+                                final_note = " | ".join(note_parts)
+                                
+                                if not all_present or not all_files:
+                                    st.error("❌ 請至少選擇一位打掃同學，並上傳至少一張照片！")
+                                else:
+                                    ok = save_entry(
+                                        {
+                                            "日期": str(today_tw), 
+                                            "班級": my_cls, 
+                                            "評分項目": "晨間打掃", 
+                                            "檢查人員": f"志工(實到:{len(all_present)})", 
+                                            "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), 
+                                            "晨間打掃原始分": 0, 
+                                            "備註": final_note
+                                        }, 
+                                        uploaded_files=all_files, 
+                                        student_list=all_present, 
+                                        custom_hours=0.5, 
+                                        custom_category="晨掃志工"
+                                    )
+                                    if ok:
+                                        st.success("✅ 回報成功！所有區域皆已記錄，辛苦了！")
+                                        time.sleep(1.5)
+                                        st.rerun()
 
     # --- Mode 4: 組長後台 ---
     elif app_mode == "組長ㄉ窩💃":
@@ -1343,15 +1401,46 @@ try:
                         if "http" in str(r['照片路徑']): 
                             c2.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=150) 
                         
+                        if "http" in str(r['照片路徑']): 
+                            c2.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=150) 
+                        
+                        # [V5.11 Patch] 新增回應輸入框
+                        reply_msg = c1.text_input("💬 給予回應 (可留白)", key=f"rm_{r['紀錄ID']}")
+
                         if c3.button("✅ 通過(+2)", key=f"p_{r['紀錄ID']}"): 
                             ws = get_worksheet(SHEET_TABS["main"])
                             id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
                             if str(r["紀錄ID"]) in id_list:
                                 ridx = id_list.index(str(r["紀錄ID"])) + 1
                                 ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, 2)
+                                
+                                # 將回覆附加到備註欄位
+                                if reply_msg:
+                                    old_note = str(r['備註'])
+                                    new_note = f"{old_note} \n組長回覆: {reply_msg}"
+                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
+                                
                                 load_main_data.clear()
                                 st.rerun()
-                        if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}"): delete_rows_by_ids([str(r["紀錄ID"])]); st.rerun()
+                                
+                        if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}"): 
+                            # [V5.11 Patch] 改為保留紀錄並標註駁回，而不是直接刪除
+                            ws = get_worksheet(SHEET_TABS["main"])
+                            id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
+                            if str(r["紀錄ID"]) in id_list:
+                                ridx = id_list.index(str(r["紀錄ID"])) + 1
+                                
+                                # 更改項目名稱，讓它從待審核清單消失，但在成績查詢能看到
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(已駁回)")
+                                
+                                # 將駁回理由寫入備註
+                                old_note = str(r['備註'])
+                                rej_msg = reply_msg if reply_msg else "未達標準，請見諒"
+                                new_note = f"{old_note} \n組長駁回: {rej_msg}"
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
+                                
+                                load_main_data.clear()
+                                st.rerun()
 
             with t_settings:
                 st.subheader("⚙️ 系統設定與維護")
