@@ -1057,7 +1057,11 @@ try:
                     
                     disp_time = str(r.get('登錄時間', ''))
                     time_str = disp_time.split(' ')[-1] if disp_time else ''
-                    with st.expander(f"{icon} {r['日期']} {time_str} - {r['評分項目']} (扣:{tot})"):
+                    
+                    # [V5.15] 判斷如果是負分(學期加分)，顯示成「加分」
+                    score_disp = f"加 {abs(tot)} 分 (學期)" if tot < 0 else f"扣: {tot}"
+                    
+                    with st.expander(f"{icon} {r['日期']} {time_str} - {r['評分項目']} ({score_disp})"):
                         st.caption(f"登錄時間：{disp_time if disp_time else '未紀錄'}") 
                         st.write(f"🧑‍✈️ **評分人員:** {r.get('檢查人員', '未知')}")
                         st.write(f"📝 **備註:** {r['備註']}")
@@ -1352,7 +1356,10 @@ try:
                                 trash_total = week_df["垃圾內掃原始分"] + week_df["垃圾外掃原始分"]
                                 trash_total = trash_total.where(trash_total > 0, week_df["垃圾原始分"])
                                 week_df["垃圾結算"] = trash_total.clip(upper=2)
-                                week_df["總扣分"] = week_df["內掃結算"]+week_df["外掃結算"]+week_df["垃圾結算"]+week_df["晨間打掃原始分"]+week_df["手機人數"]
+                                
+                                # [V5.15] 將負分(學期加分)歸零，確保「當週成績」不受影響
+                                week_morning_penalty = week_df["晨間打掃原始分"].clip(lower=0)
+                                week_df["總扣分"] = week_df["內掃結算"]+week_df["外掃結算"]+week_df["垃圾結算"]+week_morning_penalty+week_df["手機人數"]
                                 
                                 rep = week_df.groupby("班級")["總扣分"].sum().reset_index()
                                 cls_df = pd.DataFrame(structured_classes).rename(columns={"grade":"年級","name":"班級"})
@@ -1376,11 +1383,15 @@ try:
                             trash_total = full["垃圾內掃原始分"] + full["垃圾外掃原始分"]
                             trash_total = trash_total.where(trash_total > 0, full["垃圾原始分"])
                             full["垃圾結算"] = trash_total.clip(upper=2)
+                            
+                            # [V5.15] 這裡直接納入原始分(包含負數的加分)，總扣分減少 = 學期總成績增加！
                             full["總扣分"] = full["內掃結算"]+full["外掃結算"]+full["垃圾結算"]+full["晨間打掃原始分"]+full["手機人數"]
                             rep = full.groupby("班級")["總扣分"].sum().reset_index()
                             cls_df = pd.DataFrame(structured_classes).rename(columns={"grade":"年級","name":"班級"})
                             fin = pd.merge(cls_df, rep, on="班級", how="left").fillna(0)
-                            fin["總成績"] = 90 - full["總扣分"] 
+                            
+                            # [V5.15] 順便修復了原本隱藏的變數 Bug，確保算分正確
+                            fin["總成績"] = 90 - fin["總扣分"] 
                             
                             if sem_rank_mode == "全校": st.dataframe(fin.sort_values("總成績", ascending=False))
                             else:
@@ -1388,52 +1399,59 @@ try:
                                     if g != "其他": 
                                         st.write(f"#### {g}")
                                         st.dataframe(fin[fin["年級"]==g].sort_values("總成績", ascending=False))
-
             with t1:
                 df = load_main_data()
                 for i, r in df[(df["評分項目"]=="晨間打掃") & (df["晨間打掃原始分"]==0) & (df["修正"]!="TRUE")].iterrows():
                     with st.container(border=True):
-                        c1, c2, c3 = st.columns([2,2,1])
+                        c1, c2, c3 = st.columns([2,2,1.3])
                         c1.write(f"**{r['班級']}** | {r['檢查人員']}")
                         c1.caption(f"登錄時間：{r['登錄時間']}") 
                         
-                        # [修改] 拔掉 [0]，改用陣列讀取所有照片網址，這樣就能顯示多張照片
                         if "http" in str(r['照片路徑']): 
                             c2.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=150) 
                         
-                        if "http" in str(r['照片路徑']): 
-                            c2.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=150) 
-                        
-                        # [V5.11 Patch] 新增回應輸入框
                         reply_msg = c1.text_input("💬 給予回應 (可留白)", key=f"rm_{r['紀錄ID']}")
 
-                        if c3.button("✅ 通過(+2)", key=f"p_{r['紀錄ID']}"): 
+                        # [V5.15] 4人全到 (學期總分+2)
+                        if c3.button("✅ 4人全到(學期+2)", key=f"p4_{r['紀錄ID']}"): 
                             ws = get_worksheet(SHEET_TABS["main"])
                             id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
                             if str(r["紀錄ID"]) in id_list:
                                 ridx = id_list.index(str(r["紀錄ID"])) + 1
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, 2)
+                                # 寫入 -2，代表扣分減少2分 = 總分加2分
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, -2)
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(學期加分)")
                                 
-                                # 將回覆附加到備註欄位
-                                if reply_msg:
-                                    old_note = str(r['備註'])
-                                    new_note = f"{old_note} \n組長回覆: {reply_msg}"
-                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
+                                old_note = str(r['備註'])
+                                new_note = f"{old_note} \n組長回覆: {reply_msg}" if reply_msg else f"{old_note} \n組長核可: 4人全到(學期總分+2)"
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
                                 
                                 load_main_data.clear()
                                 st.rerun()
-                                
-                        if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}"): 
-                            # [V5.11 Patch] 改為保留紀錄並標註駁回，而不是直接刪除
+
+                        # [V5.15] 2人全到 (學期總分+1)
+                        if c3.button("✅ 2人全到(學期+1)", key=f"p2_{r['紀錄ID']}"): 
                             ws = get_worksheet(SHEET_TABS["main"])
                             id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
                             if str(r["紀錄ID"]) in id_list:
                                 ridx = id_list.index(str(r["紀錄ID"])) + 1
+                                # 寫入 -1，代表扣分減少1分 = 總分加1分
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, -1)
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(學期加分)")
                                 
-                                # 更改項目名稱，讓它從待審核清單消失，但在成績查詢能看到
+                                old_note = str(r['備註'])
+                                new_note = f"{old_note} \n組長回覆: {reply_msg}" if reply_msg else f"{old_note} \n組長核可: 2人全到(學期總分+1)"
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
+                                
+                                load_main_data.clear()
+                                st.rerun()
+
+                        if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}"): 
+                            ws = get_worksheet(SHEET_TABS["main"])
+                            id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
+                            if str(r["紀錄ID"]) in id_list:
+                                ridx = id_list.index(str(r["紀錄ID"])) + 1
                                 ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(已駁回)")
-                                
-                                # 將駁回理由寫入備註
                                 old_note = str(r['備註'])
                                 rej_msg = reply_msg if reply_msg else "未達標準，請見諒"
                                 new_note = f"{old_note} \n組長駁回: {rej_msg}"
