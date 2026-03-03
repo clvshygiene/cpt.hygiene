@@ -1097,7 +1097,6 @@ try:
             if not main_df[(main_df["日期"].astype(str)==str(today_tw)) & (main_df["班級"]==my_cls) & (main_df["評分項目"].astype(str).str.contains("晨間打掃"))].empty: 
                 st.warning(f"⚠️ {my_cls} 今日已回報或已審核完畢囉！")
             else:
-            else:
                 duty_df, _ = get_daily_duty(today_tw)
                 
                 # [V5.13 Patch] 預設狀態為「沒有任務」
