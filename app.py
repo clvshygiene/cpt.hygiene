@@ -32,7 +32,15 @@ except ImportError:
     NOTION_INSTALLED = False
 
 # --- 1. 網頁設定 ---
-st.set_page_config(page_title="測試-中壢家商，衛愛而生", layout="wide", page_icon="🧹")
+
+# 透過 Streamlit Secrets 判斷目前是測試區還是正式區 (預設為正式區)
+sys_env = st.secrets.get("ENV", "PROD")
+
+if sys_env == "DEV":
+    st.set_page_config(page_title="🔧測試版-中壢家商，衛愛而生", layout="wide", page_icon="🧹")
+else:
+    st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
+
 
 # --- 2. 核心參數與全域設定 ---
 try:
