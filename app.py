@@ -1151,10 +1151,53 @@ try:
                         try: n_std = int(m_d.iloc[0].get('標準人數', 4))
                         except: n_std = 4
                 
-                # 判斷：如果今天沒有任務，直接擋下並給予歡呼
+                # 判斷：如果今天沒有任務
                 if not has_duty:
-                    st.success(f"🎉 系統顯示 **{my_cls}** 今日沒有被分配到打掃任務，好好休息吧！")
-                    st.balloons() # 畫面放氣球慶祝一下
+                    # [V5.24 Patch 1] 一、二年級專屬補打掃機制
+                    if "一" in my_cls or "二" in my_cls:
+                        st.info(f"💡 **{my_cls}** 今日無排定任務。若是本週錯過打掃，可在此進行「補打掃」回報！\n\n*(補掃通過將給予學期總分 +1，並核發志工時數)*")
+                        
+                        with st.form("makeup_form"):
+                            st.write("請填寫補打掃資訊與上傳照片：")
+                            # 因為沒排班不知道區域，讓學生自己填寫補掃的地方
+                            mk_area = st.text_input("📍 實際補掃區域 (例如：外掃區A、308教室等)")
+                            class_roster = [s for s, c in ROSTER_DICT.items() if c == my_cls]
+                            mk_present = st.multiselect("✅ 參與補掃同學", class_roster)
+                            mk_files = st.file_uploader("📸 補掃成果照片", accept_multiple_files=True, type=['jpg','png'])
+                            
+                            if st.form_submit_button("🚀 確認送出補掃回報"):
+                                if time.time() - st.session_state.last_action_time < 3:
+                                    st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                                elif not mk_area or not mk_present or not mk_files:
+                                    st.error("❌ 區域、參與同學與照片皆為必填項目！")
+                                else:
+                                    st.session_state.last_action_time = time.time()
+                                    final_note = f"[補掃:{mk_area}] 負責:{','.join(mk_present)}"
+                                    
+                                    ok = save_entry(
+                                        {
+                                            "日期": str(today_tw), 
+                                            "班級": my_cls, 
+                                            # 特別標註這是補掃紀錄，讓後台認得出來
+                                            "評分項目": "晨間打掃(補掃)", 
+                                            "檢查人員": f"志工補掃(實到:{len(mk_present)})", 
+                                            "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), 
+                                            "晨間打掃原始分": 0, 
+                                            "備註": final_note
+                                        }, 
+                                        uploaded_files=mk_files, 
+                                        student_list=mk_present, 
+                                        custom_hours=0.5, 
+                                        custom_category="晨掃志工"
+                                    )
+                                    if ok:
+                                        st.success("✅ 補掃回報成功！辛苦了！")
+                                        time.sleep(1.5)
+                                        st.rerun()
+                    else:
+                        # 三年級如果沒任務，就直接讓他們去休息
+                        st.success(f"🎉 恭喜！系統顯示 **{my_cls}** 今日沒有被分配到晨掃任務，好好休息吧！")
+                        st.balloons()
                 else:
                     # 有任務才會顯示下方的填寫與上傳區塊
                     areas = [a.strip() for a in area_name_str.split('、') if a.strip()]
@@ -1542,12 +1585,18 @@ try:
                 st.markdown("---")
                 st.subheader("📝 待審核回報列表")
                 
-                # 維持原有的審核迴圈
+                # [V5.24 Patch 2] 支援審核「正常晨掃」與「補掃」紀錄
                 df = main_df 
-                for i, r in df[(df["評分項目"]=="晨間打掃") & (df["晨間打掃原始分"]==0) & (df["修正"]!="TRUE")].iterrows():
+                # 把條件改成 isin，同時抓取這兩種項目
+                for i, r in df[df["評分項目"].isin(["晨間打掃", "晨間打掃(補掃)"]) & (df["晨間打掃原始分"]==0) & (df["修正"]!="TRUE")].iterrows():
                     with st.container(border=True):
                         c1, c2, c3 = st.columns([2,2,1.3])
-                        c1.write(f"**{r['班級']}** | {r['檢查人員']}")
+                        
+                        # 判斷這筆是不是補掃，並加上顯眼的標籤
+                        is_makeup = (r["評分項目"] == "晨間打掃(補掃)")
+                        title_badge = "🩹 **[補掃]**" if is_makeup else "🧹"
+                        
+                        c1.write(f"{title_badge} **{r['班級']}** | {r['檢查人員']}")
                         c1.caption(f"登錄時間：{r['登錄時間']}") 
                         
                         if "http" in str(r['照片路徑']): 
@@ -1555,40 +1604,52 @@ try:
                         
                         reply_msg = c1.text_input("💬 給予回應 (可留白)", key=f"rm_{r['紀錄ID']}")
 
-                        # [V5.15] 4人全到 (學期總分+2)
-                        if c3.button("✅ 4人全到(學期+2)", key=f"p4_{r['紀錄ID']}"): 
-                            ws = get_worksheet(SHEET_TABS["main"])
-                            id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
-                            if str(r["紀錄ID"]) in id_list:
-                                ridx = id_list.index(str(r["紀錄ID"])) + 1
-                                # 寫入 -2，代表扣分減少2分 = 總分加2分
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, -2)
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(學期加分)")
-                                
-                                old_note = str(r['備註'])
-                                new_note = f"{old_note} \n組長回覆: {reply_msg}" if reply_msg else f"{old_note} \n組長核可: 4人全到(學期總分+2)"
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
-                                
-                                load_main_data.clear()
-                                st.rerun()
+                        if is_makeup:
+                            # 🩹 補掃專屬按鈕 (+1分)
+                            if c3.button("✅ 補掃核可(學期+1)", key=f"pm_{r['紀錄ID']}"):
+                                ws = get_worksheet(SHEET_TABS["main"])
+                                id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
+                                if str(r["紀錄ID"]) in id_list:
+                                    ridx = id_list.index(str(r["紀錄ID"])) + 1
+                                    # 寫入 -1，代表總分加 1 分
+                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, -1)
+                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(學期加分)")
+                                    
+                                    old_note = str(r['備註'])
+                                    new_note = f"{old_note} \n組長回覆: {reply_msg}" if reply_msg else f"{old_note} \n組長核可: 補掃通過(學期總分+1)"
+                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
+                                    
+                                    load_main_data.clear()
+                                    st.rerun()
+                        else:
+                            # 🧹 原本的正常晨掃按鈕
+                            if c3.button("✅ 4人全到(學期+2)", key=f"p4_{r['紀錄ID']}"): 
+                                ws = get_worksheet(SHEET_TABS["main"])
+                                id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
+                                if str(r["紀錄ID"]) in id_list:
+                                    ridx = id_list.index(str(r["紀錄ID"])) + 1
+                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, -2)
+                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(學期加分)")
+                                    old_note = str(r['備註'])
+                                    new_note = f"{old_note} \n組長回覆: {reply_msg}" if reply_msg else f"{old_note} \n組長核可: 4人全到(學期總分+2)"
+                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
+                                    load_main_data.clear()
+                                    st.rerun()
 
-                        # [V5.15] 2人全到 (學期總分+1)
-                        if c3.button("✅ 2人全到(學期+1)", key=f"p2_{r['紀錄ID']}"): 
-                            ws = get_worksheet(SHEET_TABS["main"])
-                            id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
-                            if str(r["紀錄ID"]) in id_list:
-                                ridx = id_list.index(str(r["紀錄ID"])) + 1
-                                # 寫入 -1，代表扣分減少1分 = 總分加1分
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, -1)
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(學期加分)")
-                                
-                                old_note = str(r['備註'])
-                                new_note = f"{old_note} \n組長回覆: {reply_msg}" if reply_msg else f"{old_note} \n組長核可: 2人全到(學期總分+1)"
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
-                                
-                                load_main_data.clear()
-                                st.rerun()
+                            if c3.button("✅ 2人全到(學期+1)", key=f"p2_{r['紀錄ID']}"): 
+                                ws = get_worksheet(SHEET_TABS["main"])
+                                id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
+                                if str(r["紀錄ID"]) in id_list:
+                                    ridx = id_list.index(str(r["紀錄ID"])) + 1
+                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, -1)
+                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(學期加分)")
+                                    old_note = str(r['備註'])
+                                    new_note = f"{old_note} \n組長回覆: {reply_msg}" if reply_msg else f"{old_note} \n組長核可: 2人全到(學期總分+1)"
+                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
+                                    load_main_data.clear()
+                                    st.rerun()
 
+                        # 共用的駁回按鈕
                         if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}"): 
                             ws = get_worksheet(SHEET_TABS["main"])
                             id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
