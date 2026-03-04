@@ -1163,8 +1163,12 @@ try:
                 st.warning(f"⚠️ {my_cls} 今日已回報或已審核完畢囉！")
             else:
                 duty_df, _ = get_daily_duty(today_tw)
-                has_duty = False 
                 
+                has_duty = False 
+                area_name_str = ""
+                n_std = 4
+                
+                # 1. 先查今天有沒有排班
                 if not duty_df.empty:
                     m_d = duty_df[duty_df["負責班級"]==my_cls]
                     if not m_d.empty:
@@ -1173,54 +1177,44 @@ try:
                         try: n_std = int(m_d.iloc[0].get('標準人數', 4))
                         except: n_std = 4
                 
-                if not has_duty:
-                    if "一" in my_cls or "二" in my_cls:
-                        st.info(f"💡 **{my_cls}** 今日無排定任務。若是本週錯過打掃，可在此進行「補打掃」回報！\n\n*(補掃通過將給予學期總分 +1，並核發志工時數)*")
-                        
-                        with st.form("makeup_form"):
-                            st.write("請填寫補打掃資訊與上傳照片：")
-                            mk_area = st.text_input("📍 實際補掃區域 (例如：外掃區A、308教室等)")
-                            class_roster = [s for s, c in ROSTER_DICT.items() if c == my_cls]
-                            mk_present = st.multiselect("✅ 參與補掃同學", class_roster)
-                            mk_files = st.file_uploader("📸 補掃成果照片", accept_multiple_files=True, type=['jpg','png'])
-                            
-                            if st.form_submit_button("🚀 確認送出補掃回報"):
-                                if time.time() - st.session_state.last_action_time < 3:
-                                    st.warning("⚠️ 系統處理中，請勿連續點擊！")
-                                elif not mk_area or not mk_present or not mk_files:
-                                    st.error("❌ 區域、參與同學與照片皆為必填項目！")
-                                else:
-                                    st.session_state.last_action_time = time.time()
-                                    final_note = f"[補掃:{mk_area}] 負責:{','.join(mk_present)}"
-                                    
-                                    ok = save_entry(
-                                        {
-                                            "日期": str(today_tw), 
-                                            "班級": my_cls, 
-                                            "評分項目": "晨間打掃(補掃)", 
-                                            "檢查人員": f"志工補掃(實到:{len(mk_present)})", 
-                                            "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), 
-                                            "晨間打掃原始分": 0, 
-                                            "備註": final_note
-                                        }, 
-                                        uploaded_files=mk_files, 
-                                        student_list=mk_present, 
-                                        custom_hours=0.5, 
-                                        custom_category="晨掃志工"
-                                    )
-                                    if ok:
-                                        st.success("✅ 補掃回報成功！辛苦了！")
-                                        time.sleep(1.5)
-                                        st.rerun()
-                    else:
-                        st.success(f"🎉 恭喜！系統顯示 **{my_cls}** 今日沒有被分配到晨掃任務，好好休息吧！")
-                        st.balloons()
+                is_makeup = False
+                found_duty = has_duty
+
+                # 2. 如果今天沒排班，且是一、二年級 -> 往前翻找 6 天內的班表
+                if not has_duty and ("一" in my_cls or "二" in my_cls):
+                    from datetime import timedelta
+                    for d in range(1, 7):
+                        past_date = today_tw - timedelta(days=d)
+                        p_duty, _ = get_daily_duty(past_date)
+                        if not p_duty.empty and "負責班級" in p_duty.columns:
+                            m_p = p_duty[p_duty["負責班級"].astype(str)==my_cls]
+                            if not m_p.empty:
+                                area_name_str = str(m_p.iloc[0].get('掃地區域', '未指定區域'))
+                                try: n_std = int(m_p.iloc[0].get('標準人數', 4))
+                                except: n_std = 4
+                                is_makeup = True # 判定為跨日補掃
+                                found_duty = True
+                                break
+                                
+                # 3. 如果今天有排班，但超過 15:00 -> 當日遲交補掃
+                if has_duty and now_tw.hour >= 15:
+                    is_makeup = True
+
+                # 若完全找不到班表 (例如三年級沒排班，或一二年級連上週都沒排)
+                if not found_duty:
+                    st.success(f"🎉 恭喜！系統顯示 **{my_cls}** 近期沒有被分配到晨掃任務，好好休息吧！")
+                    st.balloons()
                 else:
                     areas = [a.strip() for a in area_name_str.split('、') if a.strip()]
                     if not areas: areas = ["打掃區域"]
                     
-                    st.info(f"📍 本班任務總應到: {n_std} 人")
+                    # 依據是否為補掃，顯示不同的上方提示
+                    if is_makeup:
+                        st.info(f"💡 **{my_cls}** 進行補打掃任務。本班任務總應到: {n_std} 人\n\n*(補掃通過將給予學期總分 +1，並核發志工時數)*")
+                    else:
+                        st.info(f"📍 本班任務總應到: {n_std} 人")
                     
+                    # 顯示每日廣播大聲公
                     daily_task = SYSTEM_CONFIG.get("daily_morning_task", "")
                     if daily_task:
                         formatted_task = daily_task.replace('\n', '<br>')
@@ -1267,9 +1261,8 @@ try:
                                 with col2:
                                     files_dict[area] = st.file_uploader(f"📸 {area} 成果照片", accept_multiple_files=True, type=['jpg','png'], key=f"fu_{idx}")
                                     
-                        # [V5.28 Patch] 15:00 死線感測：動態按鈕與標籤 (已移到迴圈外部，完美解決 KeyError)
-                        is_late = now_tw.hour >= 15
-                        btn_text = "🚀 我們完成補打掃了喔" if is_late else "🚀 確認送出全部回報"
+                        # 依據 is_makeup 動態變更按鈕文字
+                        btn_text = "🚀 我們完成補打掃了喔" if is_makeup else "🚀 確認送出全部回報"
                         
                         if st.form_submit_button(btn_text):
                             if time.time() - st.session_state.last_action_time < 3:
@@ -1294,8 +1287,8 @@ try:
                                 if not all_present or not all_files:
                                     st.error("❌ 請至少選擇一位打掃同學，並上傳至少一張照片！")
                                 else:
-                                    # [V5.28] 如果超過 15:00，就精準標記為「晨間打掃(當日補掃)」，觸發後台補掃機制
-                                    task_name = "晨間打掃(當日補掃)" if is_late else "晨間打掃"
+                                    # 依據 is_makeup 變更存入的任務名稱
+                                    task_name = "晨間打掃(補掃)" if is_makeup else "晨間打掃"
                                     
                                     ok = save_entry(
                                         {
@@ -1316,7 +1309,6 @@ try:
                                         st.success("✅ 回報成功！所有區域皆已記錄，辛苦了！")
                                         time.sleep(1.5)
                                         st.rerun()
-
     # --- Mode 4: 組長後台 ---
     elif app_mode == "組長ㄉ窩💃":
         st.title("⚙️ 管理後台")
