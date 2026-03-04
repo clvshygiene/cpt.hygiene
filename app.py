@@ -32,16 +32,14 @@ except ImportError:
     NOTION_INSTALLED = False
 
 # --- 1. 網頁設定 ---
-
 # 透過 Streamlit Secrets 判斷目前是測試區還是正式區 (預設為正式區)
 sys_env = st.secrets.get("ENV", "PROD")
 
-# 👇 [抓蟲專用] 讓系統在側邊欄大聲說出它拿到的身分證是什麼！
-import streamlit as st # 確保有載入
-st.sidebar.info(f"🕵️‍♀️ 系統目前抓到的身分證是：[{sys_env}]")
-
+# [V5.31 Patch 1] 確保 set_page_config 是第一個執行的指令
 if sys_env == "DEV":
     st.set_page_config(page_title="🔧測試版-中壢家商，衛愛而生", layout="wide", page_icon="🧹")
+    st.sidebar.info(f"🕵️‍♀️ 系統目前抓到的身分證是：[{sys_env}]")
+    st.warning("🚧 **目前位於 DEV 測試環境！** 在這裡送出的資料僅供測試，不會影響正式成績。")
 else:
     st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
 
@@ -260,8 +258,11 @@ try:
         return execute_with_retry(_upload_action)
 
     def clean_id(val):
-        try: return str(int(float(val))).strip()
-        except: return str(val).strip()
+        # [V5.31 Patch 3] 改為保留字串型態，僅去除 Excel 尾端的 .0，保護學號前導 0
+        s = str(val).strip()
+        if re.fullmatch(r"\d+\.0", s):
+            s = s[:-2]
+        return s
 
     # ==========================================
     # SQLite 背景佇列
@@ -368,7 +369,8 @@ try:
                 cur.execute("UPDATE task_queue SET status='IN_PROGRESS', attempts=attempts+1 WHERE id=?", (task_id,))
                 conn.execute("COMMIT")
                 
-                return {"id": task_id, "task_type": row[1], "payload": json.loads(row[2] or "{}"), "attempts": row[3]}
+                # [V5.31 Patch 2] 回傳給 Worker 的 attempts 必須 +1，與資料庫同步
+                return {"id": task_id, "task_type": row[1], "payload": json.loads(row[2] or "{}"), "attempts": row[3] + 1}
         except Exception as e:
             print(f"抓取任務時發生錯誤: {e}")
             return None
