@@ -556,7 +556,6 @@ try:
                 is_fatal_error = not ok and err and ("FILE_NOT_FOUND" in str(err) or task["attempts"] >= 6)
                 
                 if ok or is_fatal_error:
-                    # [V5.36 Patch 1] 安全取值防護，避免 NoneType 炸裂
                     try:
                         paths = task["payload"].get("image_paths", [])[:] 
                         img_file_info = task["payload"].get("image_file")
@@ -599,10 +598,10 @@ try:
             print(f"Load holidays error: {e}")
             return []
 
-    # [V5.36 Patch 3] 申訴日期防呆裝甲
+    # [V5.37 Patch 1] 申訴日期強制轉型防護，徹底避免 Type Error 崩潰
     def is_within_appeal_period(violation_date, appeal_days=3):
         try:
-            vd = pd.to_datetime(violation_date).date() if isinstance(violation_date, str) else violation_date
+            vd = pd.to_datetime(violation_date).date()
             if pd.isna(vd): return False
             holidays, today, current_date, workdays = load_holidays(), date.today(), vd, 0
             for _ in range(14): 
@@ -704,8 +703,17 @@ try:
         config = {"semester_start": "2025-08-25", "standard_n": 4}
         if ws:
             try:
+                # [V5.37 Patch 2] 將 try-except 下放至每一列，單一髒資料不阻斷後續設定讀取
                 for row in ws.get_all_values():
-                    if len(row)>=2: config[row[0]] = int(row[1]) if row[0] == "standard_n" else row[1]
+                    if len(row)>=2:
+                        key, val = row[0], row[1]
+                        if key == "standard_n":
+                            try:
+                                config[key] = int(val)
+                            except ValueError:
+                                print(f"Invalid standard_n value: {val}, using default 4")
+                        else:
+                            config[key] = val
             except Exception as e: 
                 print(f"Load settings error: {e}")
         return config
@@ -839,13 +847,22 @@ try:
             print(f"Load inspectors error: {e}")
             return default
 
+    # [V5.37 Patch 3] 拆除重複檢查函式的裸 Except，加入必須欄位檢查並記錄 Log
     def check_duplicate_record(df, check_date, inspector, role, target_class=None):
         if df.empty: return False
         try:
+            req_cols = ["日期", "檢查人員", "評分項目"]
+            if target_class: req_cols.append("班級")
+            if not all(col in df.columns for col in req_cols):
+                print(f"Duplicate check warning: Missing columns. Expected {req_cols}, got {list(df.columns)}")
+                return False
+            
             mask = (df["日期"].astype(str) == str(check_date)) & (df["檢查人員"] == inspector) & (df["評分項目"] == role)
             if target_class: mask &= (df["班級"] == target_class)
             return not df[mask].empty
-        except: return False
+        except Exception as e:
+            print(f"Duplicate check error: {e}")
+            return False
 
     def save_entry(new_entry, uploaded_files=None, student_list=None, custom_hours=0.5, custom_category="晨掃志工", award_inspector_hours=True):
         pending_count = get_pending_count()
@@ -1018,7 +1035,6 @@ try:
         
         if not st.session_state["team_logged_in"]:
             with st.expander("🔐 身份驗證", expanded=True):
-                # [V5.36 Patch 2] 密碼安全取值，避免缺 key 時崩潰
                 pwd_input = st.text_input("請輸入隊伍通行碼", type="password", key="m1_login_pwd")
                 if pwd_input:
                     sys_cfg = st.secrets.get("system_config", {})
@@ -1453,7 +1469,6 @@ try:
         if last_err != "無紀錄":
             st.error(f"🚨 **最後錯誤紀錄:** {last_err}")
 
-        # [V5.36 Patch 2] 管理密碼安全取值
         sys_cfg = st.secrets.get("system_config", {})
         admin_pwd = sys_cfg.get("admin_password")
 
@@ -1855,7 +1870,6 @@ try:
                                 st.error("需上傳照片")
 
         elif pwd_input != "":
-            # [V5.36 Patch 2] 管理密碼安全防護
             if not admin_pwd:
                 st.error("⚠️ 系統未設定管理密碼，請檢查 Secrets。")
             else:
