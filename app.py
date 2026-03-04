@@ -113,11 +113,13 @@ try:
                 area = props.get("任務內容", {}).get("rich_text", [{}])
                 area_text = area[0].get("text", {}).get("content", "未填寫") if area else "未填寫"
 
+                # [V5.33 Patch 4] 修正 0 被誤判為 1 的問題
                 req_num_obj = props.get("需求人數", {}).get("number")
-                req_num = req_num_obj if req_num_obj else 1  
+                req_num = 1 if req_num_obj is None else req_num_obj  
                 
+                # [V5.33 Patch 3] 將 Notion rich_text 陣列無縫接合，避免學號被截斷
                 claimed_obj = props.get("認領學號", {}).get("rich_text", [])
-                claimed_str = claimed_obj[0].get("text", {}).get("content", "") if claimed_obj else ""
+                claimed_str = "".join([part.get("text", {}).get("content", "") for part in claimed_obj])
                 current_claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
                 current_count = len(current_claimants)
                 
@@ -142,11 +144,13 @@ try:
                 page = client.pages.retrieve(page_id=page_id)
                 props = page.get("properties", {})
                 
+                # [V5.33 Patch 4] 修正 0 被誤判為 1 的問題
                 req_num_obj = props.get("需求人數", {}).get("number")
-                req_num = req_num_obj if req_num_obj else 1
+                req_num = 1 if req_num_obj is None else req_num_obj
                 
+                # [V5.33 Patch 3] 將 Notion rich_text 陣列無縫接合
                 claimed_obj = props.get("認領學號", {}).get("rich_text", [])
-                claimed_str = claimed_obj[0].get("text", {}).get("content", "") if claimed_obj else ""
+                claimed_str = "".join([part.get("text", {}).get("content", "") for part in claimed_obj])
                 current_claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
                 
                 if str(student_id) in current_claimants:
@@ -229,10 +233,15 @@ try:
                 except gspread.WorksheetNotFound:
                     cols = 20 if tab_name != "appeals" else 15
                     ws = sheet.add_worksheet(title=tab_name, rows=500, cols=cols)
-                    if tab_name == "appeals": ws.append_row(APPEAL_COLUMNS)
-                    if tab_name == "service_hours": ws.append_row(["日期", "學號", "班級", "類別", "時數", "紀錄ID"])
-                    if tab_name == "holidays": ws.append_row(["日期", "說明"])
-                    if tab_name == "office_areas": ws.append_row(["區域名稱", "負責班級"])
+                    
+                    # [V5.33 Patch 2] 初始化時明確寫入所有表頭，防止 Schema 漂移
+                    if tab_name == SHEET_TABS["main"]: ws.append_row(EXPECTED_COLUMNS)
+                    if tab_name == SHEET_TABS["appeals"]: ws.append_row(APPEAL_COLUMNS)
+                    if tab_name == SHEET_TABS["service_hours"]: ws.append_row(["日期", "學號", "班級", "類別", "時數", "紀錄ID"])
+                    if tab_name == SHEET_TABS["holidays"]: ws.append_row(["日期", "說明"])
+                    if tab_name == SHEET_TABS["office_areas"]: ws.append_row(["區域名稱", "負責班級"])
+                    if tab_name == SHEET_TABS["settings"]: ws.append_row(["設定項目", "設定值"])
+                    if tab_name == SHEET_TABS["duty"]: ws.append_row(["日期", "負責班級", "掃地區域", "標準人數"])
                     return ws
             except Exception as e:
                 if "429" in str(e): 
@@ -565,9 +574,15 @@ try:
             df = pd.DataFrame(ws.get_all_records())
             if df.empty: return pd.DataFrame(columns=EXPECTED_COLUMNS)
             if "班級" in df.columns: df["班級"] = df["班級"].astype(str).str.strip()
+            
             for col in EXPECTED_COLUMNS:
                 if col not in df.columns: df[col] = ""
-            if "紀錄ID" not in df.columns: df["紀錄ID"] = df.index.astype(str)
+                
+            # [V5.33 Patch 1] 確保 紀錄ID 必定有值，精準填補空缺
+            mask = df["紀錄ID"].astype(str).str.strip() == ""
+            if mask.any():
+                df.loc[mask, "紀錄ID"] = df[mask].index.astype(str)
+                
             for col in ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數", "週次"]:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
             if "修正" in df.columns: df["修正"] = df["修正"].astype(str).apply(lambda x: True if x.upper() == "TRUE" else False)
@@ -901,7 +916,7 @@ try:
 
     # --- Mode 1: 糾察評分 ---
     elif app_mode == "糾察底家👀":
-        st.title("📝 衛生糾察評分系統")
+        st.title("📝 糾察評分系統")
         if "team_logged_in" not in st.session_state: st.session_state["team_logged_in"] = False
 
         daily_hygiene = SYSTEM_CONFIG.get("daily_hygiene_task", "")
