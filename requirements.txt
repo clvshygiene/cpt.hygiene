@@ -5,3 +5,5 @@ oauth2client
 google-api-python-client
 google-auth
 notion-client==2.2.1
+pytz>=2023.3
+Pillow>=10.0.0
