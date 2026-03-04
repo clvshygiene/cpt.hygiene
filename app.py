@@ -1314,7 +1314,7 @@ try:
                             
                             if st.form_submit_button(btn_text):
                                 if time.time() - st.session_state.last_action_time < 3:
-                                st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                                    st.warning("⚠️ 系統處理中，請勿連續點擊！")
                             else:
                                 st.session_state.last_action_time = time.time()
                                 
