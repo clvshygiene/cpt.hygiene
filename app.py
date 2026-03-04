@@ -273,10 +273,17 @@ try:
             print(f"Image compress error: {e}")
             return io.BytesIO(file_bytes)
 
+    # [V5.38 Patch 2] 密碼與金鑰溫柔取值，缺值時拋出可讀例外
     def upload_image_to_drive(file_obj, filename):
         def _upload_action():
             service = get_drive_service()
-            folder_id = st.secrets["system_config"]["drive_folder_id"]
+            if not service: raise Exception("DRIVE_SERVICE_UNAVAILABLE")
+            
+            sys_cfg = st.secrets.get("system_config", {})
+            folder_id = sys_cfg.get("drive_folder_id")
+            if not folder_id:
+                raise Exception("DRIVE_FOLDER_NOT_CONFIGURED: 系統未設定 drive_folder_id")
+                
             file = service.files().create(
                 body={'name': filename, 'parents': [folder_id]},
                 media_body=MediaIoBaseUpload(file_obj, mimetype='image/jpeg', resumable=False), 
@@ -499,10 +506,15 @@ try:
             image_paths, filenames, drive_links = payload.get("image_paths", []), payload.get("filenames", []), []
             for path in image_paths:
                 if path and not os.path.exists(path): return False, "FILE_NOT_FOUND: 找不到實體圖片檔案，直接放棄"
+                
+            # [V5.38 Patch 1 & 4] 拒絕靜默失敗：若有照片上傳失敗，強制引發例外退回重試
             for path, fname in zip(image_paths, filenames):
                 if os.path.exists(path):
                     with open(path, "rb") as f:
-                        drive_links.append(upload_image_to_drive(compress_image_bytes(f.read()), fname) or "UPLOAD_FAILED_API")
+                        link = upload_image_to_drive(compress_image_bytes(f.read()), fname)
+                        if not link or "UPLOAD_FAILED" in link:
+                            raise Exception(f"UPLOAD_FAILED_API: 圖片 {fname} 上傳 Drive 失敗")
+                        drive_links.append(link)
             if drive_links: entry["照片路徑"] = ";".join(drive_links)
 
             if task_type in ["main_entry", "volunteer_report"]:
@@ -520,7 +532,11 @@ try:
                 image_info = payload.get("image_file")
                 if image_info:
                     if not os.path.exists(image_info["path"]): return False, "FILE_NOT_FOUND: 找不到佐證照片檔案，直接放棄"
-                    with open(image_info["path"], "rb") as f: entry["佐證照片"] = upload_image_to_drive(compress_image_bytes(f.read()), image_info["filename"])
+                    with open(image_info["path"], "rb") as f: 
+                        link = upload_image_to_drive(compress_image_bytes(f.read()), image_info["filename"])
+                        if not link or "UPLOAD_FAILED" in link:
+                            raise Exception(f"UPLOAD_FAILED_API: 申訴照片 {image_info['filename']} 上傳 Drive 失敗")
+                        entry["佐證照片"] = link
                 
                 def _append_appeal():
                     ws = get_worksheet(SHEET_TABS["appeals"])
@@ -529,7 +545,9 @@ try:
                 execute_with_retry(_append_appeal)
                 
             return True, None
-        except Exception as e: return False, str(e)
+        except Exception as e: 
+            print(f"Task process error ({task_type}): {e}")
+            return False, str(e)
 
     def background_worker(stop_event=None):
         try: add_script_run_ctx(threading.current_thread(), get_script_run_ctx())
@@ -598,7 +616,6 @@ try:
             print(f"Load holidays error: {e}")
             return []
 
-    # [V5.37 Patch 1] 申訴日期強制轉型防護，徹底避免 Type Error 崩潰
     def is_within_appeal_period(violation_date, appeal_days=3):
         try:
             vd = pd.to_datetime(violation_date).date()
@@ -703,7 +720,6 @@ try:
         config = {"semester_start": "2025-08-25", "standard_n": 4}
         if ws:
             try:
-                # [V5.37 Patch 2] 將 try-except 下放至每一列，單一髒資料不阻斷後續設定讀取
                 for row in ws.get_all_values():
                     if len(row)>=2:
                         key, val = row[0], row[1]
@@ -758,7 +774,14 @@ try:
                 print(f"Waiting for UPLOAD slot... (Appeal: {proof_file.name})")
                 with UPLOAD_SEM:
                     print(f"UPLOAD slot acquired (Appeal: {proof_file.name})")
+                    
+                    # [V5.38 Patch 3] 讀檔防呆：重置指標並檢查空檔
+                    proof_file.seek(0)
                     data = proof_file.read()
+                    if not data:
+                        st.error("❌ 讀取不到照片內容，請嘗試重新上傳！")
+                        return False
+                        
                     if len(data) > MAX_IMAGE_BYTES: st.error("照片過大"); return False
                     fname = f"Appeal_{entry.get('班級', '')}_{datetime.now(TW_TZ).strftime('%H%M%S')}.jpg"
                     l_path = os.path.join(IMG_DIR, f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}_{fname}")
@@ -847,7 +870,6 @@ try:
             print(f"Load inspectors error: {e}")
             return default
 
-    # [V5.37 Patch 3] 拆除重複檢查函式的裸 Except，加入必須欄位檢查並記錄 Log
     def check_duplicate_record(df, check_date, inspector, role, target_class=None):
         if df.empty: return False
         try:
