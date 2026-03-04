@@ -1180,21 +1180,39 @@ try:
                 is_makeup = False
                 found_duty = has_duty
 
-                # 2. 如果今天沒排班，且是一、二年級 -> 往前翻找 6 天內的班表
+                # 2. 如果今天沒排班，且是一、二年級 -> 往前翻找本週班表
                 if not has_duty and ("一" in my_cls or "二" in my_cls):
                     from datetime import timedelta
-                    for d in range(1, 7):
-                        past_date = today_tw - timedelta(days=d)
-                        p_duty, _ = get_daily_duty(past_date)
-                        if not p_duty.empty and "負責班級" in p_duty.columns:
-                            m_p = p_duty[p_duty["負責班級"].astype(str)==my_cls]
-                            if not m_p.empty:
-                                area_name_str = str(m_p.iloc[0].get('掃地區域', '未指定區域'))
-                                try: n_std = int(m_p.iloc[0].get('標準人數', 4))
-                                except: n_std = 4
-                                is_makeup = True # 判定為跨日補掃
-                                found_duty = True
-                                break
+                    
+                    # [V5.30 Patch 1] 防呆：先檢查本週是不是已經交過晨掃了！(不管有沒有被核可)
+                    start_of_week = today_tw - timedelta(days=today_tw.weekday())
+                    already_done = False
+                    for _, r in main_df[main_df["班級"] == my_cls].iterrows():
+                        if "晨間打掃" in str(r["評分項目"]):
+                            try:
+                                r_date = pd.to_datetime(str(r["日期"])).date()
+                                if start_of_week <= r_date <= today_tw:
+                                    already_done = True
+                                    break
+                            except: pass
+
+                    # 如果本週「還沒交過」，才開啟時光機去查哪一天缺交
+                    if not already_done:
+                        for d in range(1, 7):
+                            past_date = today_tw - timedelta(days=d)
+                            if past_date < start_of_week: 
+                                break # 只找本週的紀錄，超過本週就不補了
+                                
+                            p_duty, _ = get_daily_duty(past_date)
+                            if not p_duty.empty and "負責班級" in p_duty.columns:
+                                m_p = p_duty[p_duty["負責班級"].astype(str)==my_cls]
+                                if not m_p.empty:
+                                    area_name_str = str(m_p.iloc[0].get('掃地區域', '未指定區域'))
+                                    try: n_std = int(m_p.iloc[0].get('標準人數', 4))
+                                    except: n_std = 4
+                                    is_makeup = True # 判定為跨日補掃
+                                    found_duty = True
+                                    break
                                 
                 # 3. 如果今天有排班，但超過 15:00 -> 當日遲交補掃
                 if has_duty and now_tw.hour >= 15:
@@ -1525,24 +1543,63 @@ try:
                                         st.write(f"#### {g}")
                                         st.dataframe(fin[fin["年級"]==g].sort_values("總成績", ascending=False))
             with t1:
-                st.subheader("🕵️‍♀️ 今日晨掃進度追蹤")
-                today_str = str(today_tw)
-                duty_df, _ = get_daily_duty(today_tw)
+                # [V5.29 Patch] 本週晨掃進度追蹤 (含過去缺交)
+                st.subheader("🕵️‍♀️ 晨掃進度追蹤 (本週)")
                 main_df = load_main_data()
                 
-                if not duty_df.empty:
-                    assigned_classes = set(duty_df["負責班級"].dropna().astype(str).tolist())
-                    reported_classes = set(main_df[(main_df["日期"].astype(str) == today_str) & (main_df["評分項目"].astype(str).str.contains("晨間打掃"))]["班級"].astype(str).tolist())
-                    
-                    missing_classes = assigned_classes - reported_classes
-                    
-                    if missing_classes:
-                        st.error(f"🚨 **尚未回報班級 ({len(missing_classes)}班)：** {', '.join(sorted(list(missing_classes)))}")
-                    else:
-                        st.success("🎉 太棒了！今日所有排定班級皆已完成晨掃回報！")
+                from datetime import timedelta
+                # 計算本週一是哪一天
+                start_of_week = today_tw - timedelta(days=today_tw.weekday())
+                
+                weekly_assigned = {}
+                # 1. 抓取從本週一到今天，每天被排班的班級
+                for i in range((today_tw - start_of_week).days + 1):
+                    check_date = start_of_week + timedelta(days=i)
+                    c_duty_df, _ = get_daily_duty(check_date)
+                    if not c_duty_df.empty:
+                        for c in c_duty_df["負責班級"].dropna().astype(str).tolist():
+                            # [V5.30 Patch 2] 確保班級名稱沒有前後空白，避免對不上
+                            if c.strip(): weekly_assigned[c.strip()] = check_date
+                            
+                # 2. 抓取本週「有交過任何晨掃紀錄」(包含準時交跟跨日補掃) 的班級
+                submitted_classes = set()
+                for _, r in main_df.iterrows():
+                    if "晨間打掃" in str(r["評分項目"]):
+                        try:
+                            # 安全地將字串轉換為日期進行比較
+                            r_date = pd.to_datetime(str(r["日期"])).date()
+                            if start_of_week <= r_date <= today_tw:
+                                submitted_classes.add(str(r["班級"]))
+                        except: pass
+                        
+                # 3. 交叉比對找出缺交名單
+                today_missing = []
+                past_missing = []
+                
+                for cls, a_date in weekly_assigned.items():
+                    if cls not in submitted_classes:
+                        if a_date == today_tw:
+                            today_missing.append(cls)
+                        else:
+                            # 如果是過去缺交的，在後面加上 (月/日) 標籤
+                            past_missing.append(f"{cls} ({a_date.month}/{a_date.day})")
+                            
+                # 4. 將結果顯示在畫面上
+                if not weekly_assigned:
+                    st.info("本週至今無晨掃排班任務。")
+                elif not today_missing and not past_missing:
+                    st.success("🎉 太棒了！本週至今所有排定班級皆已完成晨掃回報！")
                 else:
-                    st.info("今日無晨掃排班任務。")
-                    
+                    # 顯示今天的缺交狀態
+                    if today_missing:
+                        st.error(f"🚨 **今日尚未回報 ({len(today_missing)}班)：** {', '.join(sorted(today_missing))}")
+                    else:
+                        st.success("🎉 今日排定班級皆已完成回報！")
+                        
+                    # 顯示過去尚未補掃的狀態 (這就是妳要的功能！)
+                    if past_missing:
+                        st.warning(f"⚠️ **本週未補掃名單 ({len(past_missing)}班)：** {', '.join(sorted(past_missing))}")
+                        
                 st.markdown("---")
                 st.subheader("📝 待審核回報列表")
                 
