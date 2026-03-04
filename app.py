@@ -1308,8 +1308,12 @@ try:
                                 with col2:
                                     files_dict[area] = st.file_uploader(f"📸 {area} 成果照片", accept_multiple_files=True, type=['jpg','png'], key=f"fu_{idx}")
                                     
-                        if st.form_submit_button("🚀 確認送出全部回報"):
-                            if time.time() - st.session_state.last_action_time < 3:
+                            # [V5.27 Patch 1] 15:00 死線感測：動態按鈕與標籤
+                            is_late = now_tw.hour >= 15
+                            btn_text = "🚀 我們完成補打掃了喔" if is_late else "🚀 確認送出全部回報"
+                            
+                            if st.form_submit_button(btn_text):
+                                if time.time() - st.session_state.last_action_time < 3:
                                 st.warning("⚠️ 系統處理中，請勿連續點擊！")
                             else:
                                 st.session_state.last_action_time = time.time()
@@ -1331,11 +1335,14 @@ try:
                                 if not all_present or not all_files:
                                     st.error("❌ 請至少選擇一位打掃同學，並上傳至少一張照片！")
                                 else:
+                                    # 如果超過 15:00，就標記為補掃
+                                    task_name = "晨間打掃(補打掃)" if is_late else "晨間打掃"
+                                    
                                     ok = save_entry(
                                         {
                                             "日期": str(today_tw), 
                                             "班級": my_cls, 
-                                            "評分項目": "晨間打掃", 
+                                            "評分項目": task_name, 
                                             "檢查人員": f"志工(實到:{len(all_present)})", 
                                             "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), 
                                             "晨間打掃原始分": 0, 
@@ -1597,15 +1604,15 @@ try:
                 st.markdown("---")
                 st.subheader("📝 待審核回報列表")
                 
-                # [V5.24 Patch 2] 支援審核「正常晨掃」與「補掃」紀錄
+                # [V5.27 Patch 2] 支援動態給分規則的後台審核
                 df = main_df 
-                # 把條件改成 isin，同時抓取這兩種項目
-                for i, r in df[df["評分項目"].isin(["晨間打掃", "晨間打掃(補掃)"]) & (df["晨間打掃原始分"]==0) & (df["修正"]!="TRUE")].iterrows():
+                # 把條件放寬，抓取這三種項目：正常晨掃、當日補掃、隔日補掃
+                for i, r in df[df["評分項目"].isin(["晨間打掃", "晨間打掃(當日補掃)", "晨間打掃(補掃)"]) & (df["晨間打掃原始分"]==0) & (df["修正"]!="TRUE")].iterrows():
                     with st.container(border=True):
                         c1, c2, c3 = st.columns([2,2,1.3])
                         
-                        # 判斷這筆是不是補掃，並加上顯眼的標籤
-                        is_makeup = (r["評分項目"] == "晨間打掃(補掃)")
+                        # 只要名字裡有「補掃」兩個字，系統就判定為補掃機制
+                        is_makeup = "補掃" in str(r["評分項目"])
                         title_badge = "🩹 **[補掃]**" if is_makeup else "🧹"
                         
                         c1.write(f"{title_badge} **{r['班級']}** | {r['檢查人員']}")
@@ -1617,30 +1624,42 @@ try:
                         reply_msg = c1.text_input("💬 給予回應 (可留白)", key=f"rm_{r['紀錄ID']}")
 
                         if is_makeup:
-                            # 🩹 補掃專屬按鈕 (+1分)
-                            if c3.button("✅ 補掃核可(學期+1)", key=f"pm_{r['紀錄ID']}"):
+                            # 🩹 補掃專屬按鈕區 (不管幾人都是 +1 分)
+                            if c3.button("✅ 4人補掃(學期+1)", key=f"m4_{r['紀錄ID']}"):
                                 ws = get_worksheet(SHEET_TABS["main"])
                                 id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
                                 if str(r["紀錄ID"]) in id_list:
                                     ridx = id_list.index(str(r["紀錄ID"])) + 1
-                                    # 寫入 -1，代表總分加 1 分
+                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, -1) # 扣除負1 = 加1分
+                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(學期加分)")
+                                    
+                                    old_note = str(r['備註'])
+                                    new_note = f"{old_note} \n組長回覆: {reply_msg}" if reply_msg else f"{old_note} \n組長核可: 4人補掃(學期總分+1)"
+                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
+                                    load_main_data.clear()
+                                    st.rerun()
+
+                            if c3.button("✅ 2人補掃(學期+1)", key=f"m2_{r['紀錄ID']}"):
+                                ws = get_worksheet(SHEET_TABS["main"])
+                                id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
+                                if str(r["紀錄ID"]) in id_list:
+                                    ridx = id_list.index(str(r["紀錄ID"])) + 1
                                     ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, -1)
                                     ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(學期加分)")
                                     
                                     old_note = str(r['備註'])
-                                    new_note = f"{old_note} \n組長回覆: {reply_msg}" if reply_msg else f"{old_note} \n組長核可: 補掃通過(學期總分+1)"
+                                    new_note = f"{old_note} \n組長回覆: {reply_msg}" if reply_msg else f"{old_note} \n組長核可: 2人補掃(學期總分+1)"
                                     ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
-                                    
                                     load_main_data.clear()
                                     st.rerun()
                         else:
-                            # 🧹 原本的正常晨掃按鈕
+                            # 🧹 原本的正常晨掃按鈕區
                             if c3.button("✅ 4人全到(學期+2)", key=f"p4_{r['紀錄ID']}"): 
                                 ws = get_worksheet(SHEET_TABS["main"])
                                 id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
                                 if str(r["紀錄ID"]) in id_list:
                                     ridx = id_list.index(str(r["紀錄ID"])) + 1
-                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, -2)
+                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, -2) # +2分
                                     ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(學期加分)")
                                     old_note = str(r['備註'])
                                     new_note = f"{old_note} \n組長回覆: {reply_msg}" if reply_msg else f"{old_note} \n組長核可: 4人全到(學期總分+2)"
@@ -1653,7 +1672,7 @@ try:
                                 id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
                                 if str(r["紀錄ID"]) in id_list:
                                     ridx = id_list.index(str(r["紀錄ID"])) + 1
-                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, -1)
+                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, -1) # +1分
                                     ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(學期加分)")
                                     old_note = str(r['備註'])
                                     new_note = f"{old_note} \n組長回覆: {reply_msg}" if reply_msg else f"{old_note} \n組長核可: 2人全到(學期總分+1)"
