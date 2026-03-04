@@ -273,7 +273,6 @@ try:
             print(f"Image compress error: {e}")
             return io.BytesIO(file_bytes)
 
-    # [V5.38 Patch 2] 密碼與金鑰溫柔取值，缺值時拋出可讀例外
     def upload_image_to_drive(file_obj, filename):
         def _upload_action():
             service = get_drive_service()
@@ -442,23 +441,25 @@ try:
         t_sid = str(entry.get("學號", ""))
         t_cat = str(entry.get("類別", ""))
         
+        # [V5.39 Patch 2] 競態條件修復：先用 SQLite INSERT 當作分散式鎖 (Atomic Lock)
         try:
             with closing(open_queue_conn()) as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT 1 FROM service_issued WHERE date=? AND sid=? AND category=?", (t_date, t_sid, t_cat))
-                if cur.fetchone():
-                    return 
-        except Exception as e: 
-            print(f"Service deduplication DB error: {e}")
+                conn.execute("INSERT INTO service_issued VALUES (?, ?, ?)", (t_date, t_sid, t_cat))
+        except sqlite3.IntegrityError:
+            # 如果撞到 Primary Key，代表已經有人發放過，直接安全退出
+            return 
             
         def _action():
-            ws = get_worksheet(SHEET_TABS["service_hours"])
-            if not ws: raise Exception("SERVICE_WS_UNAVAILABLE: 找不到服務時數表")
-            new_row = [t_date, t_sid, str(entry.get("班級", "")), t_cat, str(entry.get("時數", "")), str(entry.get("紀錄ID", ""))]
-            ws.append_row(new_row)
-            
-            with closing(open_queue_conn()) as conn:
-                conn.execute("INSERT OR IGNORE INTO service_issued VALUES (?, ?, ?)", (t_date, t_sid, t_cat))
+            try:
+                ws = get_worksheet(SHEET_TABS["service_hours"])
+                if not ws: raise Exception("SERVICE_WS_UNAVAILABLE: 找不到服務時數表")
+                new_row = [t_date, t_sid, str(entry.get("班級", "")), t_cat, str(entry.get("時數", "")), str(entry.get("紀錄ID", ""))]
+                ws.append_row(new_row)
+            except Exception as e:
+                # [V5.39 Patch 2] 若寫入 Sheet 失敗，必須釋放鎖 (Rollback)，讓系統稍後能重試
+                with closing(open_queue_conn()) as conn:
+                    conn.execute("DELETE FROM service_issued WHERE date=? AND sid=? AND category=?", (t_date, t_sid, t_cat))
+                raise e
                 
         execute_with_retry(_action)
 
@@ -504,10 +505,14 @@ try:
         entry = payload.get("entry", {})
         try:
             image_paths, filenames, drive_links = payload.get("image_paths", []), payload.get("filenames", []), []
+            
+            # [V5.39 Patch 3] 嚴格檢查陣列長度，防止 zip() 靜默吞掉資料
+            if len(image_paths) != len(filenames):
+                raise Exception(f"DATA_MISMATCH_API: 照片路徑數量 ({len(image_paths)}) 與檔名數量 ({len(filenames)}) 不一致，拒絕處理")
+                
             for path in image_paths:
                 if path and not os.path.exists(path): return False, "FILE_NOT_FOUND: 找不到實體圖片檔案，直接放棄"
                 
-            # [V5.38 Patch 1 & 4] 拒絕靜默失敗：若有照片上傳失敗，強制引發例外退回重試
             for path, fname in zip(image_paths, filenames):
                 if os.path.exists(path):
                     with open(path, "rb") as f:
@@ -775,7 +780,6 @@ try:
                 with UPLOAD_SEM:
                     print(f"UPLOAD slot acquired (Appeal: {proof_file.name})")
                     
-                    # [V5.38 Patch 3] 讀檔防呆：重置指標並檢查空檔
                     proof_file.seek(0)
                     data = proof_file.read()
                     if not data:
@@ -1733,7 +1737,8 @@ try:
                 st.subheader("📝 待審核回報列表")
                 
                 df = main_df 
-                for i, r in df[df["評分項目"].isin(["晨間打掃", "晨間打掃(當日補掃)", "晨間打掃(補掃)"]) & (df["晨間打掃原始分"]==0) & (df["修正"]!="TRUE")].iterrows():
+                # [V5.39 Patch 1] 布林值過濾修復，精準過濾掉已經 "修正" (True) 的項目
+                for i, r in df[df["評分項目"].isin(["晨間打掃", "晨間打掃(當日補掃)", "晨間打掃(補掃)"]) & (df["晨間打掃原始分"]==0) & (df["修正"] == False)].iterrows():
                     with st.container(border=True):
                         c1, c2, c3 = st.columns([2,2,1.3])
                         
