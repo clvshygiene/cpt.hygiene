@@ -65,7 +65,6 @@ try:
         "內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數",
         "備註", "違規細項", "照片路徑", "登錄時間", "修正", "晨掃未到者", "紀錄ID"
     ]
-    # [V5.35 Patch 2] 將 "申訴ID" 加入陣列，讓資料確實落地
     APPEAL_COLUMNS = ["申訴日期", "班級", "違規日期", "違規項目", "原始扣分", "申訴理由", "佐證照片", "處理狀態", "登錄時間", "對應紀錄ID", "審核回覆", "申訴ID"]
 
     # ==========================================
@@ -523,7 +522,6 @@ try:
                     if not os.path.exists(image_info["path"]): return False, "FILE_NOT_FOUND: 找不到佐證照片檔案，直接放棄"
                     with open(image_info["path"], "rb") as f: entry["佐證照片"] = upload_image_to_drive(compress_image_bytes(f.read()), image_info["filename"])
                 
-                # [V5.35 Patch 1] 防禦寫入申訴表時的 NoneType 崩潰
                 def _append_appeal():
                     ws = get_worksheet(SHEET_TABS["appeals"])
                     if not ws: raise Exception("APPEALS_WS_UNAVAILABLE: 無法取得申訴工作表")
@@ -558,8 +556,13 @@ try:
                 is_fatal_error = not ok and err and ("FILE_NOT_FOUND" in str(err) or task["attempts"] >= 6)
                 
                 if ok or is_fatal_error:
+                    # [V5.36 Patch 1] 安全取值防護，避免 NoneType 炸裂
                     try:
-                        paths = task["payload"].get("image_paths", []) + ([task["payload"]["image_file"]["path"]] if "image_file" in task["payload"] else [])
+                        paths = task["payload"].get("image_paths", [])[:] 
+                        img_file_info = task["payload"].get("image_file")
+                        if img_file_info and isinstance(img_file_info, dict) and "path" in img_file_info:
+                            paths.append(img_file_info["path"])
+                            
                         for p in paths:
                             if p and os.path.exists(p): os.remove(p)
                     except Exception as e: print(f"File cleanup error: {e}")
@@ -596,14 +599,20 @@ try:
             print(f"Load holidays error: {e}")
             return []
 
+    # [V5.36 Patch 3] 申訴日期防呆裝甲
     def is_within_appeal_period(violation_date, appeal_days=3):
-        vd = pd.to_datetime(violation_date).date() if isinstance(violation_date, str) else violation_date
-        holidays, today, current_date, workdays = load_holidays(), date.today(), vd, 0
-        for _ in range(14): 
-            if workdays >= appeal_days: break
-            current_date += timedelta(days=1)
-            if current_date.weekday() < 5 and current_date not in holidays: workdays += 1
-        return today <= current_date
+        try:
+            vd = pd.to_datetime(violation_date).date() if isinstance(violation_date, str) else violation_date
+            if pd.isna(vd): return False
+            holidays, today, current_date, workdays = load_holidays(), date.today(), vd, 0
+            for _ in range(14): 
+                if workdays >= appeal_days: break
+                current_date += timedelta(days=1)
+                if current_date.weekday() < 5 and current_date not in holidays: workdays += 1
+            return today <= current_date
+        except Exception as e:
+            print(f"Date parse error in appeal period check: {e} (value: {violation_date})")
+            return False
 
     @st.cache_data(ttl=360)
     def load_main_data():
@@ -1009,9 +1018,14 @@ try:
         
         if not st.session_state["team_logged_in"]:
             with st.expander("🔐 身份驗證", expanded=True):
+                # [V5.36 Patch 2] 密碼安全取值，避免缺 key 時崩潰
                 pwd_input = st.text_input("請輸入隊伍通行碼", type="password", key="m1_login_pwd")
                 if pwd_input:
-                    if pwd_input == st.secrets["system_config"]["team_password"]:
+                    sys_cfg = st.secrets.get("system_config", {})
+                    team_pwd = sys_cfg.get("team_password")
+                    if not team_pwd:
+                        st.error("⚠️ 系統未設定隊伍密碼，請通知管理員檢查 Secrets。")
+                    elif pwd_input == team_pwd:
                         st.session_state["team_logged_in"] = True
                         st.rerun()
                     else:
@@ -1439,8 +1453,12 @@ try:
         if last_err != "無紀錄":
             st.error(f"🚨 **最後錯誤紀錄:** {last_err}")
 
+        # [V5.36 Patch 2] 管理密碼安全取值
+        sys_cfg = st.secrets.get("system_config", {})
+        admin_pwd = sys_cfg.get("admin_password")
+
         pwd_input = st.text_input("管理密碼", type="password", key="admin_pwd")
-        if pwd_input == st.secrets["system_config"]["admin_password"]:
+        if admin_pwd and pwd_input == admin_pwd:
             
             t_mon, t_rollcall, t4, t_appeal, t2, t1, t_settings, t3 = st.tabs([
                 "👀 衛生糾察", "👮 環保糾察", "📝 扣分明細", "📣 申訴", "📊 成績總表", 
@@ -1837,7 +1855,11 @@ try:
                                 st.error("需上傳照片")
 
         elif pwd_input != "":
-            st.error("密碼錯誤")
+            # [V5.36 Patch 2] 管理密碼安全防護
+            if not admin_pwd:
+                st.error("⚠️ 系統未設定管理密碼，請檢查 Secrets。")
+            else:
+                st.error("密碼錯誤")
 
 except Exception as e:
     st.error(f"❌ 系統發生錯誤: {str(e)}")
