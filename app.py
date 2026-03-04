@@ -32,10 +32,8 @@ except ImportError:
     NOTION_INSTALLED = False
 
 # --- 1. 網頁設定 ---
-# 透過 Streamlit Secrets 判斷目前是測試區還是正式區 (預設為正式區)
 sys_env = st.secrets.get("ENV", "PROD")
 
-# [V5.31 Patch] 確保 set_page_config 是第一個執行的指令
 if sys_env == "DEV":
     st.set_page_config(page_title="🔧測試版-中壢家商，衛愛而生", layout="wide", page_icon="🧹")
     st.sidebar.info(f"🕵️‍♀️ 系統目前抓到的身分證是：[{sys_env}]")
@@ -49,7 +47,7 @@ try:
     TW_TZ = pytz.timezone('Asia/Taipei')
     MAX_IMAGE_BYTES = 20 * 1024 * 1024  
     UPLOAD_SEM = threading.BoundedSemaphore(4) 
-    NOTION_CLAIM_LOCK = threading.Lock() # [V5.32] 防止 Notion 超額認領的執行緒鎖
+    NOTION_CLAIM_LOCK = threading.Lock() 
     QUEUE_DB_PATH = "task_queue_v4_wal.db"
     IMG_DIR = "evidence_photos"
     os.makedirs(IMG_DIR, exist_ok=True)
@@ -86,69 +84,78 @@ try:
             return [], "系統尚未設定 Notion Token 或 Database ID"
         
         try:
-            response = client.databases.query(
-                database_id=db_id,
-                filter={"property": "任務狀態", "status": {"equals": "等待認領中😿"}}
-            )
             tasks = []
-            for page in response.get("results", []):
-                props = page.get("properties", {})
-                title = props.get("任務名稱", {}).get("title", [{}])
-                title_text = title[0].get("text", {}).get("content", "未命名任務") if title else "未命名任務"
+            has_more = True
+            next_cursor = None
+            
+            # [V5.34 Patch] 增加分頁巡覽，確保超過 100 筆任務也不會漏抓
+            while has_more:
+                query_args = {
+                    "database_id": db_id,
+                    "filter": {"property": "任務狀態", "status": {"equals": "等待認領中😿"}}
+                }
+                if next_cursor:
+                    query_args["start_cursor"] = next_cursor
+                    
+                response = client.databases.query(**query_args)
                 
-                date_obj = props.get("任務日期", {}).get("date", {})
-                raw_date = date_obj.get("start", "未定") if date_obj else "未定"
-                if raw_date != "未定":
-                    try:
-                        parsed_date = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
-                        if len(raw_date) <= 10:
-                            date_val = parsed_date.strftime("%Y-%m-%d")
-                        else:
-                            date_val = parsed_date.strftime("%Y-%m-%d %H:%M")
-                    except Exception:
-                        date_val = raw_date
-                else:
-                    date_val = "未定"
-                
-                area = props.get("任務內容", {}).get("rich_text", [{}])
-                area_text = area[0].get("text", {}).get("content", "未填寫") if area else "未填寫"
+                for page in response.get("results", []):
+                    props = page.get("properties", {})
+                    title = props.get("任務名稱", {}).get("title", [{}])
+                    title_text = title[0].get("text", {}).get("content", "未命名任務") if title else "未命名任務"
+                    
+                    date_obj = props.get("任務日期", {}).get("date", {})
+                    raw_date = date_obj.get("start", "未定") if date_obj else "未定"
+                    if raw_date != "未定":
+                        try:
+                            parsed_date = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                            if len(raw_date) <= 10:
+                                date_val = parsed_date.strftime("%Y-%m-%d")
+                            else:
+                                date_val = parsed_date.strftime("%Y-%m-%d %H:%M")
+                        except Exception:
+                            date_val = raw_date
+                    else:
+                        date_val = "未定"
+                    
+                    area = props.get("任務內容", {}).get("rich_text", [{}])
+                    area_text = area[0].get("text", {}).get("content", "未填寫") if area else "未填寫"
 
-                # [V5.33 Patch 4] 修正 0 被誤判為 1 的問題
-                req_num_obj = props.get("需求人數", {}).get("number")
-                req_num = 1 if req_num_obj is None else req_num_obj  
-                
-                # [V5.33 Patch 3] 將 Notion rich_text 陣列無縫接合，避免學號被截斷
-                claimed_obj = props.get("認領學號", {}).get("rich_text", [])
-                claimed_str = "".join([part.get("text", {}).get("content", "") for part in claimed_obj])
-                current_claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
-                current_count = len(current_claimants)
-                
-                tasks.append({
-                    "id": page["id"], "title": title_text, "date": date_val, "area": area_text,
-                    "req_num": req_num, "current_count": current_count
-                })
+                    req_num_obj = props.get("需求人數", {}).get("number")
+                    req_num = 1 if req_num_obj is None else req_num_obj  
+                    
+                    claimed_obj = props.get("認領學號", {}).get("rich_text", [])
+                    claimed_str = "".join([part.get("text", {}).get("content", "") for part in claimed_obj])
+                    current_claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
+                    current_count = len(current_claimants)
+                    
+                    tasks.append({
+                        "id": page["id"], "title": title_text, "date": date_val, "area": area_text,
+                        "req_num": req_num, "current_count": current_count
+                    })
+                    
+                has_more = response.get("has_more", False)
+                next_cursor = response.get("next_cursor")
+                if not has_more:
+                    break
+                    
             return tasks, None
         except Exception as e:
             return [], f"Notion API 讀取失敗詳細錯誤: {str(e)}"
 
     def claim_notion_task(page_id, student_id):
         client = get_notion_client()
-        # [V5.32] Guard Clause：防止 client 為空時觸發 NoneType 例外
         if not client:
             return False, "Notion 服務目前未啟用或連線失敗，請通知管理員檢查系統設定。"
             
-        # [V5.32] 獲取鎖，確保同時間只有一個請求能進入這個驗證與更新區塊
         with NOTION_CLAIM_LOCK:
             try:
-                # 重新獲取最新狀態 (Double-check)
                 page = client.pages.retrieve(page_id=page_id)
                 props = page.get("properties", {})
                 
-                # [V5.33 Patch 4] 修正 0 被誤判為 1 的問題
                 req_num_obj = props.get("需求人數", {}).get("number")
                 req_num = 1 if req_num_obj is None else req_num_obj
                 
-                # [V5.33 Patch 3] 將 Notion rich_text 陣列無縫接合
                 claimed_obj = props.get("認領學號", {}).get("rich_text", [])
                 claimed_str = "".join([part.get("text", {}).get("content", "") for part in claimed_obj])
                 current_claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
@@ -156,7 +163,6 @@ try:
                 if str(student_id) in current_claimants:
                     return False, f"學號 {student_id} 已經認領過此任務囉！"
                     
-                # 防禦超額認領 (如果已經滿了，直接拒絕)
                 if len(current_claimants) >= req_num:
                     return False, "手腳太慢啦！這個任務剛剛被別人搶走額滿了！"
                     
@@ -233,8 +239,6 @@ try:
                 except gspread.WorksheetNotFound:
                     cols = 20 if tab_name != "appeals" else 15
                     ws = sheet.add_worksheet(title=tab_name, rows=500, cols=cols)
-                    
-                    # [V5.33 Patch 2] 初始化時明確寫入所有表頭，防止 Schema 漂移
                     if tab_name == SHEET_TABS["main"]: ws.append_row(EXPECTED_COLUMNS)
                     if tab_name == SHEET_TABS["appeals"]: ws.append_row(APPEAL_COLUMNS)
                     if tab_name == SHEET_TABS["service_hours"]: ws.append_row(["日期", "學號", "班級", "類別", "時數", "紀錄ID"])
@@ -279,7 +283,6 @@ try:
         return execute_with_retry(_upload_action)
 
     def clean_id(val):
-        # [V5.31] 改為保留字串型態，僅去除 Excel 尾端的 .0，保護學號前導 0
         s = str(val).strip()
         if re.fullmatch(r"\d+\.0", s):
             s = s[:-2]
@@ -390,7 +393,6 @@ try:
                 cur.execute("UPDATE task_queue SET status='IN_PROGRESS', attempts=attempts+1 WHERE id=?", (task_id,))
                 conn.execute("COMMIT")
                 
-                # [V5.31] 回傳給 Worker 的 attempts 必須 +1，與資料庫同步
                 return {"id": task_id, "task_type": row[1], "payload": json.loads(row[2] or "{}"), "attempts": row[3] + 1}
         except Exception as e:
             print(f"抓取任務時發生錯誤: {e}")
@@ -419,15 +421,14 @@ try:
         t_sid = str(entry.get("學號", ""))
         t_cat = str(entry.get("類別", ""))
         
-        # [V5.32] 第一階段：先檢查 SQLite 是否已核發 (避免重複發放)
         try:
             with closing(open_queue_conn()) as conn:
                 cur = conn.cursor()
                 cur.execute("SELECT 1 FROM service_issued WHERE date=? AND sid=? AND category=?", (t_date, t_sid, t_cat))
                 if cur.fetchone():
-                    return # 已經發放過，直接安全退出
+                    return 
         except Exception: 
-            pass # 若資料庫鎖定，略過檢查交給後續處理
+            pass 
             
         def _action():
             ws = get_worksheet(SHEET_TABS["service_hours"])
@@ -435,7 +436,6 @@ try:
             new_row = [t_date, t_sid, str(entry.get("班級", "")), t_cat, str(entry.get("時數", "")), str(entry.get("紀錄ID", ""))]
             ws.append_row(new_row)
             
-            # [V5.32] 第二階段：Google Sheet 確定寫入成功後，才在 SQLite 留下「已發放」的鐵證
             with closing(open_queue_conn()) as conn:
                 conn.execute("INSERT OR IGNORE INTO service_issued VALUES (?, ?, ?)", (t_date, t_sid, t_cat))
                 
@@ -511,9 +511,17 @@ try:
     def background_worker(stop_event=None):
         try: add_script_run_ctx(threading.current_thread(), get_script_run_ctx())
         except: pass
+        
+        # [V5.34 Patch 1] 啟動時自動回收逾時的卡單殭屍任務
+        try:
+            with closing(open_queue_conn()) as conn:
+                conn.execute("UPDATE task_queue SET status='RETRY' WHERE status='IN_PROGRESS'")
+        except: pass
+        
         while True:
             if stop_event and stop_event.is_set(): break
             update_worker_heartbeat() 
+            task = None
             try:
                 task = fetch_next_task()
                 if not task: time.sleep(2.0); continue
@@ -523,7 +531,6 @@ try:
                 else: 
                     if err and "DRY_RUN" not in err: update_last_error_summary(err)
 
-                # [V5.32] 只有任務成功，或遇到不可恢復的致命錯誤時，才清理暫存檔
                 is_fatal_error = not ok and err and ("FILE_NOT_FOUND" in str(err) or task["attempts"] >= 6)
                 
                 if ok or is_fatal_error:
@@ -536,7 +543,13 @@ try:
                 if not ok and err and "FILE_NOT_FOUND" in str(err): task["attempts"] = 999
                 update_task_status(task["id"], "DONE" if ok else ("FAILED" if task["attempts"] >= 6 else "RETRY"), task["attempts"], err)
                 time.sleep(0.5)
-            except Exception as e: time.sleep(3.0)
+            except Exception as e:
+                # [V5.34 Patch 1] 防禦外層崩潰：發生未預期例外時，確保任務退回 RETRY，避免永遠卡在 IN_PROGRESS
+                if task:
+                    try:
+                        update_task_status(task["id"], "RETRY", task.get("attempts", 1), f"Worker Critical Crash: {str(e)}")
+                    except: pass
+                time.sleep(3.0)
 
     @st.cache_resource
     def ensure_worker_started():
@@ -578,7 +591,6 @@ try:
             for col in EXPECTED_COLUMNS:
                 if col not in df.columns: df[col] = ""
                 
-            # [V5.33 Patch 1] 確保 紀錄ID 必定有值，精準填補空缺
             mask = df["紀錄ID"].astype(str).str.strip() == ""
             if mask.any():
                 df.loc[mask, "紀錄ID"] = df[mask].index.astype(str)
@@ -916,7 +928,7 @@ try:
 
     # --- Mode 1: 糾察評分 ---
     elif app_mode == "糾察底家👀":
-        st.title("📝 糾察評分系統")
+        st.title("📝 衛生糾察評分系統")
         if "team_logged_in" not in st.session_state: st.session_state["team_logged_in"] = False
 
         daily_hygiene = SYSTEM_CONFIG.get("daily_hygiene_task", "")
@@ -1708,7 +1720,15 @@ try:
             with t_settings:
                 st.subheader("⚙️ 系統設定與維護")
                 curr = SYSTEM_CONFIG.get("semester_start")
-                nd = st.date_input("開學日", datetime.strptime(curr, "%Y-%m-%d").date() if curr else today_tw)
+                
+                # [V5.34 Patch 3] 開學日格式防護，保護後台不當機
+                try:
+                    default_date = datetime.strptime(curr, "%Y-%m-%d").date() if curr else today_tw
+                except ValueError:
+                    st.warning("⚠️ 發現無效的開學日設定，已自動重置為今日，請重新設定並儲存。")
+                    default_date = today_tw
+                    
+                nd = st.date_input("開學日", default_date)
                 if st.button("更新開學日"): save_setting("semester_start", str(nd))
                 
                 st.markdown("---")
