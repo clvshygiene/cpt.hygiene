@@ -130,6 +130,10 @@ try:
 
     def claim_notion_task(page_id, student_id):
         client = get_notion_client()
+        # [Patch] Guard Clause：防止 client 為空時觸發 NoneType 例外
+        if not client:
+            return False, "Notion 服務目前未啟用或連線失敗，請通知管理員檢查系統設定。"
+            
         try:
             page = client.pages.retrieve(page_id=page_id)
             props = page.get("properties", {})
