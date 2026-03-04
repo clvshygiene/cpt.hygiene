@@ -33,7 +33,11 @@ except ImportError:
     NOTION_INSTALLED = False
 
 # --- 1. 網頁設定 ---
-sys_env = st.secrets.get("ENV", "PROD")
+# [V5.41 Patch 1] 安全讀取 Secrets，避免啟動時未知的設定檔缺失導致死當
+try:
+    sys_env = st.secrets.get("ENV", "PROD")
+except Exception:
+    sys_env = "PROD"
 
 if sys_env == "DEV":
     st.set_page_config(page_title="🔧測試版-中壢家商，衛愛而生", layout="wide", page_icon="🧹")
@@ -74,13 +78,19 @@ try:
     @st.cache_resource
     def get_notion_client():
         if NOTION_INSTALLED:
-            token = st.secrets.get("notion_token") or st.secrets.get("system_config", {}).get("notion_token")
-            if token: return Client(auth=token)
+            try:
+                token = st.secrets.get("notion_token") or st.secrets.get("system_config", {}).get("notion_token")
+                if token: return Client(auth=token)
+            except Exception: pass
         return None
 
     def fetch_available_notion_tasks():
         client = get_notion_client()
-        db_id = st.secrets.get("notion_db_id") or st.secrets.get("system_config", {}).get("notion_db_id")
+        try:
+            db_id = st.secrets.get("notion_db_id") or st.secrets.get("system_config", {}).get("notion_db_id")
+        except Exception:
+            db_id = None
+            
         if not client or not db_id: 
             return [], "系統尚未設定 Notion Token 或 Database ID"
         
@@ -218,9 +228,10 @@ try:
     @st.cache_resource
     def get_credentials():
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        if "gcp_service_account" not in st.secrets:
-            return None
-        return ServiceAccountCredentials.from_json_keyfile_dict(dict(st.secrets["gcp_service_account"]), scope)
+        try:
+            if "gcp_service_account" not in st.secrets: return None
+            return ServiceAccountCredentials.from_json_keyfile_dict(dict(st.secrets["gcp_service_account"]), scope)
+        except Exception: return None
 
     def get_gspread_client():
         creds = get_credentials()
@@ -279,7 +290,8 @@ try:
             service = get_drive_service()
             if not service: raise Exception("DRIVE_SERVICE_UNAVAILABLE")
             
-            sys_cfg = st.secrets.get("system_config", {})
+            try: sys_cfg = st.secrets.get("system_config", {})
+            except Exception: sys_cfg = {}
             folder_id = sys_cfg.get("drive_folder_id")
             if not folder_id:
                 raise Exception("DRIVE_FOLDER_NOT_CONFIGURED: 系統未設定 drive_folder_id")
@@ -318,7 +330,6 @@ try:
         try:
             with closing(open_queue_conn()) as conn:
                 cur = conn.cursor()
-                # [V5.40 Patch 3] 精準計算實際負載，將 RETRY 也納入壅塞評估，防止雪崩
                 cur.execute("SELECT COUNT(*) FROM task_queue WHERE status IN ('PENDING', 'RETRY')")
                 return cur.fetchone()[0]
         except Exception as e: 
@@ -484,7 +495,9 @@ try:
     def process_task(task):
         task_type, payload = task["task_type"], task["payload"]
         
-        is_dry_run = str(st.secrets.get("system_config", {}).get("dry_run", "false")).lower() in ["true", "1"]
+        try: is_dry_run = str(st.secrets.get("system_config", {}).get("dry_run", "false")).lower() in ["true", "1"]
+        except: is_dry_run = False
+        
         if is_dry_run:
             time.sleep(random.uniform(0.3, 0.6))
             return True, "DRY_RUN_SUCCESS"
@@ -647,7 +660,6 @@ try:
                 
             mask = df["紀錄ID"].astype(str).str.strip() == ""
             if mask.any():
-                # [V5.40 Patch 1] 使用穩態指紋 Hash 產生 ID，避免關聯漂移
                 def generate_stable_id(row):
                     unique_str = f"{row.get('日期','')}_{row.get('班級','')}_{row.get('評分項目','')}_{row.get('登錄時間','')}"
                     return hashlib.md5(unique_str.encode()).hexdigest()[:8]
@@ -803,7 +815,6 @@ try:
         st.success("📩 申訴已排入背景處理")
         return True
     
-    # [V5.40 Patch 2] 核心優先寫入 (Core-First Commit)，確保分數異動成功才改申訴表狀態
     def update_appeal_status(idx, status, record_id, reply_text=""):
         ws_appeals, ws_main = get_worksheet(SHEET_TABS["appeals"]), get_worksheet(SHEET_TABS["main"])
         try:
@@ -820,7 +831,6 @@ try:
                 else:
                     raise Exception("MAIN_RECORD_NOT_FOUND: 找不到對應的主表紀錄，無法執行核可")
 
-            # 核心資料修改成功後，才更新外層的申訴進度表
             ws_appeals.update_cell(t_row, APPEAL_COLUMNS.index("處理狀態") + 1, status)
             if "審核回覆" in APPEAL_COLUMNS:
                 ws_appeals.update_cell(t_row, APPEAL_COLUMNS.index("審核回覆") + 1, reply_text)
@@ -909,8 +919,9 @@ try:
 
         new_entry["日期"] = str(new_entry.get("日期", str(date.today())))
         new_entry["紀錄ID"] = new_entry.get("紀錄ID", f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}")
-        if "登錄時間" not in new_entry or not new_entry["登錄時間"]:
-            new_entry["登錄時間"] = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        
+        # [V5.41 Patch 3] 即時生成登錄時間，避免因前端頁面停留過久導致時間落後
+        new_entry["登錄時間"] = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
         image_paths, file_names = [], []
         if uploaded_files:
@@ -921,7 +932,6 @@ try:
                     with UPLOAD_SEM:
                         print(f"UPLOAD slot acquired ({up_file.name})")
                         
-                        # [V5.40 Patch 4] 空檔防禦
                         data = up_file.getvalue()
                         if not data:
                             st.warning(f"⚠️ 跳過空檔案 (0 byte): {up_file.name}")
@@ -991,7 +1001,9 @@ try:
         st.title("🤝 愛校服務認領區")
         st.info("💡 這裡的任務清單與 Notion 行事曆即時同步！成功認領後，任務會自動標記並更新。")
         
-        n_token = st.secrets.get("notion_token") or st.secrets.get("system_config", {}).get("notion_token")
+        try: n_token = st.secrets.get("notion_token") or st.secrets.get("system_config", {}).get("notion_token")
+        except Exception: n_token = None
+        
         if not NOTION_INSTALLED:
             st.error("⚠️ 系統偵測到未安裝 `notion-client` 套件，請通知管理員檢查系統設定。")
         elif not n_token:
@@ -1078,7 +1090,8 @@ try:
             with st.expander("🔐 身份驗證", expanded=True):
                 pwd_input = st.text_input("請輸入隊伍通行碼", type="password", key="m1_login_pwd")
                 if pwd_input:
-                    sys_cfg = st.secrets.get("system_config", {})
+                    try: sys_cfg = st.secrets.get("system_config", {})
+                    except Exception: sys_cfg = {}
                     team_pwd = sys_cfg.get("team_password")
                     if not team_pwd:
                         st.error("⚠️ 系統未設定隊伍密碼，請通知管理員檢查 Secrets。")
@@ -1150,7 +1163,7 @@ try:
                                     
                                     if v_list:
                                         score = len(v_list)
-                                        base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "班級": cls, "評分項目": role, "垃圾內掃原始分": 0, "垃圾外掃原始分": score}
+                                        base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "班級": cls, "評分項目": role, "垃圾內掃原始分": 0, "垃圾外掃原始分": score}
                                         if save_entry({**base, "備註": f"外掃({off})-{step_a}({','.join(v_list)})", "違規細項": step_a}):
                                             cnt += 1
                                 if cnt: st.success(f"✅ 已登記 {cnt} 筆違規！"); time.sleep(1.5); st.rerun()
@@ -1190,7 +1203,7 @@ try:
                                     
                                     if v_list:
                                         score = len(v_list)
-                                        base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "班級": cls, "評分項目": role, "垃圾內掃原始分": score, "垃圾外掃原始分": 0}
+                                        base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "班級": cls, "評分項目": role, "垃圾內掃原始分": score, "垃圾外掃原始分": 0}
                                         if save_entry({**base, "備註": f"內掃-{step_a}({','.join(v_list)})", "違規細項": step_a}):
                                             cnt += 1
                                 if cnt: st.success(f"✅ 已登記 {cnt} 筆違規！"); time.sleep(1.5); st.rerun()
@@ -1223,7 +1236,10 @@ try:
 
                     if sel_cls:
                         st.divider()
-                        if check_duplicate_record(main_df, input_date, inspector_name, role, sel_cls): st.warning(f"⚠️ 今日已評過 {sel_cls}！")
+                        
+                        # [V5.41 Patch 2] 將重複驗證結果存入變數，如果重複直接在送出時攔截
+                        is_dup = check_duplicate_record(main_df, input_date, inspector_name, role, sel_cls)
+                        if is_dup: st.warning(f"⚠️ 今日已評過 {sel_cls}！無法重複送出。")
                         
                         with st.form("score_form", clear_on_submit=True):
                             in_s, out_s, ph_c, note = 0, 0, 0, ""
@@ -1238,14 +1254,17 @@ try:
                             files = st.file_uploader("📸 違規照片", accept_multiple_files=True)
                             
                             if st.form_submit_button("送出"):
-                                if time.time() - st.session_state.last_action_time < 3:
+                                # [V5.41 Patch 2] 絕對阻擋重複送單
+                                if is_dup:
+                                    st.error("🚫 此班級今日已評分完畢，系統已自動攔截重複送單！")
+                                elif time.time() - st.session_state.last_action_time < 3:
                                     st.warning("⚠️ 系統處理中，請勿連續點擊！")
                                 else:
                                     st.session_state.last_action_time = time.time()
                                     if (in_s + out_s) > 0 and not files: 
                                         st.error("扣分需照片")
                                     else:
-                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note}, uploaded_files=files, award_inspector_hours=is_last_task):
+                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note}, uploaded_files=files, award_inspector_hours=is_last_task):
                                             if assigned_classes:
                                                 if is_last_task:
                                                     st.success("✅ 送出成功！今日任務已全數完成，系統將自動核發 0.25 小時！")
@@ -1314,12 +1333,13 @@ try:
     elif app_mode == "晨掃志工隊🧹":
         st.title("🧹 晨掃志工回報專區")
         
-        cutoff_hour = 24 if sys_env == "DEV" else 16
+        try: cutoff_hour = 24 if sys_env == "DEV" else 16
+        except Exception: cutoff_hour = 16
         
-        if now_tw.hour >= cutoff_hour: 
-            st.error("🚫 今日回報已截止 (16:00)")
+        if datetime.now(TW_TZ).hour >= cutoff_hour: 
+            st.error(f"🚫 今日回報已截止 ({cutoff_hour}:00)")
         else:
-            if sys_env == "DEV" and now_tw.hour >= 16:
+            if sys_env == "DEV" and datetime.now(TW_TZ).hour >= 16:
                 st.info("🔧 **[測試機特權開啟]** 目前已超過 16:00，但因為是 DEV 環境，允許繼續測試！")
                 
             my_cls = st.selectbox("選擇班級", all_classes, key="m3_cls_select")
@@ -1375,7 +1395,8 @@ try:
                                     found_duty = True
                                     break
                                 
-                if has_duty and now_tw.hour >= 15:
+                # [V5.41] 遲交判定使用當下時間
+                if has_duty and datetime.now(TW_TZ).hour >= 15:
                     is_makeup = True
 
                 if not found_duty:
@@ -1469,8 +1490,6 @@ try:
                                             "班級": my_cls, 
                                             "評分項目": task_name, 
                                             "檢查人員": f"志工(實到:{len(all_present)})", 
-                                            "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), 
-                                            "晨間打掃原始分": 0, 
                                             "備註": final_note
                                         }, 
                                         uploaded_files=all_files, 
@@ -1496,7 +1515,8 @@ try:
         col3.metric("延遲(s)", int(metrics.get("oldest_pending_sec", 0)))
         
         hb_status = "🟢 正常運作" if hb_sec < 60 else "🔴 已休眠/停止"
-        is_dry_run = str(st.secrets.get("system_config", {}).get("dry_run", "false")).lower() in ["true", "1"]
+        try: is_dry_run = str(st.secrets.get("system_config", {}).get("dry_run", "false")).lower() in ["true", "1"]
+        except: is_dry_run = False
         
         if is_dry_run: hb_status = "🟡 演習模式 (Dry Run)"
         
@@ -1510,7 +1530,8 @@ try:
         if last_err != "無紀錄":
             st.error(f"🚨 **最後錯誤紀錄:** {last_err}")
 
-        sys_cfg = st.secrets.get("system_config", {})
+        try: sys_cfg = st.secrets.get("system_config", {})
+        except: sys_cfg = {}
         admin_pwd = sys_cfg.get("admin_password")
 
         pwd_input = st.text_input("管理密碼", type="password", key="admin_pwd")
@@ -1900,10 +1921,10 @@ try:
                                 ok_norm, ok_spec = True, True
                                 if norm: 
                                     pf_n = io.BytesIO(fb); pf_n.name="p.jpg"
-                                    ok_norm = save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")}, [pf_n], norm, base_h, "返校打掃(一般)")
+                                    ok_norm = save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃"}, [pf_n], norm, base_h, "返校打掃(一般)")
                                 if spec: 
                                     pf_s = io.BytesIO(fb); pf_s.name="p.jpg"
-                                    ok_spec = save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")}, [pf_s], spec, spec_h, "返校打掃(加強)")
+                                    ok_spec = save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃"}, [pf_s], spec, spec_h, "返校打掃(加強)")
                                 
                                 if ok_norm and ok_spec:
                                     st.success("已登記！"); time.sleep(1.5); st.rerun()
