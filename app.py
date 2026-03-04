@@ -12,6 +12,7 @@ import sqlite3
 import json
 import random
 import concurrent.futures
+import hashlib
 from contextlib import closing
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -317,7 +318,8 @@ try:
         try:
             with closing(open_queue_conn()) as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT COUNT(*) FROM task_queue WHERE status='PENDING'")
+                # [V5.40 Patch 3] 精準計算實際負載，將 RETRY 也納入壅塞評估，防止雪崩
+                cur.execute("SELECT COUNT(*) FROM task_queue WHERE status IN ('PENDING', 'RETRY')")
                 return cur.fetchone()[0]
         except Exception as e: 
             print(f"get_pending_count error: {e}")
@@ -441,12 +443,10 @@ try:
         t_sid = str(entry.get("學號", ""))
         t_cat = str(entry.get("類別", ""))
         
-        # [V5.39 Patch 2] 競態條件修復：先用 SQLite INSERT 當作分散式鎖 (Atomic Lock)
         try:
             with closing(open_queue_conn()) as conn:
                 conn.execute("INSERT INTO service_issued VALUES (?, ?, ?)", (t_date, t_sid, t_cat))
         except sqlite3.IntegrityError:
-            # 如果撞到 Primary Key，代表已經有人發放過，直接安全退出
             return 
             
         def _action():
@@ -456,7 +456,6 @@ try:
                 new_row = [t_date, t_sid, str(entry.get("班級", "")), t_cat, str(entry.get("時數", "")), str(entry.get("紀錄ID", ""))]
                 ws.append_row(new_row)
             except Exception as e:
-                # [V5.39 Patch 2] 若寫入 Sheet 失敗，必須釋放鎖 (Rollback)，讓系統稍後能重試
                 with closing(open_queue_conn()) as conn:
                     conn.execute("DELETE FROM service_issued WHERE date=? AND sid=? AND category=?", (t_date, t_sid, t_cat))
                 raise e
@@ -506,7 +505,6 @@ try:
         try:
             image_paths, filenames, drive_links = payload.get("image_paths", []), payload.get("filenames", []), []
             
-            # [V5.39 Patch 3] 嚴格檢查陣列長度，防止 zip() 靜默吞掉資料
             if len(image_paths) != len(filenames):
                 raise Exception(f"DATA_MISMATCH_API: 照片路徑數量 ({len(image_paths)}) 與檔名數量 ({len(filenames)}) 不一致，拒絕處理")
                 
@@ -649,7 +647,11 @@ try:
                 
             mask = df["紀錄ID"].astype(str).str.strip() == ""
             if mask.any():
-                df.loc[mask, "紀錄ID"] = df[mask].index.astype(str)
+                # [V5.40 Patch 1] 使用穩態指紋 Hash 產生 ID，避免關聯漂移
+                def generate_stable_id(row):
+                    unique_str = f"{row.get('日期','')}_{row.get('班級','')}_{row.get('評分項目','')}_{row.get('登錄時間','')}"
+                    return hashlib.md5(unique_str.encode()).hexdigest()[:8]
+                df.loc[mask, "紀錄ID"] = df[mask].apply(generate_stable_id, axis=1)
                 
             for col in ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數", "週次"]:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
@@ -801,24 +803,31 @@ try:
         st.success("📩 申訴已排入背景處理")
         return True
     
+    # [V5.40 Patch 2] 核心優先寫入 (Core-First Commit)，確保分數異動成功才改申訴表狀態
     def update_appeal_status(idx, status, record_id, reply_text=""):
         ws_appeals, ws_main = get_worksheet(SHEET_TABS["appeals"]), get_worksheet(SHEET_TABS["main"])
         try:
             data = ws_appeals.get_all_records()
             t_row = next((i + 2 for i, r in enumerate(data) if str(r.get("對應紀錄ID")) == str(record_id) and str(r.get("處理狀態")) == "待處理"), None)
-            if t_row:
-                ws_appeals.update_cell(t_row, APPEAL_COLUMNS.index("處理狀態") + 1, status)
-                if "審核回覆" in APPEAL_COLUMNS:
-                    ws_appeals.update_cell(t_row, APPEAL_COLUMNS.index("審核回覆") + 1, reply_text)
-                    
-                if status == "已核可":
-                    m_data = ws_main.get_all_records()
-                    m_row = next((j + 2 for j, mr in enumerate(m_data) if str(mr.get("紀錄ID")) == str(record_id)), None)
-                    if m_row: ws_main.update_cell(m_row, EXPECTED_COLUMNS.index("修正") + 1, "TRUE")
-                load_main_data.clear()
-                load_appeals.clear()
-                return True, "更新成功"
-            return False, "找不到對應的申訴列"
+            if not t_row: 
+                return False, "找不到對應的申訴列"
+
+            if status == "已核可":
+                m_data = ws_main.get_all_records()
+                m_row = next((j + 2 for j, mr in enumerate(m_data) if str(mr.get("紀錄ID")) == str(record_id)), None)
+                if m_row: 
+                    ws_main.update_cell(m_row, EXPECTED_COLUMNS.index("修正") + 1, "TRUE")
+                else:
+                    raise Exception("MAIN_RECORD_NOT_FOUND: 找不到對應的主表紀錄，無法執行核可")
+
+            # 核心資料修改成功後，才更新外層的申訴進度表
+            ws_appeals.update_cell(t_row, APPEAL_COLUMNS.index("處理狀態") + 1, status)
+            if "審核回覆" in APPEAL_COLUMNS:
+                ws_appeals.update_cell(t_row, APPEAL_COLUMNS.index("審核回覆") + 1, reply_text)
+                
+            load_main_data.clear()
+            load_appeals.clear()
+            return True, "更新成功"
         except Exception as e: return False, str(e)
 
     def delete_rows_by_ids(ids):
@@ -911,7 +920,13 @@ try:
                     print(f"Waiting for UPLOAD slot... ({up_file.name})")
                     with UPLOAD_SEM:
                         print(f"UPLOAD slot acquired ({up_file.name})")
+                        
+                        # [V5.40 Patch 4] 空檔防禦
                         data = up_file.getvalue()
+                        if not data:
+                            st.warning(f"⚠️ 跳過空檔案 (0 byte): {up_file.name}")
+                            continue
+                            
                         if len(data) > MAX_IMAGE_BYTES: st.warning(f"檔案略過 (過大): {up_file.name}"); continue
                         fname = f"{new_entry['紀錄ID']}_{i}.jpg"
                         local_path = os.path.join(IMG_DIR, fname)
@@ -1737,7 +1752,6 @@ try:
                 st.subheader("📝 待審核回報列表")
                 
                 df = main_df 
-                # [V5.39 Patch 1] 布林值過濾修復，精準過濾掉已經 "修正" (True) 的項目
                 for i, r in df[df["評分項目"].isin(["晨間打掃", "晨間打掃(當日補掃)", "晨間打掃(補掃)"]) & (df["晨間打掃原始分"]==0) & (df["修正"] == False)].iterrows():
                     with st.container(border=True):
                         c1, c2, c3 = st.columns([2,2,1.3])
