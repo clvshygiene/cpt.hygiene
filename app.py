@@ -156,7 +156,7 @@ try:
                 "認領學號": {"rich_text": [{"text": {"content": new_claimed_str}}]}
             }
             if is_full:
-                update_props["任務狀態"] = {"status": {"name": "已認領"}}
+                update_props["任務狀態"] = {"status": {"name": "被認領走了！😼"}}
 
             client.pages.update(
                 page_id=page_id,
