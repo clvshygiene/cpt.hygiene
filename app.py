@@ -1168,8 +1168,16 @@ try:
                 
             my_cls = st.selectbox("選擇班級", all_classes, key="m3_cls_select")
             main_df = load_main_data()
-            if not main_df[(main_df["日期"].astype(str)==str(today_tw)) & (main_df["班級"]==my_cls) & (main_df["評分項目"].astype(str).str.contains("晨間打掃"))].empty: 
-                st.warning(f"⚠️ {my_cls} 今日已回報或已審核完畢囉！")
+            
+            # [新增防呆] 建立一個本地暫存，記住剛送出的班級
+            if "just_submitted_morning" not in st.session_state:
+                st.session_state.just_submitted_morning = []
+                
+            is_in_sheet = not main_df[(main_df["日期"].astype(str)==str(today_tw)) & (main_df["班級"]==my_cls) & (main_df["評分項目"].astype(str).str.contains("晨間打掃"))].empty
+            is_just_submitted = f"{today_tw}_{my_cls}" in st.session_state.just_submitted_morning
+            
+            if is_in_sheet or is_just_submitted: 
+                st.warning(f"⚠️ {my_cls} 今日已回報，或資料正在系統排隊處理中囉！")
             else:
                 duty_df, _ = get_daily_duty(today_tw)
                 
@@ -1333,9 +1341,11 @@ try:
                                         custom_category="晨掃志工"
                                     )
                                     if ok:
-                                        st.success("✅ 回報成功！所有區域皆已記錄，辛苦了！")
-                                        time.sleep(1.5)
-                                        st.rerun()
+                                    # [新增防呆] 送出成功後，立刻把今天和班級記在手機瀏覽器裡
+                                    st.session_state.just_submitted_morning.append(f"{today_tw}_{my_cls}")
+                                    st.success("✅ 回報成功！所有區域皆已記錄，辛苦了！")
+                                    time.sleep(1.5)
+                                    st.rerun()
     # --- Mode 4: 組長後台 ---
     elif app_mode == "組長ㄉ窩💃":
         st.title("⚙️ 管理後台")
