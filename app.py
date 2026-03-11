@@ -860,7 +860,7 @@ try:
                         
                         with col2:
                             with st.form(f"claim_form_{t['id']}"):
-                                s_id = st.text_input("請輸入您的【學號】來認領：", placeholder="例如：112001")
+                                s_id = st.text_input("請輸入您的【學號】來認領：", placeholder="例如：112001", key=f"claim_sid_{t['id']}")
                                 if st.form_submit_button("🚀 確認認領", use_container_width=True):
                                     if time.time() - st.session_state.last_action_time < 3:
                                         st.warning("⚠️ 系統處理中，請勿連續點擊！")
@@ -1139,7 +1139,10 @@ try:
                         if str(r['照片路徑']) and "http" in str(r['照片路徑']): st.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=200)
                         if not ap_st and is_within_appeal_period(r['日期']) and (tot > 0 or r['手機人數'] > 0):
                             with st.form(f"ap_{rid}"):
-                                rsn, pf = st.text_area("理由"), st.file_uploader("佐證", type=['jpg','png'])
+                                # 將原本擠在同一行的程式碼拆成兩行，並各自加上專屬的 key
+                                rsn = st.text_area("理由", key=f"rsn_{rid}")
+                                pf = st.file_uploader("佐證", type=['jpg','png'], key=f"pf_{rid}")
+    
                                 if st.form_submit_button("申訴"):
                                     if time.time() - st.session_state.last_action_time < 3:
                                         st.warning("⚠️ 系統處理中，請勿連續點擊！")
