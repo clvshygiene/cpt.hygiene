@@ -1342,10 +1342,10 @@ try:
                                     )
                                     if ok:
                                     # [新增防呆] 送出成功後，立刻把今天和班級記在手機瀏覽器裡
-                                    st.session_state.just_submitted_morning.append(f"{today_tw}_{my_cls}")
-                                    st.success("✅ 回報成功！所有區域皆已記錄，辛苦了！")
-                                    time.sleep(1.5)
-                                    st.rerun()
+                                        st.session_state.just_submitted_morning.append(f"{today_tw}_{my_cls}")
+                                        st.success("✅ 回報成功！所有區域皆已記錄，辛苦了！")
+                                        time.sleep(1.5)
+                                        st.rerun()
     # --- Mode 4: 組長後台 ---
     elif app_mode == "組長ㄉ窩💃":
         st.title("⚙️ 管理後台")
