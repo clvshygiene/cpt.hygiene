@@ -26,10 +26,10 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ct
 from PIL import Image, ImageOps
 
 try:
-from notion_client import Client
-NOTION_INSTALLED = True
+    from notion_client import Client
+    NOTION_INSTALLED = True
 except ImportError:
-NOTION_INSTALLED = False
+    NOTION_INSTALLED = False
 
 # — 1. 網頁設定 —
 
