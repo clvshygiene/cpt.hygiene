@@ -225,7 +225,7 @@ try:
                     if tab_name == "service_hours": ws.append_row(["日期", "學號", "班級", "類別", "時數", "紀錄ID"])
                     if tab_name == "holidays": ws.append_row(["日期", "說明"])
                     if tab_name == "office_areas": ws.append_row(["區域名稱", "負責班級"])
-                    if tab_name == "published_results": ws.append_row(["週次", "排名", "年級", "班級", "總扣分", "優良次數", "總成績", "評等", "發布時間"])
+                    if tab_name == "published_results": ws.append_row(["週次", "排名", "年級", "班級", "總扣分", "優良次數", "總成績", "評等", "排名模式", "發布時間"])
                     return ws
             except Exception as e:
                 if "429" in str(e): 
@@ -648,7 +648,7 @@ try:
             return df[APPEAL_COLUMNS]
         except: return pd.DataFrame(columns=APPEAL_COLUMNS)
 
-    PUBLISHED_COLS = ["週次", "排名", "年級", "班級", "總扣分", "優良次數", "總成績", "評等", "發布時間"]
+    PUBLISHED_COLS = ["週次", "排名", "年級", "班級", "總扣分", "優良次數", "總成績", "評等", "排名模式", "發布時間"]
 
     @st.cache_data(ttl=300)   # [效能] 5分鐘快取，發布後學生很快就看得到
     def load_published_results():
@@ -664,7 +664,7 @@ try:
             return df
         except: return pd.DataFrame(columns=PUBLISHED_COLS)
 
-    def publish_week_results(week_num, fin_ranked_df):
+    def publish_week_results(week_num, fin_ranked_df, rank_mode="全校"):
         """將計算好的週次排名寫入 published_results sheet，同一週再發布會覆蓋舊資料"""
         ws = get_worksheet(SHEET_TABS["published_results"])
         if not ws: return False, "無法連線至 Google Sheets"
@@ -672,8 +672,6 @@ try:
             # 讀取現有資料，刪除同一週次的舊資料
             existing = ws.get_all_values()
             if len(existing) > 1:
-                # existing[0] 是 header，existing[1:] 是資料
-                # Google Sheets 是 1-indexed，header 是第 1 行，第一筆資料是第 2 行
                 rows_to_delete = [i + 2 for i, row in enumerate(existing[1:])
                                   if row and str(row[0]) == str(week_num)]
                 for ridx in sorted(rows_to_delete, reverse=True):
@@ -691,6 +689,7 @@ try:
                     int(row.get("優良次數", 0)),
                     int(row.get("總成績", 0)),
                     str(row.get("評等", "")),
+                    rank_mode,
                     now_str
                 ])
             load_published_results.clear()
@@ -1708,20 +1707,16 @@ try:
                         else:
                             st.warning(f"找不到 {cls} 在第 {sel_pub_week} 週的排名資料。")
 
-                        # 判斷是否為全校排名：若多個年級的班級排名不從1重新開始，代表是全校制
-                        grades_in_pub = week_pub["年級"].nunique()
-                        max_rank_per_grade = week_pub.groupby("年級")["排名"].min()
-                        is_school_wide = grades_in_pub > 1 and (max_rank_per_grade > 1).any()
+                        # 直接讀取發布時儲存的排名模式，不再靠偵測推斷
+                        pub_rank_mode = str(week_pub["排名模式"].iloc[0]) if "排名模式" in week_pub.columns and not week_pub.empty else "年級"
 
-                        if is_school_wide:
-                            # 全校排名：顯示所有班級
+                        if pub_rank_mode == "全校":
                             st.markdown("##### 全校完整排名")
                             st.dataframe(
                                 week_pub[["排名","年級","班級","總扣分","優良次數","總成績"]].sort_values("排名").reset_index(drop=True),
                                 hide_index=True
                             )
                         else:
-                            # 年級排名：只顯示同年級
                             cls_grade = next((c["grade"] for c in structured_classes if c["name"] == cls), "")
                             grade_pub = week_pub[week_pub["年級"] == cls_grade] if cls_grade else week_pub
                             if not grade_pub.empty:
@@ -2223,7 +2218,11 @@ try:
                                 st.markdown("---")
                                 st.info(f"💡 計算完成後，可將第 {sel_week} 週成績發布給學生查詢。")
                                 if st.button(f"📢 發布第 {sel_week} 週成績給學生", key="publish_week_btn"):
-                                    ok, msg = publish_week_results(sel_week, st.session_state["last_computed_ranking"])
+                                    ok, msg = publish_week_results(
+                                        sel_week,
+                                        st.session_state["last_computed_ranking"],
+                                        rank_mode=rank_mode  # 把排名模式一起存進去
+                                    )
                                     if ok:
                                         st.success(f"✅ {msg}")
                                     else:
