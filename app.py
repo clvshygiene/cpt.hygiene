@@ -12,7 +12,6 @@ import sqlite3
 import json
 import random
 import concurrent.futures
-import hashlib
 from contextlib import closing
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -33,12 +32,10 @@ except ImportError:
     NOTION_INSTALLED = False
 
 # --- 1. 網頁設定 ---
-# [V5.41 Patch 1] 安全讀取 Secrets，避免啟動時未知的設定檔缺失導致死當
-try:
-    sys_env = st.secrets.get("ENV", "PROD")
-except Exception:
-    sys_env = "PROD"
+# 透過 Streamlit Secrets 判斷目前是測試區還是正式區 (預設為正式區)
+sys_env = st.secrets.get("ENV", "PROD")
 
+# [V5.31 Patch 1] 確保 set_page_config 是第一個執行的指令
 if sys_env == "DEV":
     st.set_page_config(page_title="🔧測試版-中壢家商，衛愛而生", layout="wide", page_icon="🧹")
     st.sidebar.info(f"🕵️‍♀️ 系統目前抓到的身分證是：[{sys_env}]")
@@ -52,7 +49,6 @@ try:
     TW_TZ = pytz.timezone('Asia/Taipei')
     MAX_IMAGE_BYTES = 20 * 1024 * 1024  
     UPLOAD_SEM = threading.BoundedSemaphore(4) 
-    NOTION_CLAIM_LOCK = threading.Lock() 
     QUEUE_DB_PATH = "task_queue_v4_wal.db"
     IMG_DIR = "evidence_photos"
     os.makedirs(IMG_DIR, exist_ok=True)
@@ -70,7 +66,7 @@ try:
         "內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數",
         "備註", "違規細項", "照片路徑", "登錄時間", "修正", "晨掃未到者", "紀錄ID"
     ]
-    APPEAL_COLUMNS = ["申訴日期", "班級", "違規日期", "違規項目", "原始扣分", "申訴理由", "佐證照片", "處理狀態", "登錄時間", "對應紀錄ID", "審核回覆", "申訴ID"]
+    APPEAL_COLUMNS = ["申訴日期", "班級", "違規日期", "違規項目", "原始扣分", "申訴理由", "佐證照片", "處理狀態", "登錄時間", "對應紀錄ID", "審核回覆"]
 
     # ==========================================
     # Notion API 輔助函式 
@@ -78,124 +74,98 @@ try:
     @st.cache_resource
     def get_notion_client():
         if NOTION_INSTALLED:
-            try:
-                token = st.secrets.get("notion_token") or st.secrets.get("system_config", {}).get("notion_token")
-                if token: return Client(auth=token)
-            except Exception: pass
+            token = st.secrets.get("notion_token") or st.secrets.get("system_config", {}).get("notion_token")
+            if token: return Client(auth=token)
         return None
 
     def fetch_available_notion_tasks():
         client = get_notion_client()
-        try:
-            db_id = st.secrets.get("notion_db_id") or st.secrets.get("system_config", {}).get("notion_db_id")
-        except Exception:
-            db_id = None
-            
+        db_id = st.secrets.get("notion_db_id") or st.secrets.get("system_config", {}).get("notion_db_id")
         if not client or not db_id: 
             return [], "系統尚未設定 Notion Token 或 Database ID"
         
         try:
+            response = client.databases.query(
+                database_id=db_id,
+                filter={"property": "任務狀態", "status": {"equals": "等待認領中😿"}}
+            )
             tasks = []
-            has_more = True
-            next_cursor = None
-            
-            while has_more:
-                query_args = {
-                    "database_id": db_id,
-                    "filter": {"property": "任務狀態", "status": {"equals": "等待認領中😿"}}
-                }
-                if next_cursor:
-                    query_args["start_cursor"] = next_cursor
-                    
-                response = client.databases.query(**query_args)
+            for page in response.get("results", []):
+                props = page.get("properties", {})
+                title = props.get("任務名稱", {}).get("title", [{}])
+                title_text = title[0].get("text", {}).get("content", "未命名任務") if title else "未命名任務"
                 
-                for page in response.get("results", []):
-                    props = page.get("properties", {})
-                    title = props.get("任務名稱", {}).get("title", [{}])
-                    title_text = title[0].get("text", {}).get("content", "未命名任務") if title else "未命名任務"
-                    
-                    date_obj = props.get("任務日期", {}).get("date", {})
-                    raw_date = date_obj.get("start", "未定") if date_obj else "未定"
-                    if raw_date != "未定":
-                        try:
-                            parsed_date = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
-                            if len(raw_date) <= 10:
-                                date_val = parsed_date.strftime("%Y-%m-%d")
-                            else:
-                                date_val = parsed_date.strftime("%Y-%m-%d %H:%M")
-                        except Exception as e:
-                            print(f"Date parse error: {e}")
-                            date_val = raw_date
-                    else:
-                        date_val = "未定"
-                    
-                    area = props.get("任務內容", {}).get("rich_text", [{}])
-                    area_text = area[0].get("text", {}).get("content", "未填寫") if area else "未填寫"
+                date_obj = props.get("任務日期", {}).get("date", {})
+                raw_date = date_obj.get("start", "未定") if date_obj else "未定"
+                if raw_date != "未定":
+                    try:
+                        parsed_date = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                        if len(raw_date) <= 10:
+                            date_val = parsed_date.strftime("%Y-%m-%d")
+                        else:
+                            date_val = parsed_date.strftime("%Y-%m-%d %H:%M")
+                    except Exception:
+                        date_val = raw_date
+                else:
+                    date_val = "未定"
+                
+                area = props.get("任務內容", {}).get("rich_text", [{}])
+                area_text = area[0].get("text", {}).get("content", "未填寫") if area else "未填寫"
 
-                    req_num_obj = props.get("需求人數", {}).get("number")
-                    req_num = 1 if req_num_obj is None else req_num_obj  
-                    
-                    claimed_obj = props.get("認領學號", {}).get("rich_text", [])
-                    claimed_str = "".join([part.get("text", {}).get("content", "") for part in claimed_obj])
-                    current_claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
-                    current_count = len(current_claimants)
-                    
-                    tasks.append({
-                        "id": page["id"], "title": title_text, "date": date_val, "area": area_text,
-                        "req_num": req_num, "current_count": current_count
-                    })
-                    
-                has_more = response.get("has_more", False)
-                next_cursor = response.get("next_cursor")
-                if not has_more:
-                    break
-                    
+                req_num_obj = props.get("需求人數", {}).get("number")
+                req_num = req_num_obj if req_num_obj else 1  
+                
+                claimed_obj = props.get("認領學號", {}).get("rich_text", [])
+                claimed_str = claimed_obj[0].get("text", {}).get("content", "") if claimed_obj else ""
+                current_claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
+                current_count = len(current_claimants)
+                
+                tasks.append({
+                    "id": page["id"], "title": title_text, "date": date_val, "area": area_text,
+                    "req_num": req_num, "current_count": current_count
+                })
             return tasks, None
         except Exception as e:
             return [], f"Notion API 讀取失敗詳細錯誤: {str(e)}"
 
     def claim_notion_task(page_id, student_id):
         client = get_notion_client()
+        # [Patch] Guard Clause：防止 client 為空時觸發 NoneType 例外
         if not client:
             return False, "Notion 服務目前未啟用或連線失敗，請通知管理員檢查系統設定。"
             
-        with NOTION_CLAIM_LOCK:
-            try:
-                page = client.pages.retrieve(page_id=page_id)
-                props = page.get("properties", {})
+        try:
+            page = client.pages.retrieve(page_id=page_id)
+            props = page.get("properties", {})
+            
+            req_num_obj = props.get("需求人數", {}).get("number")
+            req_num = req_num_obj if req_num_obj else 1
+            
+            claimed_obj = props.get("認領學號", {}).get("rich_text", [])
+            claimed_str = claimed_obj[0].get("text", {}).get("content", "") if claimed_obj else ""
+            current_claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
+            
+            if str(student_id) in current_claimants:
+                return False, f"學號 {student_id} 已經認領過此任務囉！"
                 
-                req_num_obj = props.get("需求人數", {}).get("number")
-                req_num = 1 if req_num_obj is None else req_num_obj
-                
-                claimed_obj = props.get("認領學號", {}).get("rich_text", [])
-                claimed_str = "".join([part.get("text", {}).get("content", "") for part in claimed_obj])
-                current_claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
-                
-                if str(student_id) in current_claimants:
-                    return False, f"學號 {student_id} 已經認領過此任務囉！"
-                    
-                if len(current_claimants) >= req_num:
-                    return False, "手腳太慢啦！這個任務剛剛被別人搶走額滿了！"
-                    
-                current_claimants.append(str(student_id))
-                new_claimed_str = ", ".join(current_claimants)
-                
-                is_full = len(current_claimants) >= req_num
-                update_props = {
-                    "認領學號": {"rich_text": [{"text": {"content": new_claimed_str}}]}
-                }
-                if is_full:
-                    update_props["任務狀態"] = {"status": {"name": "已認領"}}
+            current_claimants.append(str(student_id))
+            new_claimed_str = ", ".join(current_claimants)
+            
+            is_full = len(current_claimants) >= req_num
+            update_props = {
+                "認領學號": {"rich_text": [{"text": {"content": new_claimed_str}}]}
+            }
+            if is_full:
+                update_props["任務狀態"] = {"status": {"name": "被認領走了！😼"}}
 
-                client.pages.update(
-                    page_id=page_id,
-                    properties=update_props
-                )
-                return True, "滿團" if is_full else "未滿"
-                
-            except Exception as e:
-                print(f"Notion claim error: {e}")
-                return False, str(e)
+            client.pages.update(
+                page_id=page_id,
+                properties=update_props
+            )
+            return True, "滿團" if is_full else "未滿"
+            
+        except Exception as e:
+            return False, str(e)
 
     # ==========================================
     # SRE Utils: 重試機制
@@ -216,7 +186,7 @@ try:
                     raise Exception("API 連線超時，請稍後再試")
             except Exception as e:
                 error_str = str(e).lower()
-                is_retryable = any(x in error_str for x in ['429', '500', '503', 'quota', 'rate limit', 'timed out', 'connection', 'unavailable'])
+                is_retryable = any(x in error_str for x in ['429', '500', '503', 'quota', 'rate limit', 'timed out', 'connection'])
                 if is_retryable and attempt < max_retries - 1:
                     sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0, 1)
                     time.sleep(sleep_time)
@@ -228,10 +198,9 @@ try:
     @st.cache_resource
     def get_credentials():
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        try:
-            if "gcp_service_account" not in st.secrets: return None
-            return ServiceAccountCredentials.from_json_keyfile_dict(dict(st.secrets["gcp_service_account"]), scope)
-        except Exception: return None
+        if "gcp_service_account" not in st.secrets:
+            return None
+        return ServiceAccountCredentials.from_json_keyfile_dict(dict(st.secrets["gcp_service_account"]), scope)
 
     def get_gspread_client():
         creds = get_credentials()
@@ -252,21 +221,16 @@ try:
                 except gspread.WorksheetNotFound:
                     cols = 20 if tab_name != "appeals" else 15
                     ws = sheet.add_worksheet(title=tab_name, rows=500, cols=cols)
-                    if tab_name == SHEET_TABS["main"]: ws.append_row(EXPECTED_COLUMNS)
-                    if tab_name == SHEET_TABS["appeals"]: ws.append_row(APPEAL_COLUMNS)
-                    if tab_name == SHEET_TABS["service_hours"]: ws.append_row(["日期", "學號", "班級", "類別", "時數", "紀錄ID"])
-                    if tab_name == SHEET_TABS["holidays"]: ws.append_row(["日期", "說明"])
-                    if tab_name == SHEET_TABS["office_areas"]: ws.append_row(["區域名稱", "負責班級"])
-                    if tab_name == SHEET_TABS["settings"]: ws.append_row(["設定項目", "設定值"])
-                    if tab_name == SHEET_TABS["duty"]: ws.append_row(["日期", "負責班級", "掃地區域", "標準人數"])
+                    if tab_name == "appeals": ws.append_row(APPEAL_COLUMNS)
+                    if tab_name == "service_hours": ws.append_row(["日期", "學號", "班級", "類別", "時數", "紀錄ID"])
+                    if tab_name == "holidays": ws.append_row(["日期", "說明"])
+                    if tab_name == "office_areas": ws.append_row(["區域名稱", "負責班級"])
                     return ws
             except Exception as e:
                 if "429" in str(e): 
                     time.sleep(2 * (attempt + 1) + random.uniform(0, 1))
                     continue
-                else:
-                    print(f"Error getting worksheet {tab_name}: {e}") 
-                    return None
+                else: return None
         return None
 
     def compress_image_bytes(file_bytes, quality=70):
@@ -281,34 +245,24 @@ try:
             img.save(out_buffer, format="JPEG", quality=quality, optimize=True)
             out_buffer.seek(0)
             return out_buffer
-        except Exception as e: 
-            print(f"Image compress error: {e}")
-            return io.BytesIO(file_bytes)
+        except: return io.BytesIO(file_bytes)
 
     def upload_image_to_drive(file_obj, filename):
         def _upload_action():
             service = get_drive_service()
-            if not service: raise Exception("DRIVE_SERVICE_UNAVAILABLE")
-            
-            try: sys_cfg = st.secrets.get("system_config", {})
-            except Exception: sys_cfg = {}
-            folder_id = sys_cfg.get("drive_folder_id")
-            if not folder_id:
-                raise Exception("DRIVE_FOLDER_NOT_CONFIGURED: 系統未設定 drive_folder_id")
-                
+            folder_id = st.secrets["system_config"]["drive_folder_id"]
             file = service.files().create(
                 body={'name': filename, 'parents': [folder_id]},
                 media_body=MediaIoBaseUpload(file_obj, mimetype='image/jpeg', resumable=False), 
                 fields='id', supportsAllDrives=True
             ).execute()
-            try: 
-                service.permissions().create(fileId=file.get('id'), body={'role': 'reader', 'type': 'anyone'}).execute()
-            except Exception as e: 
-                print(f"Drive permission error: {e}") 
+            try: service.permissions().create(fileId=file.get('id'), body={'role': 'reader', 'type': 'anyone'}).execute()
+            except: pass 
             return f"https://drive.google.com/thumbnail?id={file.get('id')}&sz=w1000"
         return execute_with_retry(_upload_action)
 
     def clean_id(val):
+        # [V5.31 Patch 3] 改為保留字串型態，僅去除 Excel 尾端的 .0，保護學號前導 0
         s = str(val).strip()
         if re.fullmatch(r"\d+\.0", s):
             s = s[:-2]
@@ -330,25 +284,21 @@ try:
         try:
             with closing(open_queue_conn()) as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT COUNT(*) FROM task_queue WHERE status IN ('PENDING', 'RETRY')")
+                cur.execute("SELECT COUNT(*) FROM task_queue WHERE status='PENDING'")
                 return cur.fetchone()[0]
-        except Exception as e: 
-            print(f"get_pending_count error: {e}")
-            return 0
+        except: return 0
 
     def update_worker_heartbeat():
         try:
             with closing(open_queue_conn()) as conn:
                 conn.execute("INSERT OR REPLACE INTO system_status VALUES ('worker_heartbeat', ?)", (str(time.time()),))
-        except Exception as e: 
-            print(f"Heartbeat DB error: {e}")
+        except: pass
 
     def update_last_success_time():
         try:
             with closing(open_queue_conn()) as conn:
                 conn.execute("INSERT OR REPLACE INTO system_status VALUES ('last_success_time', ?)", (str(time.time()),))
-        except Exception as e:
-            print(f"Last success DB error: {e}")
+        except: pass
 
     def get_worker_heartbeat_sec():
         try:
@@ -358,8 +308,7 @@ try:
                 row = cur.fetchone()
                 if row:
                     return time.time() - float(row[0])
-        except Exception as e: 
-            print(f"Read heartbeat error: {e}")
+        except: pass
         return 999999
 
     def get_last_success_sec():
@@ -370,8 +319,7 @@ try:
                 row = cur.fetchone()
                 if row:
                     return time.time() - float(row[0])
-        except Exception as e: 
-            print(f"Read success time error: {e}")
+        except: pass
         return 999999
 
     def enqueue_task(task_type, payload):
@@ -398,11 +346,10 @@ try:
                 oldest = cur.fetchone()[0]
                 if oldest:
                     try: metrics["oldest_pending_sec"] = (datetime.now(pytz.utc) - datetime.fromisoformat(oldest.replace("Z", "+00:00"))).total_seconds()
-                    except Exception as e: print(f"Metrics date parse error: {e}")
+                    except: pass
                 cur.execute("SELECT last_error, created_ts FROM task_queue WHERE status='FAILED' OR status='RETRY' ORDER BY created_ts DESC LIMIT 5")
                 metrics["recent_errors"] = cur.fetchall()
-        except Exception as e: 
-            print(f"Metrics DB error: {e}")
+        except: pass
         return metrics
 
     def fetch_next_task(max_attempts=6):
@@ -426,6 +373,7 @@ try:
                 cur.execute("UPDATE task_queue SET status='IN_PROGRESS', attempts=attempts+1 WHERE id=?", (task_id,))
                 conn.execute("COMMIT")
                 
+                # [V5.31 Patch 2] 回傳給 Worker 的 attempts 必須 +1，與資料庫同步
                 return {"id": task_id, "task_type": row[1], "payload": json.loads(row[2] or "{}"), "attempts": row[3] + 1}
         except Exception as e:
             print(f"抓取任務時發生錯誤: {e}")
@@ -444,7 +392,15 @@ try:
     def _append_main_entry_row(entry):
         def _action():
             ws = get_worksheet(SHEET_TABS["main"])
-            if not ws: raise Exception("MAIN_WS_UNAVAILABLE: 無法取得 main 工作表")
+            if not ws: return
+            # [防重複寫入] 先比對紀錄ID，若已存在則跳過，避免連續上傳兩筆
+            try:
+                existing_ids = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
+                if str(entry.get("紀錄ID", "")) in existing_ids:
+                    print(f"[DEDUP] 紀錄ID {entry.get('紀錄ID')} 已存在，跳過寫入")
+                    return
+            except Exception as e:
+                print(f"[DEDUP] 防重複檢查失敗，繼續寫入: {e}")
             row = [str(entry.get(col, "")).upper() if isinstance(entry.get(col, ""), bool) else str(entry.get(col, "")) for col in EXPECTED_COLUMNS]
             ws.append_row(row)
         execute_with_retry(_action)
@@ -461,16 +417,10 @@ try:
             return 
             
         def _action():
-            try:
-                ws = get_worksheet(SHEET_TABS["service_hours"])
-                if not ws: raise Exception("SERVICE_WS_UNAVAILABLE: 找不到服務時數表")
-                new_row = [t_date, t_sid, str(entry.get("班級", "")), t_cat, str(entry.get("時數", "")), str(entry.get("紀錄ID", ""))]
-                ws.append_row(new_row)
-            except Exception as e:
-                with closing(open_queue_conn()) as conn:
-                    conn.execute("DELETE FROM service_issued WHERE date=? AND sid=? AND category=?", (t_date, t_sid, t_cat))
-                raise e
-                
+            ws = get_worksheet(SHEET_TABS["service_hours"])
+            if not ws: return
+            new_row = [t_date, t_sid, str(entry.get("班級", "")), t_cat, str(entry.get("時數", "")), str(entry.get("紀錄ID", ""))]
+            ws.append_row(new_row)
         execute_with_retry(_action)
 
     def update_last_error_summary(err_msg):
@@ -478,8 +428,7 @@ try:
             with closing(open_queue_conn()) as conn:
                 short_msg = str(err_msg)[:120]
                 conn.execute("INSERT OR REPLACE INTO system_status VALUES ('last_error_summary', ?)", (short_msg,))
-        except Exception as e: 
-            print(f"Error saving summary: {e}")
+        except: pass
 
     def get_last_error_summary():
         try:
@@ -488,16 +437,12 @@ try:
                 cur.execute("SELECT val FROM system_status WHERE key='last_error_summary'")
                 row = cur.fetchone()
                 return row[0] if row else "無紀錄"
-        except Exception as e:
-            print(f"Error fetching summary: {e}")
-            return "無紀錄"
+        except: return "無紀錄"
 
     def process_task(task):
         task_type, payload = task["task_type"], task["payload"]
         
-        try: is_dry_run = str(st.secrets.get("system_config", {}).get("dry_run", "false")).lower() in ["true", "1"]
-        except: is_dry_run = False
-        
+        is_dry_run = str(st.secrets.get("system_config", {}).get("dry_run", "false")).lower() in ["true", "1"]
         if is_dry_run:
             time.sleep(random.uniform(0.3, 0.6))
             return True, "DRY_RUN_SUCCESS"
@@ -517,25 +462,18 @@ try:
         entry = payload.get("entry", {})
         try:
             image_paths, filenames, drive_links = payload.get("image_paths", []), payload.get("filenames", []), []
-            
-            if len(image_paths) != len(filenames):
-                raise Exception(f"DATA_MISMATCH_API: 照片路徑數量 ({len(image_paths)}) 與檔名數量 ({len(filenames)}) 不一致，拒絕處理")
-                
             for path in image_paths:
                 if path and not os.path.exists(path): return False, "FILE_NOT_FOUND: 找不到實體圖片檔案，直接放棄"
-                
             for path, fname in zip(image_paths, filenames):
                 if os.path.exists(path):
                     with open(path, "rb") as f:
-                        link = upload_image_to_drive(compress_image_bytes(f.read()), fname)
-                        if not link or "UPLOAD_FAILED" in link:
-                            raise Exception(f"UPLOAD_FAILED_API: 圖片 {fname} 上傳 Drive 失敗")
-                        drive_links.append(link)
+                        drive_links.append(upload_image_to_drive(compress_image_bytes(f.read()), fname) or "UPLOAD_FAILED_API")
             if drive_links: entry["照片路徑"] = ";".join(drive_links)
 
             if task_type in ["main_entry", "volunteer_report"]:
                 _append_main_entry_row(entry)
                 inspector_name = entry.get("檢查人員", "")
+                # [V5.28] 根據參數決定是否發放時數 (預設發放，以防其他地方使用)
                 if "學號:" in inspector_name and payload.get("award_inspector_hours", True):
                     sid = inspector_name.split("學號:")[1].strip()
                     _append_service_row_unique({"日期": entry.get("日期"), "學號": sid, "班級": "", "類別": "整潔評分糾察", "時數": 0.25, "紀錄ID": uuid.uuid4().hex[:8]}) 
@@ -548,36 +486,17 @@ try:
                 image_info = payload.get("image_file")
                 if image_info:
                     if not os.path.exists(image_info["path"]): return False, "FILE_NOT_FOUND: 找不到佐證照片檔案，直接放棄"
-                    with open(image_info["path"], "rb") as f: 
-                        link = upload_image_to_drive(compress_image_bytes(f.read()), image_info["filename"])
-                        if not link or "UPLOAD_FAILED" in link:
-                            raise Exception(f"UPLOAD_FAILED_API: 申訴照片 {image_info['filename']} 上傳 Drive 失敗")
-                        entry["佐證照片"] = link
-                
-                def _append_appeal():
-                    ws = get_worksheet(SHEET_TABS["appeals"])
-                    if not ws: raise Exception("APPEALS_WS_UNAVAILABLE: 無法取得申訴工作表")
-                    ws.append_row([str(entry.get(c, "")) for c in APPEAL_COLUMNS])
-                execute_with_retry(_append_appeal)
-                
+                    with open(image_info["path"], "rb") as f: entry["佐證照片"] = upload_image_to_drive(compress_image_bytes(f.read()), image_info["filename"])
+                execute_with_retry(lambda: get_worksheet(SHEET_TABS["appeals"]).append_row([str(entry.get(c, "")) for c in APPEAL_COLUMNS]))
             return True, None
-        except Exception as e: 
-            print(f"Task process error ({task_type}): {e}")
-            return False, str(e)
+        except Exception as e: return False, str(e)
 
     def background_worker(stop_event=None):
         try: add_script_run_ctx(threading.current_thread(), get_script_run_ctx())
-        except Exception as e: print(f"Script context init error: {e}")
-        
-        try:
-            with closing(open_queue_conn()) as conn:
-                conn.execute("UPDATE task_queue SET status='RETRY' WHERE status='IN_PROGRESS'")
-        except Exception as e: print(f"Worker init reset error: {e}")
-        
+        except: pass
         while True:
             if stop_event and stop_event.is_set(): break
             update_worker_heartbeat() 
-            task = None
             try:
                 task = fetch_next_task()
                 if not task: time.sleep(2.0); continue
@@ -587,29 +506,16 @@ try:
                 else: 
                     if err and "DRY_RUN" not in err: update_last_error_summary(err)
 
-                is_fatal_error = not ok and err and ("FILE_NOT_FOUND" in str(err) or task["attempts"] >= 6)
-                
-                if ok or is_fatal_error:
-                    try:
-                        paths = task["payload"].get("image_paths", [])[:] 
-                        img_file_info = task["payload"].get("image_file")
-                        if img_file_info and isinstance(img_file_info, dict) and "path" in img_file_info:
-                            paths.append(img_file_info["path"])
-                            
-                        for p in paths:
-                            if p and os.path.exists(p): os.remove(p)
-                    except Exception as e: print(f"File cleanup error: {e}")
+                try:
+                    paths = task["payload"].get("image_paths", []) + ([task["payload"]["image_file"]["path"]] if "image_file" in task["payload"] else [])
+                    for p in paths:
+                        if p and os.path.exists(p): os.remove(p)
+                except: pass
 
                 if not ok and err and "FILE_NOT_FOUND" in str(err): task["attempts"] = 999
                 update_task_status(task["id"], "DONE" if ok else ("FAILED" if task["attempts"] >= 6 else "RETRY"), task["attempts"], err)
                 time.sleep(0.5)
-            except Exception as e:
-                print(f"Worker critical crash: {e}")
-                if task:
-                    try:
-                        update_task_status(task["id"], "RETRY", task.get("attempts", 1), f"Worker Critical Crash: {str(e)}")
-                    except Exception as inner_e: print(f"Failed to reset task after crash: {inner_e}")
-                time.sleep(3.0)
+            except Exception as e: time.sleep(3.0)
 
     @st.cache_resource
     def ensure_worker_started():
@@ -628,23 +534,16 @@ try:
         ws = get_worksheet(SHEET_TABS["holidays"])
         if not ws: return []
         try: return [pd.to_datetime(str(r.get("日期", "")).strip()).date() for r in ws.get_all_records() if str(r.get("日期", "")).strip()]
-        except Exception as e: 
-            print(f"Load holidays error: {e}")
-            return []
+        except: return []
 
     def is_within_appeal_period(violation_date, appeal_days=3):
-        try:
-            vd = pd.to_datetime(violation_date).date()
-            if pd.isna(vd): return False
-            holidays, today, current_date, workdays = load_holidays(), date.today(), vd, 0
-            for _ in range(14): 
-                if workdays >= appeal_days: break
-                current_date += timedelta(days=1)
-                if current_date.weekday() < 5 and current_date not in holidays: workdays += 1
-            return today <= current_date
-        except Exception as e:
-            print(f"Date parse error in appeal period check: {e} (value: {violation_date})")
-            return False
+        vd = pd.to_datetime(violation_date).date() if isinstance(violation_date, str) else violation_date
+        holidays, today, current_date, workdays = load_holidays(), date.today(), vd, 0
+        for _ in range(14): 
+            if workdays >= appeal_days: break
+            current_date += timedelta(days=1)
+            if current_date.weekday() < 5 and current_date not in holidays: workdays += 1
+        return today <= current_date
 
     @st.cache_data(ttl=360)
     def load_main_data():
@@ -654,24 +553,14 @@ try:
             df = pd.DataFrame(ws.get_all_records())
             if df.empty: return pd.DataFrame(columns=EXPECTED_COLUMNS)
             if "班級" in df.columns: df["班級"] = df["班級"].astype(str).str.strip()
-            
             for col in EXPECTED_COLUMNS:
                 if col not in df.columns: df[col] = ""
-                
-            mask = df["紀錄ID"].astype(str).str.strip() == ""
-            if mask.any():
-                def generate_stable_id(row):
-                    unique_str = f"{row.get('日期','')}_{row.get('班級','')}_{row.get('評分項目','')}_{row.get('登錄時間','')}"
-                    return hashlib.md5(unique_str.encode()).hexdigest()[:8]
-                df.loc[mask, "紀錄ID"] = df[mask].apply(generate_stable_id, axis=1)
-                
+            if "紀錄ID" not in df.columns: df["紀錄ID"] = df.index.astype(str)
             for col in ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數", "週次"]:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
             if "修正" in df.columns: df["修正"] = df["修正"].astype(str).apply(lambda x: True if x.upper() == "TRUE" else False)
             return df[EXPECTED_COLUMNS]
-        except Exception as e: 
-            print(f"Load main data error: {e}")
-            return pd.DataFrame(columns=EXPECTED_COLUMNS)
+        except: return pd.DataFrame(columns=EXPECTED_COLUMNS)
 
     @st.cache_data(ttl=21600)
     def load_roster_dict():
@@ -681,9 +570,7 @@ try:
             df = pd.DataFrame(ws.get_all_records())
             id_c, cls_c = next((c for c in df.columns if "學號" in c), None), next((c for c in df.columns if "班級" in c), None)
             return {clean_id(row[id_c]): str(row[cls_c]).strip() for _, row in df.iterrows()} if id_c and cls_c else {}
-        except Exception as e: 
-            print(f"Load roster error: {e}")
-            return {}
+        except: return {}
     
     @st.cache_data(ttl=3600)
     def load_sorted_classes():
@@ -704,9 +591,7 @@ try:
                 return (g, next((v for k, v in dept_order.items() if k in n), 99), n)
             sorted_all = sorted(unique, key=get_sort_key)
             return sorted_all, [{"grade": f"{get_sort_key(c)[0]}年級" if get_sort_key(c)[0]!=99 else "其他", "name": c} for c in sorted_all]
-        except Exception as e: 
-            print(f"Load sorted classes error: {e}")
-            return [], []
+        except: return [], []
 
     @st.cache_data(ttl=60)
     def get_daily_duty(target_date):
@@ -720,18 +605,14 @@ try:
                 df[date_col] = pd.to_datetime(df[date_col], errors='coerce').dt.date
                 return df[df[date_col] == (target_date if isinstance(target_date, date) else target_date.date())], "success"
             return pd.DataFrame(), "missing_cols"
-        except Exception as e: 
-            print(f"Load duty error: {e}")
-            return pd.DataFrame(), "error"
+        except: return pd.DataFrame(), "error"
 
     @st.cache_data(ttl=3600)
     def load_office_area_map():
         ws = get_worksheet(SHEET_TABS["office_areas"])
         if not ws: return {}
         try: return {str(r.get("區域名稱", "")).strip(): str(r.get("負責班級", "")).strip() for r in ws.get_all_records() if str(r.get("區域名稱", "")).strip()}
-        except Exception as e: 
-            print(f"Load office map error: {e}")
-            return {}
+        except: return {}
 
     @st.cache_data(ttl=21600)
     def load_settings():
@@ -740,17 +621,8 @@ try:
         if ws:
             try:
                 for row in ws.get_all_values():
-                    if len(row)>=2:
-                        key, val = row[0], row[1]
-                        if key == "standard_n":
-                            try:
-                                config[key] = int(val)
-                            except ValueError:
-                                print(f"Invalid standard_n value: {val}, using default 4")
-                        else:
-                            config[key] = val
-            except Exception as e: 
-                print(f"Load settings error: {e}")
+                    if len(row)>=2: config[row[0]] = int(row[1]) if row[0] == "standard_n" else row[1]
+            except: pass
         return config
 
     def save_setting(key, val):
@@ -761,9 +633,7 @@ try:
                 if cell: ws.update_cell(cell.row, cell.col+1, val)
                 else: ws.append_row([key, val])
                 st.cache_data.clear(); return True
-            except Exception as e: 
-                print(f"Save setting error: {e}")
-                return False
+            except: return False
         return False
 
     @st.cache_data(ttl=60)
@@ -775,9 +645,7 @@ try:
             for col in APPEAL_COLUMNS:
                 if col not in df.columns: df[col] = "待處理" if col == "處理狀態" else ""
             return df[APPEAL_COLUMNS]
-        except Exception as e: 
-            print(f"Load appeals error: {e}")
-            return pd.DataFrame(columns=APPEAL_COLUMNS)
+        except: return pd.DataFrame(columns=APPEAL_COLUMNS)
 
     def save_appeal(entry, proof_file=None):
         pending_count = get_pending_count()
@@ -793,13 +661,7 @@ try:
                 print(f"Waiting for UPLOAD slot... (Appeal: {proof_file.name})")
                 with UPLOAD_SEM:
                     print(f"UPLOAD slot acquired (Appeal: {proof_file.name})")
-                    
-                    proof_file.seek(0)
                     data = proof_file.read()
-                    if not data:
-                        st.error("❌ 讀取不到照片內容，請嘗試重新上傳！")
-                        return False
-                        
                     if len(data) > MAX_IMAGE_BYTES: st.error("照片過大"); return False
                     fname = f"Appeal_{entry.get('班級', '')}_{datetime.now(TW_TZ).strftime('%H%M%S')}.jpg"
                     l_path = os.path.join(IMG_DIR, f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}_{fname}")
@@ -820,24 +682,19 @@ try:
         try:
             data = ws_appeals.get_all_records()
             t_row = next((i + 2 for i, r in enumerate(data) if str(r.get("對應紀錄ID")) == str(record_id) and str(r.get("處理狀態")) == "待處理"), None)
-            if not t_row: 
-                return False, "找不到對應的申訴列"
-
-            if status == "已核可":
-                m_data = ws_main.get_all_records()
-                m_row = next((j + 2 for j, mr in enumerate(m_data) if str(mr.get("紀錄ID")) == str(record_id)), None)
-                if m_row: 
-                    ws_main.update_cell(m_row, EXPECTED_COLUMNS.index("修正") + 1, "TRUE")
-                else:
-                    raise Exception("MAIN_RECORD_NOT_FOUND: 找不到對應的主表紀錄，無法執行核可")
-
-            ws_appeals.update_cell(t_row, APPEAL_COLUMNS.index("處理狀態") + 1, status)
-            if "審核回覆" in APPEAL_COLUMNS:
-                ws_appeals.update_cell(t_row, APPEAL_COLUMNS.index("審核回覆") + 1, reply_text)
-                
-            load_main_data.clear()
-            load_appeals.clear()
-            return True, "更新成功"
+            if t_row:
+                ws_appeals.update_cell(t_row, APPEAL_COLUMNS.index("處理狀態") + 1, status)
+                if "審核回覆" in APPEAL_COLUMNS:
+                    ws_appeals.update_cell(t_row, APPEAL_COLUMNS.index("審核回覆") + 1, reply_text)
+                    
+                if status == "已核可":
+                    m_data = ws_main.get_all_records()
+                    m_row = next((j + 2 for j, mr in enumerate(m_data) if str(mr.get("紀錄ID")) == str(record_id)), None)
+                    if m_row: ws_main.update_cell(m_row, EXPECTED_COLUMNS.index("修正") + 1, "TRUE")
+                load_main_data.clear()
+                load_appeals.clear()
+                return True, "更新成功"
+            return False, "找不到對應的申訴列"
         except Exception as e: return False, str(e)
 
     def delete_rows_by_ids(ids):
@@ -889,26 +746,17 @@ try:
                         "raw_role": s_role
                     })
             return inspectors or default
-        except Exception as e: 
-            print(f"Load inspectors error: {e}")
-            return default
+        except: return default
 
     def check_duplicate_record(df, check_date, inspector, role, target_class=None):
         if df.empty: return False
         try:
-            req_cols = ["日期", "檢查人員", "評分項目"]
-            if target_class: req_cols.append("班級")
-            if not all(col in df.columns for col in req_cols):
-                print(f"Duplicate check warning: Missing columns. Expected {req_cols}, got {list(df.columns)}")
-                return False
-            
             mask = (df["日期"].astype(str) == str(check_date)) & (df["檢查人員"] == inspector) & (df["評分項目"] == role)
             if target_class: mask &= (df["班級"] == target_class)
             return not df[mask].empty
-        except Exception as e:
-            print(f"Duplicate check error: {e}")
-            return False
+        except: return False
 
+    # [V5.28] 加入 award_inspector_hours 控制是否發放時數
     def save_entry(new_entry, uploaded_files=None, student_list=None, custom_hours=0.5, custom_category="晨掃志工", award_inspector_hours=True):
         pending_count = get_pending_count()
         if pending_count > 300:
@@ -919,9 +767,8 @@ try:
 
         new_entry["日期"] = str(new_entry.get("日期", str(date.today())))
         new_entry["紀錄ID"] = new_entry.get("紀錄ID", f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}")
-        
-        # [V5.41 Patch 3] 即時生成登錄時間，避免因前端頁面停留過久導致時間落後
-        new_entry["登錄時間"] = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        if "登錄時間" not in new_entry or not new_entry["登錄時間"]:
+            new_entry["登錄時間"] = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
         image_paths, file_names = [], []
         if uploaded_files:
@@ -931,12 +778,7 @@ try:
                     print(f"Waiting for UPLOAD slot... ({up_file.name})")
                     with UPLOAD_SEM:
                         print(f"UPLOAD slot acquired ({up_file.name})")
-                        
                         data = up_file.getvalue()
-                        if not data:
-                            st.warning(f"⚠️ 跳過空檔案 (0 byte): {up_file.name}")
-                            continue
-                            
                         if len(data) > MAX_IMAGE_BYTES: st.warning(f"檔案略過 (過大): {up_file.name}"); continue
                         fname = f"{new_entry['紀錄ID']}_{i}.jpg"
                         local_path = os.path.join(IMG_DIR, fname)
@@ -966,9 +808,7 @@ try:
             for col in ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數", "週次"]:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
             return df[EXPECTED_COLUMNS]
-        except Exception as e: 
-            print(f"Export load error: {e}")
-            return pd.DataFrame()
+        except: return pd.DataFrame()
 
     # ==========================================
     # 3. 主程式 UI 啟動前準備
@@ -986,8 +826,29 @@ try:
     
     def get_week_num(d):
         try:
-            start = datetime.strptime(SYSTEM_CONFIG["semester_start"], "%Y-%m-%d").date()
             if isinstance(d, datetime): d = d.date()
+            # [週次對照表] 優先使用 settings 裡的 week_map 手動對照（格式：2025-01-23:1,2025-02-23:2,...）
+            week_map_str = SYSTEM_CONFIG.get("week_map", "")
+            if week_map_str.strip():
+                entries = []
+                for item in week_map_str.split(","):
+                    item = item.strip()
+                    if ":" in item:
+                        date_str, wn = item.rsplit(":", 1)
+                        try:
+                            entries.append((datetime.strptime(date_str.strip(), "%Y-%m-%d").date(), int(wn.strip())))
+                        except: pass
+                if entries:
+                    entries.sort(key=lambda x: x[0])
+                    matched_week = 0
+                    for start_date, wn in entries:
+                        if d >= start_date:
+                            matched_week = wn
+                        else:
+                            break
+                    return matched_week if matched_week > 0 else 0
+            # fallback：純數學計算
+            start = datetime.strptime(SYSTEM_CONFIG["semester_start"], "%Y-%m-%d").date()
             return max(0, ((d - start).days // 7) + 1)
         except: return 0
 
@@ -1001,9 +862,7 @@ try:
         st.title("🤝 愛校服務認領區")
         st.info("💡 這裡的任務清單與 Notion 行事曆即時同步！成功認領後，任務會自動標記並更新。")
         
-        try: n_token = st.secrets.get("notion_token") or st.secrets.get("system_config", {}).get("notion_token")
-        except Exception: n_token = None
-        
+        n_token = st.secrets.get("notion_token") or st.secrets.get("system_config", {}).get("notion_token")
         if not NOTION_INSTALLED:
             st.error("⚠️ 系統偵測到未安裝 `notion-client` 套件，請通知管理員檢查系統設定。")
         elif not n_token:
@@ -1015,7 +874,7 @@ try:
             if error_msg:
                 st.error(f"⚠️ 讀取 Notion 發生錯誤！請檢查以下錯誤訊息：\n\n{error_msg}")
             elif not tasks:
-                st.success("🎉 哇，目前沒有任務！")
+                st.success("🎉 娃，目前沒有任務！")
                 st.balloons()
             else:
                 st.write(f"目前共有 **{len(tasks)}** 項待認領的任務：")
@@ -1030,8 +889,8 @@ try:
                         
                         with col2:
                             with st.form(f"claim_form_{t['id']}"):
-                                s_id = st.text_input("請輸入您的【學號】來認領：", placeholder="例如：112001")
-                                if st.form_submit_button("🚀 確認認領"):
+                                s_id = st.text_input("請輸入您的【學號】來認領：", placeholder="例如：112001", key=f"claim_sid_{t['id']}")
+                                if st.form_submit_button("🚀 確認認領", use_container_width=True):
                                     if time.time() - st.session_state.last_action_time < 3:
                                         st.warning("⚠️ 系統處理中，請勿連續點擊！")
                                     elif not s_id:
@@ -1090,12 +949,7 @@ try:
             with st.expander("🔐 身份驗證", expanded=True):
                 pwd_input = st.text_input("請輸入隊伍通行碼", type="password", key="m1_login_pwd")
                 if pwd_input:
-                    try: sys_cfg = st.secrets.get("system_config", {})
-                    except Exception: sys_cfg = {}
-                    team_pwd = sys_cfg.get("team_password")
-                    if not team_pwd:
-                        st.error("⚠️ 系統未設定隊伍密碼，請通知管理員檢查 Secrets。")
-                    elif pwd_input == team_pwd:
+                    if pwd_input == st.secrets["system_config"]["team_password"]:
                         st.session_state["team_logged_in"] = True
                         st.rerun()
                     else:
@@ -1163,7 +1017,7 @@ try:
                                     
                                     if v_list:
                                         score = len(v_list)
-                                        base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "班級": cls, "評分項目": role, "垃圾內掃原始分": 0, "垃圾外掃原始分": score}
+                                        base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "班級": cls, "評分項目": role, "垃圾內掃原始分": 0, "垃圾外掃原始分": score}
                                         if save_entry({**base, "備註": f"外掃({off})-{step_a}({','.join(v_list)})", "違規細項": step_a}):
                                             cnt += 1
                                 if cnt: st.success(f"✅ 已登記 {cnt} 筆違規！"); time.sleep(1.5); st.rerun()
@@ -1203,7 +1057,7 @@ try:
                                     
                                     if v_list:
                                         score = len(v_list)
-                                        base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "班級": cls, "評分項目": role, "垃圾內掃原始分": score, "垃圾外掃原始分": 0}
+                                        base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "班級": cls, "評分項目": role, "垃圾內掃原始分": score, "垃圾外掃原始分": 0}
                                         if save_entry({**base, "備註": f"內掃-{step_a}({','.join(v_list)})", "違規細項": step_a}):
                                             cnt += 1
                                 if cnt: st.success(f"✅ 已登記 {cnt} 筆違規！"); time.sleep(1.5); st.rerun()
@@ -1214,6 +1068,7 @@ try:
                     pending_classes = []
 
                     if assigned_classes:
+                        # [V5.28 Patch] 衛生糾察進度與自動核發時數防堵
                         completed_records = main_df[(main_df["日期"].astype(str) == str(input_date)) & (main_df["檢查人員"] == inspector_name)]["班級"].tolist()
                         completed_classes = set(completed_records)
                         pending_classes = [c for c in assigned_classes if c not in completed_classes]
@@ -1222,12 +1077,13 @@ try:
                         
                         sel_cls = st.radio("選擇負責班級", assigned_classes, key="m1_cls_assigned")
                         
+                        # 判斷這是不是最後一個缺少的班級
                         if sel_cls in pending_classes and len(pending_classes) == 1:
                             is_last_task = True
                         elif sel_cls in pending_classes:
                             is_last_task = False
                         else:
-                            is_last_task = False 
+                            is_last_task = False # 代表已經評分過了
                     else:
                         st.info("📍 今日任務：機動/隊長/組長自由巡查")
                         temp_g = st.radio("步驟 A: 選擇年級", grades, horizontal=True, key="m1_grade_select")
@@ -1236,14 +1092,12 @@ try:
 
                     if sel_cls:
                         st.divider()
-                        
-                        # [V5.41 Patch 2] 將重複驗證結果存入變數，如果重複直接在送出時攔截
-                        is_dup = check_duplicate_record(main_df, input_date, inspector_name, role, sel_cls)
-                        if is_dup: st.warning(f"⚠️ 今日已評過 {sel_cls}！無法重複送出。")
+                        if check_duplicate_record(main_df, input_date, inspector_name, role, sel_cls): st.warning(f"⚠️ 今日已評過 {sel_cls}！")
                         
                         with st.form("score_form", clear_on_submit=True):
                             in_s, out_s, ph_c, note = 0, 0, 0, ""
-                            if st.radio("檢查結果", ["❌ 違規", "✨ 乾淨"], horizontal=True) == "❌ 違規":
+                            check_result = st.radio("檢查結果", ["✨ 乾淨(優良)", "❌ 違規"], horizontal=True)
+                            if check_result == "❌ 違規":
                                 if role == "內掃檢查":
                                     in_s = st.number_input("內掃扣分", 0)
                                     note = " ".join([x for x in [st.selectbox("區塊", ["", "走廊", "黑板", "地板"]), st.selectbox("狀況", ["", "髒亂", "沒拖地"]), st.text_input("補充")] if x])
@@ -1251,20 +1105,29 @@ try:
                                     out_s = st.number_input("外掃扣分", 0)
                                     note = " ".join([x for x in [st.selectbox("區域", ["", "走廊", "樓梯", "廁所", "操場"]), st.selectbox("狀況", ["", "很髒", "沒掃"]), st.text_input("補充")] if x])
                             is_fix = st.checkbox("🚩 這是修正單")
-                            files = st.file_uploader("📸 違規照片", accept_multiple_files=True)
+                            
+                            # [照片上傳] 提供相簿選取或直接拍照兩種方式
+                            upload_method = st.radio("照片上傳方式", ["📁 從相簿/檔案選取", "📷 直接拍照（不怕照片消失）"], horizontal=True, key="m1_upload_method")
+                            if upload_method == "📷 直接拍照（不怕照片消失）":
+                                cam_img = st.camera_input("拍攝現場照片")
+                                files = [cam_img] if cam_img else []
+                            else:
+                                files = st.file_uploader("📸 違規照片", accept_multiple_files=True)
                             
                             if st.form_submit_button("送出"):
-                                # [V5.41 Patch 2] 絕對阻擋重複送單
-                                if is_dup:
-                                    st.error("🚫 此班級今日已評分完畢，系統已自動攔截重複送單！")
-                                elif time.time() - st.session_state.last_action_time < 3:
-                                    st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                                if time.time() - st.session_state.last_action_time < 5:
+                                    st.warning("⚠️ 系統處理中，請稍候 5 秒再試！")
                                 else:
                                     st.session_state.last_action_time = time.time()
-                                    if (in_s + out_s) > 0 and not files: 
+                                    if check_result == "✨ 乾淨(優良)":
+                                        # 優良：記錄一筆扣分為0的優良紀錄
+                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(優良)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": "本次檢查表現優良，無扣分項目"}, uploaded_files=files if files else None, award_inspector_hours=is_last_task):
+                                            st.success("⭐ 優良紀錄已登記！"); time.sleep(1.5); st.rerun()
+                                    elif (in_s + out_s) > 0 and not files:
                                         st.error("扣分需照片")
                                     else:
-                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note}, uploaded_files=files, award_inspector_hours=is_last_task):
+                                        # 傳遞 award_inspector_hours 參數，控制背景發放時數
+                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note}, uploaded_files=files, award_inspector_hours=is_last_task):
                                             if assigned_classes:
                                                 if is_last_task:
                                                     st.success("✅ 送出成功！今日任務已全數完成，系統將自動核發 0.25 小時！")
@@ -1302,7 +1165,7 @@ try:
                     disp_time = str(r.get('登錄時間', ''))
                     time_str = disp_time.split(' ')[-1] if disp_time else ''
                     
-                    score_disp = f"加 {abs(tot)} 分 (學期)" if tot < 0 else f"扣: {tot}"
+                    score_disp = "⭐ 優良 (無扣分)" if "優良" in str(r['評分項目']) else (f"加 {abs(tot)} 分 (學期)" if tot < 0 else f"扣: {tot}")
                     
                     with st.expander(f"{icon} {r['日期']} {time_str} - {r['評分項目']} ({score_disp})"):
                         st.caption(f"登錄時間：{disp_time if disp_time else '未紀錄'}") 
@@ -1317,7 +1180,10 @@ try:
                         if str(r['照片路徑']) and "http" in str(r['照片路徑']): st.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=200)
                         if not ap_st and is_within_appeal_period(r['日期']) and (tot > 0 or r['手機人數'] > 0):
                             with st.form(f"ap_{rid}"):
-                                rsn, pf = st.text_area("理由"), st.file_uploader("佐證", type=['jpg','png'])
+                                # 將原本擠在同一行的程式碼拆成兩行，並各自加上專屬的 key
+                                rsn = st.text_area("理由", key=f"rsn_{rid}")
+                                pf = st.file_uploader("佐證", type=['jpg','png'], key=f"pf_{rid}")
+    
                                 if st.form_submit_button("申訴"):
                                     if time.time() - st.session_state.last_action_time < 3:
                                         st.warning("⚠️ 系統處理中，請勿連續點擊！")
@@ -1333,19 +1199,26 @@ try:
     elif app_mode == "晨掃志工隊🧹":
         st.title("🧹 晨掃志工回報專區")
         
-        try: cutoff_hour = 24 if sys_env == "DEV" else 16
-        except Exception: cutoff_hour = 16
+        cutoff_hour = 24 if sys_env == "DEV" else 16
         
-        if datetime.now(TW_TZ).hour >= cutoff_hour: 
-            st.error(f"🚫 今日回報已截止 ({cutoff_hour}:00)")
+        if now_tw.hour >= cutoff_hour: 
+            st.error("🚫 今日回報已截止 (16:00)")
         else:
-            if sys_env == "DEV" and datetime.now(TW_TZ).hour >= 16:
+            if sys_env == "DEV" and now_tw.hour >= 16:
                 st.info("🔧 **[測試機特權開啟]** 目前已超過 16:00，但因為是 DEV 環境，允許繼續測試！")
                 
             my_cls = st.selectbox("選擇班級", all_classes, key="m3_cls_select")
             main_df = load_main_data()
-            if not main_df[(main_df["日期"].astype(str)==str(today_tw)) & (main_df["班級"]==my_cls) & (main_df["評分項目"].astype(str).str.contains("晨間打掃"))].empty: 
-                st.warning(f"⚠️ {my_cls} 今日已回報或已審核完畢囉！")
+            
+            # [新增防呆] 建立一個本地暫存，記住剛送出的班級
+            if "just_submitted_morning" not in st.session_state:
+                st.session_state.just_submitted_morning = []
+                
+            is_in_sheet = not main_df[(main_df["日期"].astype(str)==str(today_tw)) & (main_df["班級"]==my_cls) & (main_df["評分項目"].astype(str).str.contains("晨間打掃"))].empty
+            is_just_submitted = f"{today_tw}_{my_cls}" in st.session_state.just_submitted_morning
+            
+            if is_in_sheet or is_just_submitted: 
+                st.warning(f"⚠️ {my_cls} 今日已回報，或資料正在系統排隊處理中囉！")
             else:
                 duty_df, _ = get_daily_duty(today_tw)
                 
@@ -1353,6 +1226,7 @@ try:
                 area_name_str = ""
                 n_std = 4
                 
+                # 1. 先查今天有沒有排班
                 if not duty_df.empty:
                     m_d = duty_df[duty_df["負責班級"]==my_cls]
                     if not m_d.empty:
@@ -1364,9 +1238,11 @@ try:
                 is_makeup = False
                 found_duty = has_duty
 
+                # 2. 如果今天沒排班，且是一、二年級 -> 往前翻找本週班表
                 if not has_duty and ("一" in my_cls or "二" in my_cls):
                     from datetime import timedelta
                     
+                    # [V5.30 Patch 1] 防呆：先檢查本週是不是已經交過晨掃了！(不管有沒有被核可)
                     start_of_week = today_tw - timedelta(days=today_tw.weekday())
                     already_done = False
                     for _, r in main_df[main_df["班級"] == my_cls].iterrows():
@@ -1378,11 +1254,12 @@ try:
                                     break
                             except: pass
 
+                    # 如果本週「還沒交過」，才開啟時光機去查哪一天缺交
                     if not already_done:
                         for d in range(1, 7):
                             past_date = today_tw - timedelta(days=d)
                             if past_date < start_of_week: 
-                                break 
+                                break # 只找本週的紀錄，超過本週就不補了
                                 
                             p_duty, _ = get_daily_duty(past_date)
                             if not p_duty.empty and "負責班級" in p_duty.columns:
@@ -1391,14 +1268,15 @@ try:
                                     area_name_str = str(m_p.iloc[0].get('掃地區域', '未指定區域'))
                                     try: n_std = int(m_p.iloc[0].get('標準人數', 4))
                                     except: n_std = 4
-                                    is_makeup = True 
+                                    is_makeup = True # 判定為跨日補掃
                                     found_duty = True
                                     break
                                 
-                # [V5.41] 遲交判定使用當下時間
-                if has_duty and datetime.now(TW_TZ).hour >= 15:
+                # 3. 如果今天有排班，但超過 15:00 -> 當日遲交補掃
+                if has_duty and now_tw.hour >= 15:
                     is_makeup = True
 
+                # 若完全找不到班表 (例如三年級沒排班，或一二年級連上週都沒排)
                 if not found_duty:
                     st.success(f"🎉 恭喜！系統顯示 **{my_cls}** 近期沒有被分配到晨掃任務，好好休息吧！")
                     st.balloons()
@@ -1406,11 +1284,13 @@ try:
                     areas = [a.strip() for a in area_name_str.split('、') if a.strip()]
                     if not areas: areas = ["打掃區域"]
                     
+                    # 依據是否為補掃，顯示不同的上方提示
                     if is_makeup:
                         st.info(f"💡 **{my_cls}** 進行補打掃任務。本班任務總應到: {n_std} 人\n\n*(補掃通過將給予學期總分 +1，並核發志工時數)*")
                     else:
                         st.info(f"📍 本班任務總應到: {n_std} 人")
                     
+                    # 顯示每日廣播大聲公
                     daily_task = SYSTEM_CONFIG.get("daily_morning_task", "")
                     if daily_task:
                         formatted_task = daily_task.replace('\n', '<br>')
@@ -1457,6 +1337,7 @@ try:
                                 with col2:
                                     files_dict[area] = st.file_uploader(f"📸 {area} 成果照片", accept_multiple_files=True, type=['jpg','png'], key=f"fu_{idx}")
                                     
+                        # 依據 is_makeup 動態變更按鈕文字
                         btn_text = "🚀 我們完成補打掃了喔" if is_makeup else "🚀 確認送出全部回報"
                         
                         if st.form_submit_button(btn_text):
@@ -1482,6 +1363,7 @@ try:
                                 if not all_present or not all_files:
                                     st.error("❌ 請至少選擇一位打掃同學，並上傳至少一張照片！")
                                 else:
+                                    # 依據 is_makeup 變更存入的任務名稱
                                     task_name = "晨間打掃(補掃)" if is_makeup else "晨間打掃"
                                     
                                     ok = save_entry(
@@ -1490,6 +1372,8 @@ try:
                                             "班級": my_cls, 
                                             "評分項目": task_name, 
                                             "檢查人員": f"志工(實到:{len(all_present)})", 
+                                            "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), 
+                                            "晨間打掃原始分": 0, 
                                             "備註": final_note
                                         }, 
                                         uploaded_files=all_files, 
@@ -1498,10 +1382,11 @@ try:
                                         custom_category="晨掃志工"
                                     )
                                     if ok:
+                                    # [新增防呆] 送出成功後，立刻把今天和班級記在手機瀏覽器裡
+                                        st.session_state.just_submitted_morning.append(f"{today_tw}_{my_cls}")
                                         st.success("✅ 回報成功！所有區域皆已記錄，辛苦了！")
                                         time.sleep(1.5)
                                         st.rerun()
-
     # --- Mode 4: 組長後台 ---
     elif app_mode == "組長ㄉ窩💃":
         st.title("⚙️ 管理後台")
@@ -1515,8 +1400,7 @@ try:
         col3.metric("延遲(s)", int(metrics.get("oldest_pending_sec", 0)))
         
         hb_status = "🟢 正常運作" if hb_sec < 60 else "🔴 已休眠/停止"
-        try: is_dry_run = str(st.secrets.get("system_config", {}).get("dry_run", "false")).lower() in ["true", "1"]
-        except: is_dry_run = False
+        is_dry_run = str(st.secrets.get("system_config", {}).get("dry_run", "false")).lower() in ["true", "1"]
         
         if is_dry_run: hb_status = "🟡 演習模式 (Dry Run)"
         
@@ -1530,12 +1414,8 @@ try:
         if last_err != "無紀錄":
             st.error(f"🚨 **最後錯誤紀錄:** {last_err}")
 
-        try: sys_cfg = st.secrets.get("system_config", {})
-        except: sys_cfg = {}
-        admin_pwd = sys_cfg.get("admin_password")
-
         pwd_input = st.text_input("管理密碼", type="password", key="admin_pwd")
-        if admin_pwd and pwd_input == admin_pwd:
+        if pwd_input == st.secrets["system_config"]["admin_password"]:
             
             t_mon, t_rollcall, t4, t_appeal, t2, t1, t_settings, t3 = st.tabs([
                 "👀 衛生糾察", "👮 環保糾察", "📝 扣分明細", "📣 申訴", "📊 成績總表", 
@@ -1677,6 +1557,8 @@ try:
                             
                             if st.button("🚀 計算當週成績"):
                                 week_df = full[full["週次"] == sel_week].copy()
+                                # 優良紀錄不計入扣分
+                                week_df = week_df[~week_df["評分項目"].astype(str).str.contains("優良")]
                                 week_df["內掃結算"] = week_df["內掃原始分"].clip(upper=2)
                                 week_df["外掃結算"] = week_df["外掃原始分"].clip(upper=2)
                                 trash_total = week_df["垃圾內掃原始分"] + week_df["垃圾外掃原始分"]
@@ -1691,61 +1573,91 @@ try:
                                 fin = pd.merge(cls_df, rep, on="班級", how="left").fillna(0)
                                 fin["總成績"] = 90 - fin["總扣分"]
                                 
-                                if rank_mode == "全校": st.dataframe(fin.sort_values("總成績", ascending=False))
+                                def get_week_grade_label(s):
+                                    if s == 0: return "⭐ 優良"
+                                    elif s <= 3: return "✅ 普通"
+                                    else: return "⚠️ 需加強"
+                                fin["評等"] = fin["總扣分"].apply(get_week_grade_label)
+                                
+                                if rank_mode == "全校":
+                                    fin_sorted = fin.sort_values("總成績", ascending=False).reset_index(drop=True)
+                                    fin_sorted.insert(0, "排名", range(1, len(fin_sorted) + 1))
+                                    st.dataframe(fin_sorted[["排名", "年級", "班級", "總扣分", "總成績", "評等"]], hide_index=True)
                                 else:
                                     for g in sorted(fin["年級"].unique()):
-                                        if g != "其他": 
+                                        if g != "其他":
                                             st.write(f"#### {g} 排名")
-                                            st.dataframe(fin[fin["年級"]==g].sort_values("總成績", ascending=False))
+                                            g_df = fin[fin["年級"]==g].sort_values("總成績", ascending=False).reset_index(drop=True).copy()
+                                            g_df.insert(0, "排名", range(1, len(g_df) + 1))
+                                            st.dataframe(g_df[["排名", "班級", "總扣分", "總成績", "評等"]], hide_index=True)
                     
                     with tab_semester:
                         st.write("計算全學期累計總扣分與總成績")
                         sem_rank_mode = st.radio("學期排名方式", ["全校", "年級"], horizontal=True, key="sem_rank")
                         
                         if st.button("🚀 計算全學期成績", key="sem_btn"):
-                            full["內掃結算"] = full["內掃原始分"].clip(upper=2)
-                            full["外掃結算"] = full["外掃原始分"].clip(upper=2)
-                            trash_total = full["垃圾內掃原始分"] + full["垃圾外掃原始分"]
-                            trash_total = trash_total.where(trash_total > 0, full["垃圾原始分"])
-                            full["垃圾結算"] = trash_total.clip(upper=2)
+                            full_calc = full[~full["評分項目"].astype(str).str.contains("優良")].copy()
+                            full_calc["內掃結算"] = full_calc["內掃原始分"].clip(upper=2)
+                            full_calc["外掃結算"] = full_calc["外掃原始分"].clip(upper=2)
+                            trash_total = full_calc["垃圾內掃原始分"] + full_calc["垃圾外掃原始分"]
+                            trash_total = trash_total.where(trash_total > 0, full_calc["垃圾原始分"])
+                            full_calc["垃圾結算"] = trash_total.clip(upper=2)
                             
-                            full["總扣分"] = full["內掃結算"]+full["外掃結算"]+full["垃圾結算"]+full["晨間打掃原始分"]+full["手機人數"]
-                            rep = full.groupby("班級")["總扣分"].sum().reset_index()
+                            full_calc["總扣分"] = full_calc["內掃結算"]+full_calc["外掃結算"]+full_calc["垃圾結算"]+full_calc["晨間打掃原始分"]+full_calc["手機人數"]
+                            rep = full_calc.groupby("班級")["總扣分"].sum().reset_index()
                             cls_df = pd.DataFrame(structured_classes).rename(columns={"grade":"年級","name":"班級"})
                             fin = pd.merge(cls_df, rep, on="班級", how="left").fillna(0)
                             
-                            fin["總成績"] = 90 - fin["總扣分"] 
+                            fin["總成績"] = 90 - fin["總扣分"]
                             
-                            if sem_rank_mode == "全校": st.dataframe(fin.sort_values("總成績", ascending=False))
+                            def get_sem_grade_label(s):
+                                if s == 0: return "⭐ 優良"
+                                elif s <= 10: return "✅ 普通"
+                                else: return "⚠️ 需加強"
+                            fin["評等"] = fin["總扣分"].apply(get_sem_grade_label)
+                            
+                            if sem_rank_mode == "全校":
+                                fin_sorted = fin.sort_values("總成績", ascending=False).reset_index(drop=True)
+                                fin_sorted.insert(0, "排名", range(1, len(fin_sorted) + 1))
+                                st.dataframe(fin_sorted[["排名", "年級", "班級", "總扣分", "總成績", "評等"]], hide_index=True)
                             else:
                                 for g in sorted(fin["年級"].unique()):
-                                    if g != "其他": 
+                                    if g != "其他":
                                         st.write(f"#### {g}")
-                                        st.dataframe(fin[fin["年級"]==g].sort_values("總成績", ascending=False))
+                                        g_df = fin[fin["年級"]==g].sort_values("總成績", ascending=False).reset_index(drop=True).copy()
+                                        g_df.insert(0, "排名", range(1, len(g_df) + 1))
+                                        st.dataframe(g_df[["排名", "班級", "總扣分", "總成績", "評等"]], hide_index=True)
             with t1:
+                # [V5.29 Patch] 本週晨掃進度追蹤 (含過去缺交)
                 st.subheader("🕵️‍♀️ 晨掃進度追蹤 (本週)")
                 main_df = load_main_data()
                 
                 from datetime import timedelta
+                # 計算本週一是哪一天
                 start_of_week = today_tw - timedelta(days=today_tw.weekday())
                 
                 weekly_assigned = {}
+                # 1. 抓取從本週一到今天，每天被排班的班級
                 for i in range((today_tw - start_of_week).days + 1):
                     check_date = start_of_week + timedelta(days=i)
                     c_duty_df, _ = get_daily_duty(check_date)
                     if not c_duty_df.empty:
                         for c in c_duty_df["負責班級"].dropna().astype(str).tolist():
+                            # [V5.30 Patch 2] 確保班級名稱沒有前後空白，避免對不上
                             if c.strip(): weekly_assigned[c.strip()] = check_date
                             
+                # 2. 抓取本週「有交過任何晨掃紀錄」(包含準時交跟跨日補掃) 的班級
                 submitted_classes = set()
                 for _, r in main_df.iterrows():
                     if "晨間打掃" in str(r["評分項目"]):
                         try:
+                            # 安全地將字串轉換為日期進行比較
                             r_date = pd.to_datetime(str(r["日期"])).date()
                             if start_of_week <= r_date <= today_tw:
-                                submitted_classes.add(str(r["班級"]).strip())
-                        except Exception as e: print(f"Date parse error in track: {e}")
+                                submitted_classes.add(str(r["班級"]))
+                        except: pass
                         
+                # 3. 交叉比對找出缺交名單
                 today_missing = []
                 past_missing = []
                 
@@ -1754,18 +1666,22 @@ try:
                         if a_date == today_tw:
                             today_missing.append(cls)
                         else:
+                            # 如果是過去缺交的，在後面加上 (月/日) 標籤
                             past_missing.append(f"{cls} ({a_date.month}/{a_date.day})")
                             
+                # 4. 將結果顯示在畫面上
                 if not weekly_assigned:
                     st.info("本週至今無晨掃排班任務。")
                 elif not today_missing and not past_missing:
                     st.success("🎉 太棒了！本週至今所有排定班級皆已完成晨掃回報！")
                 else:
+                    # 顯示今天的缺交狀態
                     if today_missing:
                         st.error(f"🚨 **今日尚未回報 ({len(today_missing)}班)：** {', '.join(sorted(today_missing))}")
                     else:
                         st.success("🎉 今日排定班級皆已完成回報！")
                         
+                    # 顯示過去尚未補掃的狀態 (這就是妳要的功能！)
                     if past_missing:
                         st.warning(f"⚠️ **本週未補掃名單 ({len(past_missing)}班)：** {', '.join(sorted(past_missing))}")
                         
@@ -1773,7 +1689,7 @@ try:
                 st.subheader("📝 待審核回報列表")
                 
                 df = main_df 
-                for i, r in df[df["評分項目"].isin(["晨間打掃", "晨間打掃(當日補掃)", "晨間打掃(補掃)"]) & (df["晨間打掃原始分"]==0) & (df["修正"] == False)].iterrows():
+                for i, r in df[df["評分項目"].isin(["晨間打掃", "晨間打掃(當日補掃)", "晨間打掃(補掃)"]) & (df["晨間打掃原始分"]==0) & (df["修正"]!="TRUE")].iterrows():
                     with st.container(border=True):
                         c1, c2, c3 = st.columns([2,2,1.3])
                         
@@ -1860,15 +1776,17 @@ try:
             with t_settings:
                 st.subheader("⚙️ 系統設定與維護")
                 curr = SYSTEM_CONFIG.get("semester_start")
-                
-                try:
-                    default_date = datetime.strptime(curr, "%Y-%m-%d").date() if curr else today_tw
-                except ValueError:
-                    st.warning("⚠️ 發現無效的開學日設定，已自動重置為今日，請重新設定並儲存。")
-                    default_date = today_tw
-                    
-                nd = st.date_input("開學日", default_date)
+                nd = st.date_input("開學日", datetime.strptime(curr, "%Y-%m-%d").date() if curr else today_tw)
                 if st.button("更新開學日"): save_setting("semester_start", str(nd))
+                
+                st.markdown("---")
+                st.write("📅 **週次手動對照表**（解決寒假跨週問題）")
+                st.caption("格式：每週一日期:週次號碼，用逗號分隔。例如：2025-01-23:1,2025-02-23:2,2025-03-02:3\n填入後，系統會依此對照計算週次，不再用純數學計算。留空則回到自動計算模式。")
+                curr_week_map = SYSTEM_CONFIG.get("week_map", "")
+                new_week_map = st.text_area("週次對照表", value=curr_week_map, placeholder="2025-01-23:1,2025-02-23:2,2025-03-02:3,...")
+                if st.button("💾 儲存週次對照表"):
+                    if save_setting("week_map", new_week_map.strip()):
+                        st.success("✅ 週次對照表已更新！")
                 
                 st.markdown("---")
                 st.write("📢 晨掃志工每日廣播/任務")
@@ -1921,10 +1839,10 @@ try:
                                 ok_norm, ok_spec = True, True
                                 if norm: 
                                     pf_n = io.BytesIO(fb); pf_n.name="p.jpg"
-                                    ok_norm = save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃"}, [pf_n], norm, base_h, "返校打掃(一般)")
+                                    ok_norm = save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")}, [pf_n], norm, base_h, "返校打掃(一般)")
                                 if spec: 
                                     pf_s = io.BytesIO(fb); pf_s.name="p.jpg"
-                                    ok_spec = save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃"}, [pf_s], spec, spec_h, "返校打掃(加強)")
+                                    ok_spec = save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")}, [pf_s], spec, spec_h, "返校打掃(加強)")
                                 
                                 if ok_norm and ok_spec:
                                     st.success("已登記！"); time.sleep(1.5); st.rerun()
@@ -1932,10 +1850,7 @@ try:
                                 st.error("需上傳照片")
 
         elif pwd_input != "":
-            if not admin_pwd:
-                st.error("⚠️ 系統未設定管理密碼，請檢查 Secrets。")
-            else:
-                st.error("密碼錯誤")
+            st.error("密碼錯誤")
 
 except Exception as e:
     st.error(f"❌ 系統發生錯誤: {str(e)}")
