@@ -1527,9 +1527,11 @@ try:
 
                 def _is_real_deduct(r):
                     item = str(r['評分項目'])
-                    # 排除優良、普通、學期加分（晨掃），以及已修正紀錄
+                    # 排除優良、普通、學期加分（晨掃），以及申訴已核可的修正紀錄
+                    # 注意：load_main_data 將修正欄位轉為布林值 True/False
+                    is_corrected = r['修正'] is True or str(r['修正']).upper() == "TRUE"
                     return (not any(x in item for x in ["優良", "普通", "學期加分"])
-                            and str(r['修正']) != "TRUE")
+                            and not is_corrected)
 
                 def _is_bonus(r):
                     # 學期加分紀錄（晨間打掃(學期加分)，分數為負）
