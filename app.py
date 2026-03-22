@@ -847,7 +847,7 @@ try:
         enqueue_task("volunteer_report" if student_list is not None else "main_entry", payload)
         return True
 
-    @st.cache_data(ttl=1800)  # [效能] 30分鐘，報表用途不需頻繁更新
+    @st.cache_data(ttl=600)   # [效能] 申訴核可後最多10分鐘內會反映（配合報表計算）
     def load_full_semester_data_for_export():
         ws = get_worksheet(SHEET_TABS["main"])
         if not ws: return pd.DataFrame(columns=EXPECTED_COLUMNS)
@@ -2073,8 +2073,11 @@ try:
 
                 # ── 共用計算函式 ──────────────────────────────────────────
                 def calc_scores(df_raw):
-                    """回傳含結算欄位的 DataFrame（已排除優良/普通紀錄）"""
-                    df = df_raw[~df_raw["評分項目"].astype(str).str.contains("優良|普通")].copy()
+                    """回傳含結算欄位的 DataFrame（已排除優良/普通紀錄，以及申訴核可的修正紀錄）"""
+                    df = df_raw[
+                        ~df_raw["評分項目"].astype(str).str.contains("優良|普通") &
+                        ~df_raw["修正"].astype(str).str.upper().eq("TRUE")   # [關鍵修正] 排除申訴已核可的紀錄
+                    ].copy()
                     df["內掃結算"] = df["內掃原始分"].clip(upper=2)
                     df["外掃結算"] = df["外掃原始分"].clip(upper=2)
                     trash = df["垃圾內掃原始分"] + df["垃圾外掃原始分"]
@@ -2170,8 +2173,15 @@ try:
                             default_mode = "年級 (上學期制)" if is_fall else "全校 (下學期制)"
                             st.info(f"💡 系統偵測目前為 **{'上' if is_fall else '下'}學期**，預設採用 **{default_mode}** 排名。")
                             rank_mode = st.radio("排名方式 (可手動更改)", ["年級", "全校"], index=0 if is_fall else 1, horizontal=True)
+                            
+                            col_calc, col_refresh = st.columns([3, 1])
+                            if col_refresh.button("🔄 重新讀取資料", key="refresh_export", help="若有申訴剛核可，請先點此確保資料是最新的"):
+                                load_full_semester_data_for_export.clear()
+                                load_main_data.clear()
+                                st.success("✅ 資料已刷新！")
+                                st.rerun()
 
-                            if st.button("🚀 計算並顯示當週成績"):
+                            if col_calc.button("🚀 計算並顯示當週成績"):
                                 scored = calc_scores(full[full["週次"] == sel_week])
                                 fin = build_ranking(scored, full, structured_classes)
                                 by_grade = (rank_mode == "年級")
