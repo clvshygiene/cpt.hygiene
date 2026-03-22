@@ -225,6 +225,7 @@ try:
                     if tab_name == "service_hours": ws.append_row(["日期", "學號", "班級", "類別", "時數", "紀錄ID"])
                     if tab_name == "holidays": ws.append_row(["日期", "說明"])
                     if tab_name == "office_areas": ws.append_row(["區域名稱", "負責班級"])
+                    if tab_name == "published_results": ws.append_row(["週次", "排名", "年級", "班級", "總扣分", "優良次數", "總成績", "評等", "發布時間"])
                     return ws
             except Exception as e:
                 if "429" in str(e): 
@@ -671,10 +672,12 @@ try:
             # 讀取現有資料，刪除同一週次的舊資料
             existing = ws.get_all_values()
             if len(existing) > 1:
-                rows_to_delete = [i+1 for i, row in enumerate(existing[1:], 1)
+                # existing[0] 是 header，existing[1:] 是資料
+                # Google Sheets 是 1-indexed，header 是第 1 行，第一筆資料是第 2 行
+                rows_to_delete = [i + 2 for i, row in enumerate(existing[1:])
                                   if row and str(row[0]) == str(week_num)]
                 for ridx in sorted(rows_to_delete, reverse=True):
-                    ws.delete_rows(ridx + 1)  # +1 因為 header 佔第一行
+                    ws.delete_rows(ridx)
 
             # 寫入新資料
             now_str = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M")
