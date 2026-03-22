@@ -1097,50 +1097,101 @@ try:
 
                     if sel_cls:
                         st.divider()
+                        # 任務提醒：告知糾察目前負責的是內掃還是外掃
+                        if role == "內掃檢查":
+                            st.info("🏫 **今日任務：內掃檢查** — 請進入班級教室內部進行檢查")
+                        elif role == "外掃檢查":
+                            st.info("🏢 **今日任務：外掃檢查** — 請至負責大樓的外掃區域進行檢查")
+                        
                         if check_duplicate_record(main_df, input_date, inspector_name, role, sel_cls): st.warning(f"⚠️ 今日已評過 {sel_cls}！")
                         
                         with st.form("score_form", clear_on_submit=True):
-                            in_s, out_s, ph_c, note = 0, 0, 0, ""
-                            check_result = st.radio("檢查結果", ["⭐ 優良", "🙂 普通", "❌ 違規(需扣分)"], horizontal=True)
+                            in_s, out_s, ph_c, note, sel_violations = 0, 0, 0, "", []
+                            check_result = st.radio("檢查結果", ["⭐ 優良", "✅ 普通", "❌ 違規(需扣分)"], horizontal=True)
+
                             if check_result == "❌ 違規(需扣分)":
                                 if role == "內掃檢查":
-                                    in_s = st.number_input("內掃扣分", 0)
-                                    note = " ".join([x for x in [st.selectbox("區塊", ["", "走廊", "黑板", "地板"]), st.selectbox("狀況", ["", "髒亂", "沒拖地"]), st.text_input("補充")] if x])
-                                else:
-                                    out_s = st.number_input("外掃扣分", 0)
-                                    note = " ".join([x for x in [st.selectbox("區域", ["", "走廊", "樓梯", "廁所", "操場"]), st.selectbox("狀況", ["", "很髒", "沒掃"]), st.text_input("補充")] if x])
+                                    # ── 內掃扣分 ──────────────────────────
+                                    in_s = st.number_input("內掃扣分", min_value=0, step=1)
+                                    st.markdown("**📍 違規位置（可複選）**")
+                                    INNER_AREA_OPTIONS = ["走廊", "黑板", "地板", "窗戶(窗溝)", "陽台"]
+                                    sel_areas = st.multiselect("違規位置", INNER_AREA_OPTIONS, key="inner_areas")
+                                    st.markdown("**⚠️ 違規狀況（可複選）**")
+                                    INNER_STATUS_OPTIONS = ["髒亂", "沒拖地", "沒擦拭", "酒精未補", "掃具壞掉未換", "懸掛垃圾未清除", "人工垃圾", "蜘蛛網", "頭髮圈圈", "打掃玩手機"]
+                                    sel_violations = st.multiselect("違規狀況", INNER_STATUS_OPTIONS, key="inner_status")
+                                    extra_note = st.text_input("📝 其他補充（選填，找不到對應選項時請在此輸入）")
+                                    note_parts = []
+                                    if sel_areas: note_parts.append("位置：" + "、".join(sel_areas))
+                                    if sel_violations: note_parts.append("狀況：" + "、".join(sel_violations))
+                                    if extra_note: note_parts.append(extra_note)
+                                    note = " | ".join(note_parts)
+
+                                elif role == "外掃檢查":
+                                    # ── 外掃扣分 ──────────────────────────
+                                    out_s = st.number_input("外掃扣分", min_value=0, step=1)
+                                    st.markdown("**📍 違規位置**")
+                                    loc_col1, loc_col2 = st.columns(2)
+                                    BUILDING_OPTIONS = ["", "誠信樓A棟(各處室)", "誠信樓B棟", "樸實樓(合作社)", "勤學樓(烘焙縫紉)", "敬業樓(圖書館)"]
+                                    FLOOR_MAP = {
+                                        "誠信樓A棟(各處室)": ["", "1F", "2F", "3F", "4F", "5F", "6F"],
+                                        "誠信樓B棟":         ["", "1F", "2F", "3F", "4F", "5F", "6F"],
+                                        "樸實樓(合作社)":    ["", "1F", "2F", "3F", "4F", "5F"],
+                                        "勤學樓(烘焙縫紉)": ["", "1F", "2F", "3F", "4F", "5F"],
+                                        "敬業樓(圖書館)":   ["", "1F", "2F", "3F"],
+                                    }
+                                    sel_building = loc_col1.selectbox("大樓", BUILDING_OPTIONS)
+                                    floor_opts = FLOOR_MAP.get(sel_building, ["", "1F", "2F", "3F", "4F", "5F", "6F"])
+                                    sel_floor = loc_col2.selectbox("樓層", floor_opts)
+                                    st.markdown("**⚠️ 違規項目（可複選）**")
+                                    OUTER_AREA_OPTIONS = ["男廁", "女廁", "茶水間", "無障礙廁所", "樓梯間", "洗手台", "天花板", "走廊", "地板", "陽台"]
+                                    sel_violations = st.multiselect("違規項目", OUTER_AREA_OPTIONS, key="outer_areas")
+                                    st.markdown("**⚠️ 違規狀況（可複選）**")
+                                    OUTER_STATUS_OPTIONS = ["髒亂", "沒拖地", "沒掃地", "沒擦拭", "酒精未補", "掃具壞掉未換", "人工垃圾", "蜘蛛網", "頭髮圈圈", "打掃玩手機"]
+                                    sel_status = st.multiselect("違規狀況", OUTER_STATUS_OPTIONS, key="outer_status")
+                                    extra_note = st.text_input("📝 其他補充（選填，找不到對應選項時請在此輸入）")
+                                    note_parts = []
+                                    if sel_building: note_parts.append(sel_building)
+                                    if sel_floor: note_parts.append(sel_floor)
+                                    if sel_violations: note_parts.append("項目：" + "、".join(sel_violations))
+                                    if sel_status: note_parts.append("狀況：" + "、".join(sel_status))
+                                    if extra_note: note_parts.append(extra_note)
+                                    note = " | ".join(note_parts)
+                                    # 合併violations供違規細項欄位使用
+                                    sel_violations = sel_violations + sel_status
+
                             is_fix = st.checkbox("🚩 這是修正單")
-                            
-                            # [照片上傳] 強制從相簿選取，避免直接拍照導致照片消失
+
+                            # [照片上傳] 強制從相簿選取
                             st.info("📸 請先用手機相機拍好照片存到相簿，再從下方選取上傳。")
                             files = st.file_uploader("選取照片", accept_multiple_files=True, type=['jpg','png','jpeg'])
-                            
+
                             if st.form_submit_button("送出"):
                                 if time.time() - st.session_state.last_action_time < 5:
                                     st.warning("⚠️ 系統處理中，請稍候 5 秒再試！")
                                 else:
                                     st.session_state.last_action_time = time.time()
                                     if check_result == "⭐ 優良":
-                                        # 優良：記錄一筆扣分為0的優良紀錄
                                         if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(優良)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": "本次檢查表現優良，無扣分項目"}, uploaded_files=files if files else None, award_inspector_hours=is_last_task):
                                             st.success("⭐ 優良紀錄已登記！"); time.sleep(1.5); st.rerun()
-                                    elif check_result == "🙂 普通":
-                                        # 普通：記錄一筆扣分為0的普通紀錄
+                                    elif check_result == "✅ 普通":
                                         if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(普通)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": "本次檢查無扣分，表現普通"}, uploaded_files=files if files else None, award_inspector_hours=is_last_task):
                                             st.success("✅ 普通紀錄已登記！"); time.sleep(1.5); st.rerun()
-                                    elif (in_s + out_s) > 0 and not files:
-                                        st.error("扣分需照片")
-                                    else:
-                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note}, uploaded_files=files, award_inspector_hours=is_last_task):
-                                            if assigned_classes:
-                                                if is_last_task:
-                                                    st.success("✅ 送出成功！今日任務已全數完成，系統將自動核發 0.25 小時！")
+                                    elif check_result == "❌ 違規(需扣分)":
+                                        if (in_s + out_s) == 0:
+                                            st.error("❌ 選擇違規但扣分為 0，請填入扣分數值！")
+                                        elif not files:
+                                            st.error("❌ 扣分紀錄需要附上照片才能送出！")
+                                        else:
+                                            if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note, "違規細項": "、".join(sel_violations) if sel_violations else ""}, uploaded_files=files, award_inspector_hours=is_last_task):
+                                                if assigned_classes:
+                                                    if is_last_task:
+                                                        st.success("✅ 送出成功！今日任務已全數完成，系統將自動核發 0.25 小時！")
+                                                    else:
+                                                        st.success(f"✅ 送出成功！尚缺 {len(pending_classes)-1} 個班級，請繼續努力！")
                                                 else:
-                                                    st.success(f"✅ 送出成功！尚缺 {len(pending_classes)-1} 個班級，請繼續努力！")
-                                            else:
-                                                st.success("✅ 送出成功！系統將自動排程發放本日 0.25 小時。")
-                                            time.sleep(1.5)
-                                            st.rerun()
+                                                    st.success("✅ 送出成功！系統將自動排程發放本日 0.25 小時。")
+                                                time.sleep(1.5)
+                                                st.rerun()
 
     # --- Mode 2: 班級負責人 ---
     elif app_mode == "班級負責人🥸":
@@ -1874,6 +1925,7 @@ try:
                 if st.button("更新開學日"): save_setting("semester_start", str(nd))
                 
                 st.markdown("---")
+                st.write("📅 **週次手動對照表**（解決寒假跨週問題）")
                 st.write("📅 **週次手動對照表**（解決寒假跨週問題）")
                 st.caption("只需填「錨點」：每個學期重置點的週一日期與週次號碼，用逗號分隔。\n\n例如：`2025-01-23:1,2025-02-23:2`\n\n這樣填即可：第1週從1/23起，第2週從2/23起，第3週之後系統會自動從2/23往後每7天累計，不需要填完所有週次。")
                 curr_week_map = SYSTEM_CONFIG.get("week_map", "")
