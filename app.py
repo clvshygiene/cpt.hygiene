@@ -1173,6 +1173,31 @@ try:
             if not prefixes: st.warning("找不到糾察名單")
             else:
                 sel_p = st.radio("步驟 1：選擇開頭", [f"{p}開頭" for p in prefixes], horizontal=True, key="m1_p_radio")[0]
+                # 步驟2 套用三欄 CSS
+                st.markdown("""
+                <style>
+                div[data-testid="stRadio"][data-key="m1_name_radio"] div[role="radiogroup"] {
+                    display: grid !important;
+                    grid-template-columns: repeat(3, 1fr) !important;
+                    gap: 4px 12px !important;
+                }
+                div[data-testid="stRadio"][data-key="m1_name_radio"] div[role="radiogroup"] label {
+                    background: rgba(49,130,206,0.06);
+                    border: 1px solid #d0e4f7;
+                    border-radius: 8px;
+                    padding: 6px 10px !important;
+                    font-size: 13px !important;
+                    white-space: nowrap;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                }
+                div[data-testid="stRadio"][data-key="m1_name_radio"] div[role="radiogroup"] label:has(input:checked) {
+                    background: rgba(49,130,206,0.18) !important;
+                    border-color: #3182ce !important;
+                    font-weight: 600 !important;
+                }
+                </style>
+                """, unsafe_allow_html=True)
                 inspector_name = st.radio("步驟 2：點選身份", [p["label"] for p in INSPECTOR_LIST if p["id_prefix"] == sel_p], key="m1_name_radio")
                 curr_inspector = next((p for p in INSPECTOR_LIST if p["label"] == inspector_name), {})
                 allowed_roles = [r for r in curr_inspector.get("allowed_roles", ["內掃檢查"]) if r != "晨間打掃"] or ["內掃檢查"]
