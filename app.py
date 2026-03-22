@@ -1507,26 +1507,52 @@ try:
                     if tr == 0: tr = r['垃圾原始分']
                     return r['內掃原始分'] + r['外掃原始分'] + tr + r['晨間打掃原始分']
 
-                week_deduct = sum(_calc_tot(r) for _, r in week_df.iterrows()
-                                  if not any(x in str(r['評分項目']) for x in ["優良","普通"]) and str(r['修正']) != "TRUE") if not week_df.empty else 0
+                def _is_real_deduct(r):
+                    item = str(r['評分項目'])
+                    # 排除優良、普通、學期加分（晨掃），以及已修正紀錄
+                    return (not any(x in item for x in ["優良", "普通", "學期加分"])
+                            and str(r['修正']) != "TRUE")
+
+                def _is_bonus(r):
+                    # 學期加分紀錄（晨間打掃(學期加分)，分數為負）
+                    return "學期加分" in str(r['評分項目']) and _calc_tot(r) < 0
+
+                # 本週：只算正數扣分
+                week_deduct = sum(max(_calc_tot(r), 0) for _, r in week_df.iterrows()
+                                  if _is_real_deduct(r)) if not week_df.empty else 0
+                # 學期：扣分與加分分開
+                total_deduct = max(sum(max(_calc_tot(r), 0) for _, r in cls_df.iterrows() if _is_real_deduct(r)), 0)
+                total_bonus  = sum(abs(_calc_tot(r)) for _, r in cls_df.iterrows() if _is_bonus(r))
+
                 pending_appeals = sum(1 for rid in [str(r['紀錄ID']) for _, r in cls_df.iterrows()]
                                       if appeal_map.get(rid, {}).get("status") == "待處理")
 
                 mc1, mc2, mc3 = st.columns(3)
-                mc1.markdown(f"""<div style='background:#f0f7ff;border-radius:12px;padding:14px 16px;border-left:4px solid #3182ce'>
-                    <div style='font-size:12px;color:#555;margin-bottom:4px'>本週扣分</div>
-                    <div style='font-size:26px;font-weight:700;color:{"#e53e3e" if week_deduct>0 else "#38a169"}'>{week_deduct} 分</div>
-                </div>""", unsafe_allow_html=True)
-                mc2.markdown(f"""<div style='background:#f0f7ff;border-radius:12px;padding:14px 16px;border-left:4px solid #805ad5'>
-                    <div style='font-size:12px;color:#555;margin-bottom:4px'>待處理申訴</div>
-                    <div style='font-size:26px;font-weight:700;color:{"#d69e2e" if pending_appeals>0 else "#38a169"}'>{pending_appeals} 件</div>
-                </div>""", unsafe_allow_html=True)
-                total_deduct = sum(_calc_tot(r) for _, r in cls_df.iterrows()
-                                   if not any(x in str(r['評分項目']) for x in ["優良","普通"]) and str(r['修正']) != "TRUE")
-                mc3.markdown(f"""<div style='background:#f0f7ff;border-radius:12px;padding:14px 16px;border-left:4px solid #dd6b20'>
-                    <div style='font-size:12px;color:#555;margin-bottom:4px'>學期累計扣分</div>
-                    <div style='font-size:26px;font-weight:700;color:{"#e53e3e" if total_deduct>0 else "#38a169"}'>{total_deduct} 分</div>
-                </div>""", unsafe_allow_html=True)
+                mc1.markdown(
+                    f"<div style='background:#f0f7ff;border-radius:12px;padding:14px 16px;border-left:4px solid #3182ce'>"
+                    f"<div style='font-size:12px;color:#555;margin-bottom:4px'>本週扣分</div>"
+                    f"<div style='font-size:26px;font-weight:700;color:{'#e53e3e' if week_deduct>0 else '#38a169'}'>{week_deduct} 分</div>"
+                    f"</div>", unsafe_allow_html=True)
+                mc2.markdown(
+                    f"<div style='background:#f0f7ff;border-radius:12px;padding:14px 16px;border-left:4px solid #805ad5'>"
+                    f"<div style='font-size:12px;color:#555;margin-bottom:4px'>待處理申訴</div>"
+                    f"<div style='font-size:26px;font-weight:700;color:{'#d69e2e' if pending_appeals>0 else '#38a169'}'>{pending_appeals} 件</div>"
+                    f"</div>", unsafe_allow_html=True)
+                # 第三張卡片：有加分時同時顯示扣分與加分
+                if total_bonus > 0:
+                    mc3_content = (
+                        f"<div style='font-size:12px;color:#555;margin-bottom:4px'>學期扣分 / 加分</div>"
+                        f"<div style='font-size:22px;font-weight:700;color:#e53e3e'>{total_deduct} 分</div>"
+                        f"<div style='font-size:14px;font-weight:600;color:#38a169;margin-top:2px'>🌟 加分 {total_bonus} 分</div>"
+                    )
+                else:
+                    mc3_content = (
+                        f"<div style='font-size:12px;color:#555;margin-bottom:4px'>學期累計扣分</div>"
+                        f"<div style='font-size:26px;font-weight:700;color:{'#e53e3e' if total_deduct>0 else '#38a169'}'>{total_deduct} 分</div>"
+                    )
+                mc3.markdown(
+                    f"<div style='background:#f0f7ff;border-radius:12px;padding:14px 16px;border-left:4px solid #dd6b20'>"
+                    f"{mc3_content}</div>", unsafe_allow_html=True)
 
                 st.markdown("<div style='margin-top:16px'></div>", unsafe_allow_html=True)
 
@@ -1562,8 +1588,16 @@ try:
                                 card_color, border_color, tag_bg, tag_color, tag_text = "#f0fff4","#68d391","#c6f6d5","#276749","⭐ 優良"
                             elif is_normal:
                                 card_color, border_color, tag_bg, tag_color, tag_text = "#f7fafc","#a0aec0","#edf2f7","#4a5568","✅ 普通"
+                            elif "學期加分" in str(r['評分項目']):
+                                card_color, border_color, tag_bg, tag_color = "#f0fff4","#38a169","#c6f6d5","#276749"
+                                tag_text = f"🌟 學期加 {abs(tot)} 分"
                             else:
-                                card_color, border_color, tag_bg, tag_color, tag_text = "#fff5f5","#fc8181","#fed7d7","#9b2c2c", f"❌ 扣 {tot} 分"
+                                card_color, border_color, tag_bg, tag_color = "#fff5f5","#fc8181","#fed7d7","#9b2c2c"
+                                if tot < 0:
+                                    card_color, border_color, tag_bg, tag_color = "#f0fff4","#38a169","#c6f6d5","#276749"
+                                    tag_text = f"🌟 學期加 {abs(tot)} 分"
+                                else:
+                                    tag_text = f"❌ 扣 {tot} 分"
 
                             disp_time = str(r.get('登錄時間', ''))
                             date_str = str(r['日期'])
