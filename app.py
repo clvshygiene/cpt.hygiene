@@ -918,19 +918,19 @@ try:
         font-family: 'Noto Sans TC', sans-serif !important;
     }
 
-    /* ── 修正手機上 radio / checkbox / selectbox 文字顏色 ── */
-    .stRadio label p,
-    .stRadio label span,
-    [data-testid="stRadio"] label,
-    [data-testid="stRadio"] p,
-    .stCheckbox label p,
-    .stCheckbox label span,
-    [data-testid="stCheckbox"] label,
-    [data-testid="stSelectbox"] span,
-    [data-testid="stSelectbox"] p,
-    .stSelectbox label,
-    .stMarkdown p,
-    .stText p {
+    /* ── 修正手機上 radio / checkbox / selectbox 文字顏色（僅主內容區，不影響側邊欄）── */
+    .main .stRadio label p,
+    .main .stRadio label span,
+    .main [data-testid="stRadio"] label,
+    .main [data-testid="stRadio"] p,
+    .main .stCheckbox label p,
+    .main .stCheckbox label span,
+    .main [data-testid="stCheckbox"] label,
+    .main [data-testid="stSelectbox"] span,
+    .main [data-testid="stSelectbox"] p,
+    .main .stSelectbox label,
+    .main .stMarkdown p,
+    .main .stText p {
         color: #1a2a4a !important;
     }
 
