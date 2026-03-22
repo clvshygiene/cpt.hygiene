@@ -857,19 +857,166 @@ try:
             return max(0, ((d - start).days // 7) + 1)
         except: return 0
 
-    # ── 側邊欄樣式注入 ─────────────────────────────────────────
+    # ── 全域樣式注入 ─────────────────────────────────────────
     st.markdown("""
     <style>
-    /* 側邊欄背景 */
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap');
+
+    /* ── 全域字體 ── */
+    html, body, [class*="css"] {
+        font-family: 'Noto Sans TC', sans-serif !important;
+    }
+
+    /* ── 主內容區背景 ── */
+    .stApp {
+        background: #f0f4f9;
+    }
+    [data-testid="stAppViewContainer"] > .main {
+        background: #f0f4f9;
+    }
+
+    /* ── 主內容區塊加陰影卡片感 ── */
+    [data-testid="stVerticalBlock"] > div > [data-testid="stVerticalBlock"] {
+        background: white;
+        border-radius: 16px;
+        padding: 4px 0;
+    }
+
+    /* ── 頁面標題 h1 ── */
+    h1 {
+        color: #1a2a4a !important;
+        font-weight: 700 !important;
+        font-size: 26px !important;
+        border-left: 5px solid #3182ce;
+        padding-left: 12px !important;
+        margin-bottom: 20px !important;
+    }
+    h2 { color: #2c3e6b !important; font-weight: 600 !important; }
+    h3 { color: #2c4a8a !important; }
+
+    /* ── 所有按鈕 ── */
+    .stButton > button {
+        border-radius: 10px !important;
+        font-weight: 600 !important;
+        font-size: 14px !important;
+        padding: 8px 18px !important;
+        border: none !important;
+        background: linear-gradient(135deg, #2b6cb0, #3182ce) !important;
+        color: white !important;
+        box-shadow: 0 2px 8px rgba(49,130,206,0.35) !important;
+        transition: all 0.2s ease !important;
+    }
+    .stButton > button:hover {
+        background: linear-gradient(135deg, #1a4a8a, #2b6cb0) !important;
+        box-shadow: 0 4px 14px rgba(49,130,206,0.45) !important;
+        transform: translateY(-1px) !important;
+    }
+    .stButton > button:active { transform: translateY(0px) !important; }
+
+    /* ── 下載按鈕特別用綠色 ── */
+    [data-testid="stDownloadButton"] > button {
+        background: linear-gradient(135deg, #276749, #38a169) !important;
+        box-shadow: 0 2px 8px rgba(56,161,105,0.35) !important;
+    }
+    [data-testid="stDownloadButton"] > button:hover {
+        background: linear-gradient(135deg, #1c4f37, #276749) !important;
+    }
+
+    /* ── 表單送出按鈕 ── */
+    [data-testid="stFormSubmitButton"] > button {
+        width: 100% !important;
+        background: linear-gradient(135deg, #553c9a, #6b46c1) !important;
+        box-shadow: 0 2px 8px rgba(107,70,193,0.35) !important;
+        font-size: 16px !important;
+        padding: 12px !important;
+    }
+    [data-testid="stFormSubmitButton"] > button:hover {
+        background: linear-gradient(135deg, #44337a, #553c9a) !important;
+    }
+
+    /* ── input / selectbox / text_area ── */
+    .stTextInput > div > div > input,
+    .stTextArea > div > div > textarea,
+    .stNumberInput > div > div > input {
+        border-radius: 8px !important;
+        border: 1.5px solid #c9d7e8 !important;
+        background: #fafcff !important;
+        font-size: 14px !important;
+        transition: border 0.2s;
+    }
+    .stTextInput > div > div > input:focus,
+    .stTextArea > div > div > textarea:focus {
+        border-color: #3182ce !important;
+        box-shadow: 0 0 0 3px rgba(49,130,206,0.15) !important;
+    }
+
+    /* ── selectbox ── */
+    [data-testid="stSelectbox"] > div > div {
+        border-radius: 8px !important;
+        border: 1.5px solid #c9d7e8 !important;
+        background: #fafcff !important;
+    }
+
+    /* ── info / warning / error / success 提示框 ── */
+    [data-testid="stAlert"] {
+        border-radius: 10px !important;
+        border-left-width: 5px !important;
+        font-size: 14px !important;
+    }
+
+    /* ── expander ── */
+    [data-testid="stExpander"] {
+        border: 1.5px solid #d8e4f0 !important;
+        border-radius: 12px !important;
+        background: white !important;
+        box-shadow: 0 1px 6px rgba(0,0,0,0.06) !important;
+    }
+    [data-testid="stExpander"] summary {
+        font-weight: 600 !important;
+        font-size: 15px !important;
+        color: #1a2a4a !important;
+        padding: 12px 16px !important;
+    }
+
+    /* ── container border ── */
+    [data-testid="stVerticalBlockBorderWrapper"] {
+        border: 1.5px solid #d8e4f0 !important;
+        border-radius: 14px !important;
+        background: white !important;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.05) !important;
+        padding: 12px !important;
+    }
+
+    /* ── dataframe / table ── */
+    [data-testid="stDataFrame"] {
+        border-radius: 10px !important;
+        overflow: hidden !important;
+        box-shadow: 0 1px 8px rgba(0,0,0,0.07) !important;
+    }
+
+    /* ── tabs ── */
+    [data-testid="stTabs"] [role="tab"] {
+        font-weight: 600 !important;
+        font-size: 14px !important;
+        border-radius: 8px 8px 0 0 !important;
+        padding: 8px 16px !important;
+    }
+    [data-testid="stTabs"] [role="tab"][aria-selected="true"] {
+        color: #2b6cb0 !important;
+        border-bottom: 3px solid #3182ce !important;
+    }
+
+    /* ── divider ── */
+    hr { border-color: #d8e4f0 !important; margin: 16px 0 !important; }
+
+    /* ══════════════════════════════
+       側邊欄
+    ══════════════════════════════ */
     [data-testid="stSidebar"] {
-        background: linear-gradient(160deg, #1a2a4a 0%, #0d1b35 100%);
+        background: linear-gradient(160deg, #1a2a4a 0%, #0d1b35 100%) !important;
     }
     [data-testid="stSidebar"] * { color: #e8edf5 !important; }
-
-    /* 隱藏預設的 radio label 文字「請選擇模式」*/
     [data-testid="stSidebar"] .stRadio > label { display: none; }
-
-    /* 讓每個 radio 選項變成獨立按鈕卡片 */
     [data-testid="stSidebar"] .stRadio div[role="radiogroup"] {
         display: flex; flex-direction: column; gap: 6px; margin-top: 4px;
     }
@@ -889,26 +1036,21 @@ try:
         border-color: rgba(255,255,255,0.3);
         transform: translateX(3px);
     }
-    /* 選中狀態 */
     [data-testid="stSidebar"] .stRadio div[role="radiogroup"] label:has(input:checked) {
-        background: rgba(99, 179, 237, 0.25);
+        background: rgba(99,179,237,0.25);
         border-color: #63b3ed;
         color: #ffffff !important;
     }
-    /* 隱藏原本的圓形 radio 點 */
     [data-testid="stSidebar"] .stRadio input[type="radio"] { display: none; }
-
-    /* 側邊欄標題區塊 */
     [data-testid="stSidebar"] h1 {
-        font-size: 20px !important;
-        font-weight: 700 !important;
+        font-size: 20px !important; font-weight: 700 !important;
         color: #ffffff !important;
         padding-bottom: 8px;
         border-bottom: 1px solid rgba(255,255,255,0.15);
         margin-bottom: 14px !important;
+        border-left: none !important;
+        padding-left: 0 !important;
     }
-
-    /* 底部版本資訊 */
     .sidebar-footer {
         position: fixed; bottom: 20px; left: 0;
         width: 240px; text-align: center;
