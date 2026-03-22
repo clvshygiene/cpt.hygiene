@@ -40,11 +40,11 @@ sys_env = st.secrets.get("ENV", "PROD")
 # [V5.31 Patch 1] 確保 set_page_config 是第一個執行的指令
 
 if sys_env == "DEV":
-st.set_page_config(page_title="🔧測試版-中壢家商，衛愛而生”, layout="wide”, page_icon="🧹”)
-st.sidebar.info(f”🕵️‍♀️ 系統目前抓到的身分證是：[{sys_env}]”)
-st.warning("🚧 **目前位於 DEV 測試環境！** 在這裡送出的資料僅供測試，不會影響正式成績。”)
+st.set_page_config(page_title="🔧測試版-中壢家商，衛愛而生", layout="wide", page_icon="🧹")
+st.sidebar.info(f"🕵️‍♀️ 系統目前抓到的身分證是：[{sys_env}]")
+st.warning("🚧 **目前位於 DEV 測試環境！** 在這裡送出的資料僅供測試，不會影響正式成績。")
 else:
-st.set_page_config(page_title="中壢家商，衛愛而生”, layout="wide”, page_icon="🧹”)
+st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
 
 # — 2. 核心參數與全域設定 —
 
@@ -52,8 +52,8 @@ try:
 TW_TZ = pytz.timezone(‘Asia/Taipei’)
 MAX_IMAGE_BYTES = 20 * 1024 * 1024  
 UPLOAD_SEM = threading.BoundedSemaphore(4)
-QUEUE_DB_PATH = "task_queue_v4_wal.db”
-IMG_DIR = "evidence_photos”
+QUEUE_DB_PATH = "task_queue_v4_wal.db"
+IMG_DIR = "evidence_photos"
 os.makedirs(IMG_DIR, exist_ok=True)
 
 ```
@@ -2528,5 +2528,5 @@ elif app_mode == "組長ㄉ窩💃":
 ```
 
 except Exception as e:
-st.error(f”❌ 系統發生錯誤: {str(e)}”)
+st.error(f"❌ 系統發生錯誤: {str(e)}")
 st.code(traceback.format_exc())
