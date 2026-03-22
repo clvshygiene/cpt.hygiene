@@ -1552,7 +1552,8 @@ try:
 
                             # 決定卡片顏色
                             if ap_st == "已核可" or is_corrected:
-                                card_color, border_color, tag_bg, tag_color, tag_text = "#f0fff4","#38a169","#c6f6d5","#276749","✅ 申訴成功" if ap_st=="已核可" else "🛠️ 已修正"
+                                card_color, border_color, tag_bg, tag_color = "#f0fff4","#38a169","#c6f6d5","#276749"
+                                tag_text = "✅ 申訴成功" if ap_st == "已核可" else "🛠️ 已修正"
                             elif ap_st == "已駁回":
                                 card_color, border_color, tag_bg, tag_color, tag_text = "#fff5f5","#fc8181","#fed7d7","#9b2c2c","🚫 申訴駁回"
                             elif ap_st == "待處理":
@@ -1562,25 +1563,31 @@ try:
                             elif is_normal:
                                 card_color, border_color, tag_bg, tag_color, tag_text = "#f7fafc","#a0aec0","#edf2f7","#4a5568","✅ 普通"
                             else:
-                                card_color, border_color, tag_bg, tag_color, tag_text = "#fff5f5","#fc8181","#fed7d7","#9b2c2c",f"❌ 扣 {tot} 分"
+                                card_color, border_color, tag_bg, tag_color, tag_text = "#fff5f5","#fc8181","#fed7d7","#9b2c2c", f"❌ 扣 {tot} 分"
 
                             disp_time = str(r.get('登錄時間', ''))
                             date_str = str(r['日期'])
                             week_str = f"第{r.get('週次','')}週"
 
-                            st.markdown(f"""
-                            <div style='background:{card_color};border:1.5px solid {border_color};border-radius:12px;padding:12px 16px;margin-bottom:10px'>
-                                <div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px'>
-                                    <div style='font-weight:600;font-size:15px'>{date_str} <span style='color:#718096;font-size:13px'>{week_str}</span></div>
-                                    <span style='background:{tag_bg};color:{tag_color};border-radius:20px;padding:3px 12px;font-size:13px;font-weight:600'>{tag_text}</span>
-                                </div>
-                                <div style='font-size:13px;color:#4a5568;margin-top:6px'>
-                                    🧑‍✈️ {r.get('檢查人員','未知')} &nbsp;|&nbsp; 📌 {r['評分項目']}
-                                    {"&nbsp;|&nbsp; 📝 " + str(r['備註']) if str(r.get('備註','')).strip() else ""}
-                                </div>
-                                {f'<div style="font-size:12px;color:#718096;margin-top:4px">登錄：{disp_time}</div>' if disp_time else ""}
-                            </div>
-                            """, unsafe_allow_html=True)
+                            # [關鍵修正] 預先組好所有動態欄位，避免巢狀 f-string 破壞 HTML 結構
+                            import html as _html
+                            inspector_safe = _html.escape(str(r.get('檢查人員', '未知')))
+                            item_safe      = _html.escape(str(r['評分項目']))
+                            note_raw       = str(r.get('備註', '')).strip()
+                            note_part      = f"&nbsp;|&nbsp; 📝 {_html.escape(note_raw)}" if note_raw else ""
+                            time_part      = f'<div style="font-size:12px;color:#718096;margin-top:4px">登錄：{_html.escape(disp_time)}</div>' if disp_time else ""
+
+                            st.markdown(
+                                f"<div style='background:{card_color};border:1.5px solid {border_color};border-radius:12px;padding:12px 16px;margin-bottom:10px'>"
+                                f"<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px'>"
+                                f"<div style='font-weight:600;font-size:15px'>{date_str} <span style='color:#718096;font-size:13px'>{week_str}</span></div>"
+                                f"<span style='background:{tag_bg};color:{tag_color};border-radius:20px;padding:3px 12px;font-size:13px;font-weight:600'>{tag_text}</span>"
+                                f"</div>"
+                                f"<div style='font-size:13px;color:#4a5568;margin-top:6px'>🧑‍✈️ {inspector_safe} &nbsp;|&nbsp; 📌 {item_safe}{note_part}</div>"
+                                f"{time_part}"
+                                f"</div>",
+                                unsafe_allow_html=True
+                            )
 
                             # 申訴回覆
                             if ap_st == "已核可":
