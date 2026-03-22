@@ -2182,8 +2182,9 @@ try:
                                 st.rerun()
 
                             if col_calc.button("🚀 計算並顯示當週成績"):
-                                scored = calc_scores(full[full["週次"] == sel_week])
-                                fin = build_ranking(scored, full, structured_classes)
+                                week_raw = full[full["週次"] == sel_week]  # 當週原始資料
+                                scored = calc_scores(week_raw)
+                                fin = build_ranking(scored, week_raw, structured_classes)  # 優良次數只算當週
                                 by_grade = (rank_mode == "年級")
                                 fin_ranked = add_rank_and_label(fin, by_grade=by_grade)
                                 detail = build_detail(scored)
