@@ -35,7 +35,7 @@ NOTION_INSTALLED = False
 
 # 透過 Streamlit Secrets 判斷目前是測試區還是正式區 (預設為正式區)
 
-sys_env = st.secrets.get(“ENV”, “PROD”)
+sys_env = st.secrets.get("ENV", "PROD")
 
 # [V5.31 Patch 1] 確保 set_page_config 是第一個執行的指令
 
