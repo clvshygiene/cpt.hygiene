@@ -393,6 +393,14 @@ try:
         def _action():
             ws = get_worksheet(SHEET_TABS["main"])
             if not ws: return
+            # [防重複寫入] 先比對紀錄ID，若已存在則跳過，避免連續上傳兩筆
+            try:
+                existing_ids = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
+                if str(entry.get("紀錄ID", "")) in existing_ids:
+                    print(f"[DEDUP] 紀錄ID {entry.get('紀錄ID')} 已存在，跳過寫入")
+                    return
+            except Exception as e:
+                print(f"[DEDUP] 防重複檢查失敗，繼續寫入: {e}")
             row = [str(entry.get(col, "")).upper() if isinstance(entry.get(col, ""), bool) else str(entry.get(col, "")) for col in EXPECTED_COLUMNS]
             ws.append_row(row)
         execute_with_retry(_action)
@@ -818,8 +826,29 @@ try:
     
     def get_week_num(d):
         try:
-            start = datetime.strptime(SYSTEM_CONFIG["semester_start"], "%Y-%m-%d").date()
             if isinstance(d, datetime): d = d.date()
+            # [週次對照表] 優先使用 settings 裡的 week_map 手動對照（格式：2025-01-23:1,2025-02-23:2,...）
+            week_map_str = SYSTEM_CONFIG.get("week_map", "")
+            if week_map_str.strip():
+                entries = []
+                for item in week_map_str.split(","):
+                    item = item.strip()
+                    if ":" in item:
+                        date_str, wn = item.rsplit(":", 1)
+                        try:
+                            entries.append((datetime.strptime(date_str.strip(), "%Y-%m-%d").date(), int(wn.strip())))
+                        except: pass
+                if entries:
+                    entries.sort(key=lambda x: x[0])
+                    matched_week = 0
+                    for start_date, wn in entries:
+                        if d >= start_date:
+                            matched_week = wn
+                        else:
+                            break
+                    return matched_week if matched_week > 0 else 0
+            # fallback：純數學計算
+            start = datetime.strptime(SYSTEM_CONFIG["semester_start"], "%Y-%m-%d").date()
             return max(0, ((d - start).days // 7) + 1)
         except: return 0
 
@@ -1067,7 +1096,8 @@ try:
                         
                         with st.form("score_form", clear_on_submit=True):
                             in_s, out_s, ph_c, note = 0, 0, 0, ""
-                            if st.radio("檢查結果", ["❌ 違規", "✨ 乾淨"], horizontal=True) == "❌ 違規":
+                            check_result = st.radio("檢查結果", ["✨ 乾淨(優良)", "❌ 違規"], horizontal=True)
+                            if check_result == "❌ 違規":
                                 if role == "內掃檢查":
                                     in_s = st.number_input("內掃扣分", 0)
                                     note = " ".join([x for x in [st.selectbox("區塊", ["", "走廊", "黑板", "地板"]), st.selectbox("狀況", ["", "髒亂", "沒拖地"]), st.text_input("補充")] if x])
@@ -1075,14 +1105,25 @@ try:
                                     out_s = st.number_input("外掃扣分", 0)
                                     note = " ".join([x for x in [st.selectbox("區域", ["", "走廊", "樓梯", "廁所", "操場"]), st.selectbox("狀況", ["", "很髒", "沒掃"]), st.text_input("補充")] if x])
                             is_fix = st.checkbox("🚩 這是修正單")
-                            files = st.file_uploader("📸 違規照片", accept_multiple_files=True)
+                            
+                            # [照片上傳] 提供相簿選取或直接拍照兩種方式
+                            upload_method = st.radio("照片上傳方式", ["📁 從相簿/檔案選取", "📷 直接拍照（不怕照片消失）"], horizontal=True, key="m1_upload_method")
+                            if upload_method == "📷 直接拍照（不怕照片消失）":
+                                cam_img = st.camera_input("拍攝現場照片")
+                                files = [cam_img] if cam_img else []
+                            else:
+                                files = st.file_uploader("📸 違規照片", accept_multiple_files=True)
                             
                             if st.form_submit_button("送出"):
-                                if time.time() - st.session_state.last_action_time < 3:
-                                    st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                                if time.time() - st.session_state.last_action_time < 5:
+                                    st.warning("⚠️ 系統處理中，請稍候 5 秒再試！")
                                 else:
                                     st.session_state.last_action_time = time.time()
-                                    if (in_s + out_s) > 0 and not files: 
+                                    if check_result == "✨ 乾淨(優良)":
+                                        # 優良：記錄一筆扣分為0的優良紀錄
+                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(優良)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": "本次檢查表現優良，無扣分項目"}, uploaded_files=files if files else None, award_inspector_hours=is_last_task):
+                                            st.success("⭐ 優良紀錄已登記！"); time.sleep(1.5); st.rerun()
+                                    elif (in_s + out_s) > 0 and not files:
                                         st.error("扣分需照片")
                                     else:
                                         # 傳遞 award_inspector_hours 參數，控制背景發放時數
@@ -1124,7 +1165,7 @@ try:
                     disp_time = str(r.get('登錄時間', ''))
                     time_str = disp_time.split(' ')[-1] if disp_time else ''
                     
-                    score_disp = f"加 {abs(tot)} 分 (學期)" if tot < 0 else f"扣: {tot}"
+                    score_disp = "⭐ 優良 (無扣分)" if "優良" in str(r['評分項目']) else (f"加 {abs(tot)} 分 (學期)" if tot < 0 else f"扣: {tot}")
                     
                     with st.expander(f"{icon} {r['日期']} {time_str} - {r['評分項目']} ({score_disp})"):
                         st.caption(f"登錄時間：{disp_time if disp_time else '未紀錄'}") 
@@ -1516,6 +1557,8 @@ try:
                             
                             if st.button("🚀 計算當週成績"):
                                 week_df = full[full["週次"] == sel_week].copy()
+                                # 優良紀錄不計入扣分
+                                week_df = week_df[~week_df["評分項目"].astype(str).str.contains("優良")]
                                 week_df["內掃結算"] = week_df["內掃原始分"].clip(upper=2)
                                 week_df["外掃結算"] = week_df["外掃原始分"].clip(upper=2)
                                 trash_total = week_df["垃圾內掃原始分"] + week_df["垃圾外掃原始分"]
@@ -1530,37 +1573,60 @@ try:
                                 fin = pd.merge(cls_df, rep, on="班級", how="left").fillna(0)
                                 fin["總成績"] = 90 - fin["總扣分"]
                                 
-                                if rank_mode == "全校": st.dataframe(fin.sort_values("總成績", ascending=False))
+                                def get_week_grade_label(s):
+                                    if s == 0: return "⭐ 優良"
+                                    elif s <= 3: return "✅ 普通"
+                                    else: return "⚠️ 需加強"
+                                fin["評等"] = fin["總扣分"].apply(get_week_grade_label)
+                                
+                                if rank_mode == "全校":
+                                    fin_sorted = fin.sort_values("總成績", ascending=False).reset_index(drop=True)
+                                    fin_sorted.insert(0, "排名", range(1, len(fin_sorted) + 1))
+                                    st.dataframe(fin_sorted[["排名", "年級", "班級", "總扣分", "總成績", "評等"]], hide_index=True)
                                 else:
                                     for g in sorted(fin["年級"].unique()):
-                                        if g != "其他": 
+                                        if g != "其他":
                                             st.write(f"#### {g} 排名")
-                                            st.dataframe(fin[fin["年級"]==g].sort_values("總成績", ascending=False))
+                                            g_df = fin[fin["年級"]==g].sort_values("總成績", ascending=False).reset_index(drop=True).copy()
+                                            g_df.insert(0, "排名", range(1, len(g_df) + 1))
+                                            st.dataframe(g_df[["排名", "班級", "總扣分", "總成績", "評等"]], hide_index=True)
                     
                     with tab_semester:
                         st.write("計算全學期累計總扣分與總成績")
                         sem_rank_mode = st.radio("學期排名方式", ["全校", "年級"], horizontal=True, key="sem_rank")
                         
                         if st.button("🚀 計算全學期成績", key="sem_btn"):
-                            full["內掃結算"] = full["內掃原始分"].clip(upper=2)
-                            full["外掃結算"] = full["外掃原始分"].clip(upper=2)
-                            trash_total = full["垃圾內掃原始分"] + full["垃圾外掃原始分"]
-                            trash_total = trash_total.where(trash_total > 0, full["垃圾原始分"])
-                            full["垃圾結算"] = trash_total.clip(upper=2)
+                            full_calc = full[~full["評分項目"].astype(str).str.contains("優良")].copy()
+                            full_calc["內掃結算"] = full_calc["內掃原始分"].clip(upper=2)
+                            full_calc["外掃結算"] = full_calc["外掃原始分"].clip(upper=2)
+                            trash_total = full_calc["垃圾內掃原始分"] + full_calc["垃圾外掃原始分"]
+                            trash_total = trash_total.where(trash_total > 0, full_calc["垃圾原始分"])
+                            full_calc["垃圾結算"] = trash_total.clip(upper=2)
                             
-                            full["總扣分"] = full["內掃結算"]+full["外掃結算"]+full["垃圾結算"]+full["晨間打掃原始分"]+full["手機人數"]
-                            rep = full.groupby("班級")["總扣分"].sum().reset_index()
+                            full_calc["總扣分"] = full_calc["內掃結算"]+full_calc["外掃結算"]+full_calc["垃圾結算"]+full_calc["晨間打掃原始分"]+full_calc["手機人數"]
+                            rep = full_calc.groupby("班級")["總扣分"].sum().reset_index()
                             cls_df = pd.DataFrame(structured_classes).rename(columns={"grade":"年級","name":"班級"})
                             fin = pd.merge(cls_df, rep, on="班級", how="left").fillna(0)
                             
-                            fin["總成績"] = 90 - fin["總扣分"] 
+                            fin["總成績"] = 90 - fin["總扣分"]
                             
-                            if sem_rank_mode == "全校": st.dataframe(fin.sort_values("總成績", ascending=False))
+                            def get_sem_grade_label(s):
+                                if s == 0: return "⭐ 優良"
+                                elif s <= 10: return "✅ 普通"
+                                else: return "⚠️ 需加強"
+                            fin["評等"] = fin["總扣分"].apply(get_sem_grade_label)
+                            
+                            if sem_rank_mode == "全校":
+                                fin_sorted = fin.sort_values("總成績", ascending=False).reset_index(drop=True)
+                                fin_sorted.insert(0, "排名", range(1, len(fin_sorted) + 1))
+                                st.dataframe(fin_sorted[["排名", "年級", "班級", "總扣分", "總成績", "評等"]], hide_index=True)
                             else:
                                 for g in sorted(fin["年級"].unique()):
-                                    if g != "其他": 
+                                    if g != "其他":
                                         st.write(f"#### {g}")
-                                        st.dataframe(fin[fin["年級"]==g].sort_values("總成績", ascending=False))
+                                        g_df = fin[fin["年級"]==g].sort_values("總成績", ascending=False).reset_index(drop=True).copy()
+                                        g_df.insert(0, "排名", range(1, len(g_df) + 1))
+                                        st.dataframe(g_df[["排名", "班級", "總扣分", "總成績", "評等"]], hide_index=True)
             with t1:
                 # [V5.29 Patch] 本週晨掃進度追蹤 (含過去缺交)
                 st.subheader("🕵️‍♀️ 晨掃進度追蹤 (本週)")
@@ -1712,6 +1778,15 @@ try:
                 curr = SYSTEM_CONFIG.get("semester_start")
                 nd = st.date_input("開學日", datetime.strptime(curr, "%Y-%m-%d").date() if curr else today_tw)
                 if st.button("更新開學日"): save_setting("semester_start", str(nd))
+                
+                st.markdown("---")
+                st.write("📅 **週次手動對照表**（解決寒假跨週問題）")
+                st.caption("格式：每週一日期:週次號碼，用逗號分隔。例如：2025-01-23:1,2025-02-23:2,2025-03-02:3\n填入後，系統會依此對照計算週次，不再用純數學計算。留空則回到自動計算模式。")
+                curr_week_map = SYSTEM_CONFIG.get("week_map", "")
+                new_week_map = st.text_area("週次對照表", value=curr_week_map, placeholder="2025-01-23:1,2025-02-23:2,2025-03-02:3,...")
+                if st.button("💾 儲存週次對照表"):
+                    if save_setting("week_map", new_week_map.strip()):
+                        st.success("✅ 週次對照表已更新！")
                 
                 st.markdown("---")
                 st.write("📢 晨掃志工每日廣播/任務")
