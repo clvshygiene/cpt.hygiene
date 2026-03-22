@@ -751,7 +751,10 @@ try:
     def check_duplicate_record(df, check_date, inspector, role, target_class=None):
         if df.empty: return False
         try:
-            mask = (df["日期"].astype(str) == str(check_date)) & (df["檢查人員"] == inspector) & (df["評分項目"] == role)
+            # 同時比對原始 role、以及加了(優良)/(普通) 的變體，避免重複評分
+            mask = (df["日期"].astype(str) == str(check_date)) & \
+                   (df["檢查人員"] == inspector) & \
+                   (df["評分項目"].astype(str).str.startswith(role))
             if target_class: mask &= (df["班級"] == target_class)
             return not df[mask].empty
         except: return False
@@ -1281,19 +1284,21 @@ try:
                         # [即時進度] 用 session_state 補足背景非同步的延遲
                         if "submitted_inspections" not in st.session_state:
                             st.session_state.submitted_inspections = set()
-                        completed_records = main_df[(main_df["日期"].astype(str) == str(input_date)) & (main_df["檢查人員"] == inspector_name)]["班級"].tolist()
-                        completed_classes = set(completed_records) | {
-                            c for c in st.session_state.submitted_inspections
-                            if c.startswith(f"{input_date}__{inspector_name}__")
-                            and c.split("__")[2] in assigned_classes
-                        }
-                        # 統一清出班級名稱
-                        completed_class_names = set()
-                        for item in completed_classes:
-                            if "__" in str(item):
-                                completed_class_names.add(item.split("__")[2])
-                            else:
-                                completed_class_names.add(item)
+
+                        # 從 Google Sheet 讀到的已完成班級（字串，直接是班級名稱）
+                        sheet_done = set(
+                            main_df[
+                                (main_df["日期"].astype(str) == str(input_date)) &
+                                (main_df["檢查人員"] == inspector_name)
+                            ]["班級"].astype(str).tolist()
+                        )
+                        # 從 session_state 讀到的本地已送出班級（格式：日期__糾察名__班級）
+                        local_done = set(
+                            key.split("__")[2]
+                            for key in st.session_state.submitted_inspections
+                            if key.startswith(f"{input_date}__{inspector_name}__")
+                        )
+                        completed_class_names = sheet_done | local_done
                         pending_classes = [c for c in assigned_classes if c not in completed_class_names]
 
                         # 合併「任務類型 + 進度」為同一個框
@@ -2113,7 +2118,9 @@ try:
                                 ridx = id_list.index(str(record_id)) + 1
                                 ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, score_val)
                                 ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, eval_label)
-                                old_note = str(df.loc[df["紀錄ID"].astype(str)==str(record_id), "備註"].iloc[0]) if not df.loc[df["紀錄ID"].astype(str)==str(record_id)].empty else ""
+                                # [Fix③] 明確使用 main_df，不依賴外層 df 變數
+                                matched = main_df.loc[main_df["紀錄ID"].astype(str) == str(record_id), "備註"]
+                                old_note = str(matched.iloc[0]) if not matched.empty else ""
                                 new_note = f"{old_note} \n組長回覆: {reply}" if reply else f"{old_note} \n組長核可: {note_text}"
                                 ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
                                 st.session_state.approved_morning_ids.add(str(record_id))
