@@ -1173,32 +1173,39 @@ try:
             if not prefixes: st.warning("找不到糾察名單")
             else:
                 sel_p = st.radio("步驟 1：選擇開頭", [f"{p}開頭" for p in prefixes], horizontal=True, key="m1_p_radio")[0]
-                # 步驟2 套用三欄 CSS
-                st.markdown("""
-                <style>
-                div[data-testid="stRadio"][data-key="m1_name_radio"] div[role="radiogroup"] {
-                    display: grid !important;
-                    grid-template-columns: repeat(3, 1fr) !important;
-                    gap: 4px 12px !important;
-                }
-                div[data-testid="stRadio"][data-key="m1_name_radio"] div[role="radiogroup"] label {
-                    background: rgba(49,130,206,0.06);
-                    border: 1px solid #d0e4f7;
-                    border-radius: 8px;
-                    padding: 6px 10px !important;
-                    font-size: 13px !important;
-                    white-space: nowrap;
-                    overflow: hidden;
-                    text-overflow: ellipsis;
-                }
-                div[data-testid="stRadio"][data-key="m1_name_radio"] div[role="radiogroup"] label:has(input:checked) {
-                    background: rgba(49,130,206,0.18) !important;
-                    border-color: #3182ce !important;
-                    font-weight: 600 !important;
-                }
-                </style>
-                """, unsafe_allow_html=True)
-                inspector_name = st.radio("步驟 2：點選身份", [p["label"] for p in INSPECTOR_LIST if p["id_prefix"] == sel_p], key="m1_name_radio")
+                
+                filtered_inspectors = [p["label"] for p in INSPECTOR_LIST if p["id_prefix"] == sel_p]
+                st.markdown("**步驟 2：點選身份**")
+                
+                # 分成三欄顯示，避免清單過長
+                n = len(filtered_inspectors)
+                col_size = (n + 2) // 3  # 每欄最多幾個
+                cols = st.columns(3)
+                inspector_name = None
+                
+                # 用 session_state 記住目前選中的值
+                if "m1_inspector_selected" not in st.session_state:
+                    st.session_state.m1_inspector_selected = filtered_inspectors[0] if filtered_inspectors else None
+                # 切換開頭時重置選擇
+                if st.session_state.m1_inspector_selected not in filtered_inspectors:
+                    st.session_state.m1_inspector_selected = filtered_inspectors[0] if filtered_inspectors else None
+
+                for col_idx, col in enumerate(cols):
+                    chunk = filtered_inspectors[col_idx * col_size : (col_idx + 1) * col_size]
+                    for name in chunk:
+                        if col.button(
+                            name,
+                            key=f"insp_btn_{name}",
+                            type="primary" if st.session_state.m1_inspector_selected == name else "secondary",
+                            use_container_width=True
+                        ):
+                            st.session_state.m1_inspector_selected = name
+                            st.rerun()
+                
+                inspector_name = st.session_state.m1_inspector_selected or (filtered_inspectors[0] if filtered_inspectors else "")
+                if inspector_name:
+                    st.caption(f"目前選擇：**{inspector_name}**")
+
                 curr_inspector = next((p for p in INSPECTOR_LIST if p["label"] == inspector_name), {})
                 allowed_roles = [r for r in curr_inspector.get("allowed_roles", ["內掃檢查"]) if r != "晨間打掃"] or ["內掃檢查"]
                 
