@@ -58,7 +58,7 @@ try:
         "main": "main_data", "settings": "settings", "roster": "roster",
         "inspectors": "inspectors", "duty": "duty",
         "appeals": "appeals", "holidays": "holidays", "service_hours": "service_hours",
-        "office_areas": "office_areas"
+        "office_areas": "office_areas", "published_results": "published_results"
     }
 
     EXPECTED_COLUMNS = [
@@ -545,7 +545,7 @@ try:
             if current_date.weekday() < 5 and current_date not in holidays: workdays += 1
         return today <= current_date
 
-    @st.cache_data(ttl=360)
+    @st.cache_data(ttl=600)   # [效能] 10分鐘，降低尖峰 API 請求頻率
     def load_main_data():
         ws = get_worksheet(SHEET_TABS["main"])
         if not ws: return pd.DataFrame(columns=EXPECTED_COLUMNS)
@@ -593,7 +593,7 @@ try:
             return sorted_all, [{"grade": f"{get_sort_key(c)[0]}年級" if get_sort_key(c)[0]!=99 else "其他", "name": c} for c in sorted_all]
         except: return [], []
 
-    @st.cache_data(ttl=60)
+    @st.cache_data(ttl=300)   # [效能] 5分鐘，尖峰時段不必每分鐘重打
     def get_daily_duty(target_date):
         ws = get_worksheet(SHEET_TABS["duty"])
         if not ws: return pd.DataFrame(), "error"
@@ -636,7 +636,7 @@ try:
             except: return False
         return False
 
-    @st.cache_data(ttl=60)
+    @st.cache_data(ttl=300)   # [效能] 5分鐘，申訴資料不需秒級更新
     def load_appeals():
         ws = get_worksheet(SHEET_TABS["appeals"])
         if not ws: return pd.DataFrame(columns=APPEAL_COLUMNS)
@@ -646,6 +646,54 @@ try:
                 if col not in df.columns: df[col] = "待處理" if col == "處理狀態" else ""
             return df[APPEAL_COLUMNS]
         except: return pd.DataFrame(columns=APPEAL_COLUMNS)
+
+    PUBLISHED_COLS = ["週次", "排名", "年級", "班級", "總扣分", "優良次數", "總成績", "評等", "發布時間"]
+
+    @st.cache_data(ttl=300)   # [效能] 5分鐘快取，發布後學生很快就看得到
+    def load_published_results():
+        ws = get_worksheet(SHEET_TABS["published_results"])
+        if not ws: return pd.DataFrame(columns=PUBLISHED_COLS)
+        try:
+            df = pd.DataFrame(ws.get_all_records())
+            if df.empty: return pd.DataFrame(columns=PUBLISHED_COLS)
+            for col in PUBLISHED_COLS:
+                if col not in df.columns: df[col] = ""
+            for col in ["週次", "排名", "總扣分", "優良次數", "總成績"]:
+                if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+            return df
+        except: return pd.DataFrame(columns=PUBLISHED_COLS)
+
+    def publish_week_results(week_num, fin_ranked_df):
+        """將計算好的週次排名寫入 published_results sheet，同一週再發布會覆蓋舊資料"""
+        ws = get_worksheet(SHEET_TABS["published_results"])
+        if not ws: return False, "無法連線至 Google Sheets"
+        try:
+            # 讀取現有資料，刪除同一週次的舊資料
+            existing = ws.get_all_values()
+            if len(existing) > 1:
+                rows_to_delete = [i+1 for i, row in enumerate(existing[1:], 1)
+                                  if row and str(row[0]) == str(week_num)]
+                for ridx in sorted(rows_to_delete, reverse=True):
+                    ws.delete_rows(ridx + 1)  # +1 因為 header 佔第一行
+
+            # 寫入新資料
+            now_str = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M")
+            for _, row in fin_ranked_df.iterrows():
+                ws.append_row([
+                    int(week_num),
+                    int(row.get("排名", 0)),
+                    str(row.get("年級", "")),
+                    str(row.get("班級", "")),
+                    int(row.get("總扣分", 0)),
+                    int(row.get("優良次數", 0)),
+                    int(row.get("總成績", 0)),
+                    str(row.get("評等", "")),
+                    now_str
+                ])
+            load_published_results.clear()
+            return True, f"第 {week_num} 週成績已發布！學生現在可以查詢。"
+        except Exception as e:
+            return False, str(e)
 
     def save_appeal(entry, proof_file=None):
         pending_count = get_pending_count()
@@ -797,7 +845,7 @@ try:
         enqueue_task("volunteer_report" if student_list is not None else "main_entry", payload)
         return True
 
-    @st.cache_data(ttl=360)
+    @st.cache_data(ttl=1800)  # [效能] 30分鐘，報表用途不需頻繁更新
     def load_full_semester_data_for_export():
         ws = get_worksheet(SHEET_TABS["main"])
         if not ws: return pd.DataFrame(columns=EXPECTED_COLUMNS)
@@ -1173,39 +1221,7 @@ try:
             if not prefixes: st.warning("找不到糾察名單")
             else:
                 sel_p = st.radio("步驟 1：選擇開頭", [f"{p}開頭" for p in prefixes], horizontal=True, key="m1_p_radio")[0]
-                
-                filtered_inspectors = [p["label"] for p in INSPECTOR_LIST if p["id_prefix"] == sel_p]
-                st.markdown("**步驟 2：點選身份**")
-                
-                # 分成三欄顯示，避免清單過長
-                n = len(filtered_inspectors)
-                col_size = (n + 2) // 3  # 每欄最多幾個
-                cols = st.columns(3)
-                inspector_name = None
-                
-                # 用 session_state 記住目前選中的值
-                if "m1_inspector_selected" not in st.session_state:
-                    st.session_state.m1_inspector_selected = filtered_inspectors[0] if filtered_inspectors else None
-                # 切換開頭時重置選擇
-                if st.session_state.m1_inspector_selected not in filtered_inspectors:
-                    st.session_state.m1_inspector_selected = filtered_inspectors[0] if filtered_inspectors else None
-
-                for col_idx, col in enumerate(cols):
-                    chunk = filtered_inspectors[col_idx * col_size : (col_idx + 1) * col_size]
-                    for name in chunk:
-                        if col.button(
-                            name,
-                            key=f"insp_btn_{name}",
-                            type="primary" if st.session_state.m1_inspector_selected == name else "secondary",
-                            use_container_width=True
-                        ):
-                            st.session_state.m1_inspector_selected = name
-                            st.rerun()
-                
-                inspector_name = st.session_state.m1_inspector_selected or (filtered_inspectors[0] if filtered_inspectors else "")
-                if inspector_name:
-                    st.caption(f"目前選擇：**{inspector_name}**")
-
+                inspector_name = st.radio("步驟 2：點選身份", [p["label"] for p in INSPECTOR_LIST if p["id_prefix"] == sel_p], key="m1_name_radio")
                 curr_inspector = next((p for p in INSPECTOR_LIST if p["label"] == inspector_name), {})
                 allowed_roles = [r for r in curr_inspector.get("allowed_roles", ["內掃檢查"]) if r != "晨間打掃"] or ["內掃檢查"]
                 
@@ -1458,57 +1474,191 @@ try:
         st.title("🔎 班級成績查詢")
         df, appeals_df = load_main_data(), load_appeals()
         appeal_map = {str(r.get("對應紀錄ID")): {"status": str(r.get("處理狀態", "")), "reply": str(r.get("審核回覆", ""))} for _, r in appeals_df.iterrows()} if not appeals_df.empty else {}
-        
+
         sel_grade_m2 = st.radio("選擇年級", grades, horizontal=True, key="m2_grade_select")
         cls_opts = [c["name"] for c in structured_classes if c["grade"] == sel_grade_m2]
-        
+
         if cls_opts:
             cls = st.selectbox("選擇班級", cls_opts, key="m2_cls_select")
             if cls and not df.empty:
-                for idx, r in df[df["班級"] == cls].sort_values("登錄時間", ascending=False).iterrows():
-                    trash_score = r['垃圾內掃原始分'] + r['垃圾外掃原始分']
-                    if trash_score == 0: trash_score = r['垃圾原始分']
-                    
-                    tot = r['內掃原始分'] + r['外掃原始分'] + trash_score + r['晨間打掃原始分']
-                    rid = str(r['紀錄ID'])
-                    ap_info = appeal_map.get(rid, {})
-                    ap_st = ap_info.get("status")
-                    ap_reply = ap_info.get("reply")
-                    
-                    icon = "✅" if ap_st=="已核可" else "🚫" if ap_st=="已駁回" else "⏳" if ap_st=="待處理" else "🛠️" if str(r['修正'])=="TRUE" else ""
-                    
-                    disp_time = str(r.get('登錄時間', ''))
-                    time_str = disp_time.split(' ')[-1] if disp_time else ''
-                    
-                    score_disp = "⭐ 優良 (無扣分)" if "優良" in str(r['評分項目']) else ("🙂 普通 (無扣分)" if "普通" in str(r['評分項目']) else (f"加 {abs(tot)} 分 (學期)" if tot < 0 else f"扣: {tot}"))
-                    
-                    with st.expander(f"{icon} {r['日期']} {time_str} - {r['評分項目']} ({score_disp})"):
-                        st.caption(f"登錄時間：{disp_time if disp_time else '未紀錄'}") 
-                        st.write(f"🧑‍✈️ **評分人員:** {r.get('檢查人員', '未知')}")
-                        st.write(f"📝 **備註:** {r['備註']}")
-                        
-                        if ap_st:
-                            if ap_st == "待處理": st.info("⏳ 申訴審核中...")
-                            elif ap_st == "已核可": st.success(f"✅ 申訴成功。組長回覆: {ap_reply if ap_reply else '無'}")
-                            elif ap_st == "已駁回": st.error(f"🚫 申訴駁回。組長回覆: {ap_reply if ap_reply else '無'}")
-                            
-                        if str(r['照片路徑']) and "http" in str(r['照片路徑']): st.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=200)
-                        if not ap_st and is_within_appeal_period(r['日期']) and (tot > 0 or r['手機人數'] > 0):
-                            with st.form(f"ap_{rid}"):
-                                # 將原本擠在同一行的程式碼拆成兩行，並各自加上專屬的 key
-                                rsn = st.text_area("理由", key=f"rsn_{rid}")
-                                pf = st.file_uploader("佐證", type=['jpg','png'], key=f"pf_{rid}")
-    
-                                if st.form_submit_button("申訴"):
-                                    if time.time() - st.session_state.last_action_time < 3:
-                                        st.warning("⚠️ 系統處理中，請勿連續點擊！")
-                                    elif rsn and pf:
-                                        st.session_state.last_action_time = time.time()
-                                        if save_appeal({"班級": cls, "違規日期": str(r["日期"]), "違規項目": r['評分項目'], "原始扣分": str(tot), "申訴理由": rsn, "對應紀錄ID": rid}, pf):
-                                            time.sleep(1.5)
-                                            st.rerun()
-                                    else:
-                                        st.error("請填寫理由並上傳照片")
+                cls_df = df[df["班級"] == cls].copy()
+
+                # ── [效能] 預計算申訴期限，不在每筆 loop 裡重複呼叫 ──
+                holidays = load_holidays()
+                def _appeal_deadline(vd):
+                    try:
+                        current_date, workdays = (pd.to_datetime(str(vd)).date() if isinstance(vd, str) else vd), 0
+                        for _ in range(14):
+                            if workdays >= 3: break
+                            current_date += timedelta(days=1)
+                            if current_date.weekday() < 5 and current_date not in holidays: workdays += 1
+                        return current_date
+                    except: return date.today()
+
+                unique_dates = cls_df["日期"].astype(str).unique()
+                appeal_deadline_map = {d: _appeal_deadline(d) for d in unique_dates}
+
+                # ── 摘要卡片 ──
+                now_week = get_week_num(today_tw)
+                week_df = cls_df[cls_df["週次"] == now_week] if "週次" in cls_df.columns else pd.DataFrame()
+
+                def _calc_tot(r):
+                    tr = r['垃圾內掃原始分'] + r['垃圾外掃原始分']
+                    if tr == 0: tr = r['垃圾原始分']
+                    return r['內掃原始分'] + r['外掃原始分'] + tr + r['晨間打掃原始分']
+
+                week_deduct = sum(_calc_tot(r) for _, r in week_df.iterrows()
+                                  if not any(x in str(r['評分項目']) for x in ["優良","普通"]) and str(r['修正']) != "TRUE") if not week_df.empty else 0
+                pending_appeals = sum(1 for rid in [str(r['紀錄ID']) for _, r in cls_df.iterrows()]
+                                      if appeal_map.get(rid, {}).get("status") == "待處理")
+
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.markdown(f"""<div style='background:#f0f7ff;border-radius:12px;padding:14px 16px;border-left:4px solid #3182ce'>
+                    <div style='font-size:12px;color:#555;margin-bottom:4px'>本週扣分</div>
+                    <div style='font-size:26px;font-weight:700;color:{"#e53e3e" if week_deduct>0 else "#38a169"}'>{week_deduct} 分</div>
+                </div>""", unsafe_allow_html=True)
+                mc2.markdown(f"""<div style='background:#f0f7ff;border-radius:12px;padding:14px 16px;border-left:4px solid #805ad5'>
+                    <div style='font-size:12px;color:#555;margin-bottom:4px'>待處理申訴</div>
+                    <div style='font-size:26px;font-weight:700;color:{"#d69e2e" if pending_appeals>0 else "#38a169"}'>{pending_appeals} 件</div>
+                </div>""", unsafe_allow_html=True)
+                total_deduct = sum(_calc_tot(r) for _, r in cls_df.iterrows()
+                                   if not any(x in str(r['評分項目']) for x in ["優良","普通"]) and str(r['修正']) != "TRUE")
+                mc3.markdown(f"""<div style='background:#f0f7ff;border-radius:12px;padding:14px 16px;border-left:4px solid #dd6b20'>
+                    <div style='font-size:12px;color:#555;margin-bottom:4px'>學期累計扣分</div>
+                    <div style='font-size:26px;font-weight:700;color:{"#e53e3e" if total_deduct>0 else "#38a169"}'>{total_deduct} 分</div>
+                </div>""", unsafe_allow_html=True)
+
+                st.markdown("<div style='margin-top:16px'></div>", unsafe_allow_html=True)
+
+                # ── 分頁 ──
+                tab_records, tab_ranking = st.tabs(["📋 扣分明細", "🏆 各週排名"])
+
+                with tab_records:
+                    records = cls_df.sort_values("登錄時間", ascending=False)
+                    if records.empty:
+                        st.success("🎉 目前沒有任何評分紀錄！")
+                    else:
+                        for idx, r in records.iterrows():
+                            trash_score = r['垃圾內掃原始分'] + r['垃圾外掃原始分']
+                            if trash_score == 0: trash_score = r['垃圾原始分']
+                            tot = r['內掃原始分'] + r['外掃原始分'] + trash_score + r['晨間打掃原始分']
+                            rid = str(r['紀錄ID'])
+                            ap_info = appeal_map.get(rid, {})
+                            ap_st = ap_info.get("status")
+                            ap_reply = ap_info.get("reply")
+                            is_excellent = "優良" in str(r['評分項目'])
+                            is_normal = "普通" in str(r['評分項目'])
+                            is_corrected = str(r['修正']) == "TRUE"
+
+                            # 決定卡片顏色
+                            if ap_st == "已核可" or is_corrected:
+                                card_color, border_color, tag_bg, tag_color, tag_text = "#f0fff4","#38a169","#c6f6d5","#276749","✅ 申訴成功" if ap_st=="已核可" else "🛠️ 已修正"
+                            elif ap_st == "已駁回":
+                                card_color, border_color, tag_bg, tag_color, tag_text = "#fff5f5","#fc8181","#fed7d7","#9b2c2c","🚫 申訴駁回"
+                            elif ap_st == "待處理":
+                                card_color, border_color, tag_bg, tag_color, tag_text = "#fffbeb","#f6ad55","#fefcbf","#744210","⏳ 申訴中"
+                            elif is_excellent:
+                                card_color, border_color, tag_bg, tag_color, tag_text = "#f0fff4","#68d391","#c6f6d5","#276749","⭐ 優良"
+                            elif is_normal:
+                                card_color, border_color, tag_bg, tag_color, tag_text = "#f7fafc","#a0aec0","#edf2f7","#4a5568","✅ 普通"
+                            else:
+                                card_color, border_color, tag_bg, tag_color, tag_text = "#fff5f5","#fc8181","#fed7d7","#9b2c2c",f"❌ 扣 {tot} 分"
+
+                            disp_time = str(r.get('登錄時間', ''))
+                            date_str = str(r['日期'])
+                            week_str = f"第{r.get('週次','')}週"
+
+                            st.markdown(f"""
+                            <div style='background:{card_color};border:1.5px solid {border_color};border-radius:12px;padding:12px 16px;margin-bottom:10px'>
+                                <div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px'>
+                                    <div style='font-weight:600;font-size:15px'>{date_str} <span style='color:#718096;font-size:13px'>{week_str}</span></div>
+                                    <span style='background:{tag_bg};color:{tag_color};border-radius:20px;padding:3px 12px;font-size:13px;font-weight:600'>{tag_text}</span>
+                                </div>
+                                <div style='font-size:13px;color:#4a5568;margin-top:6px'>
+                                    🧑‍✈️ {r.get('檢查人員','未知')} &nbsp;|&nbsp; 📌 {r['評分項目']}
+                                    {"&nbsp;|&nbsp; 📝 " + str(r['備註']) if str(r.get('備註','')).strip() else ""}
+                                </div>
+                                {f'<div style="font-size:12px;color:#718096;margin-top:4px">登錄：{disp_time}</div>' if disp_time else ""}
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                            # 申訴回覆
+                            if ap_st == "已核可":
+                                st.success(f"✅ 申訴成功。組長回覆：{ap_reply if ap_reply else '無'}")
+                            elif ap_st == "已駁回":
+                                st.error(f"🚫 申訴駁回。組長回覆：{ap_reply if ap_reply else '無'}")
+                            elif ap_st == "待處理":
+                                st.info("⏳ 申訴審核中，請耐心等候...")
+
+                            # 違規照片
+                            if str(r.get('照片路徑','')).strip() and "http" in str(r['照片路徑']):
+                                with st.expander("📷 查看照片"):
+                                    st.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=200)
+
+                            # 申訴表單（使用預計算的期限，不重複呼叫函式）
+                            deadline = appeal_deadline_map.get(date_str, date.today())
+                            if not ap_st and date.today() <= deadline and (tot > 0 or r['手機人數'] > 0):
+                                with st.expander(f"📣 提出申訴（截止 {deadline.strftime('%m/%d')}）"):
+                                    with st.form(f"ap_{rid}"):
+                                        rsn = st.text_area("申訴理由", key=f"rsn_{rid}")
+                                        pf = st.file_uploader("佐證照片", type=['jpg','png'], key=f"pf_{rid}")
+                                        if st.form_submit_button("送出申訴"):
+                                            if time.time() - st.session_state.last_action_time < 3:
+                                                st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                                            elif rsn and pf:
+                                                st.session_state.last_action_time = time.time()
+                                                if save_appeal({"班級": cls, "違規日期": date_str, "違規項目": r['評分項目'], "原始扣分": str(tot), "申訴理由": rsn, "對應紀錄ID": rid}, pf):
+                                                    time.sleep(1.5)
+                                                    st.rerun()
+                                            else:
+                                                st.error("請填寫理由並上傳照片")
+
+                with tab_ranking:
+                    pub_df = load_published_results()
+                    if pub_df.empty:
+                        st.info("📭 組長尚未發布任何週次的成績，請耐心等候！")
+                    else:
+                        available_pub_weeks = sorted(pub_df["週次"].unique(), reverse=True)
+                        sel_pub_week = st.selectbox("選擇查詢週次", available_pub_weeks,
+                                                    format_func=lambda w: f"第 {w} 週", key="m2_pub_week")
+                        week_pub = pub_df[pub_df["週次"] == sel_pub_week]
+                        cls_row = week_pub[week_pub["班級"] == cls]
+
+                        pub_time = week_pub["發布時間"].iloc[0] if not week_pub.empty else ""
+
+                        if not cls_row.empty:
+                            cr = cls_row.iloc[0]
+                            rank_val = int(cr["排名"])
+                            score_val = int(cr["總成績"])
+                            deduct_val = int(cr["總扣分"])
+                            grade_val = str(cr["評等"])
+                            exc_val = int(cr["優良次數"])
+
+                            color = "#f0fff4" if "優良" in grade_val else ("#fffbeb" if "普通" in grade_val else "#fff5f5")
+                            border = "#38a169" if "優良" in grade_val else ("#f6ad55" if "普通" in grade_val else "#fc8181")
+                            st.markdown(f"""
+                            <div style='background:{color};border:2px solid {border};border-radius:14px;padding:20px 24px;text-align:center;margin-bottom:16px'>
+                                <div style='font-size:14px;color:#718096;margin-bottom:4px'>第 {sel_pub_week} 週 · {cls} · {grade_val}</div>
+                                <div style='font-size:48px;font-weight:700;color:#2d3748'>#{rank_val}</div>
+                                <div style='font-size:15px;color:#4a5568;margin-top:6px'>
+                                    總成績 {score_val} 分 &nbsp;|&nbsp; 扣分 {deduct_val} 分 &nbsp;|&nbsp; ⭐ 優良 {exc_val} 次
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        else:
+                            st.warning(f"找不到 {cls} 在第 {sel_pub_week} 週的排名資料。")
+
+                        # 顯示同年級排名
+                        cls_grade = next((c["grade"] for c in structured_classes if c["name"] == cls), "")
+                        grade_pub = week_pub[week_pub["年級"] == cls_grade] if cls_grade else week_pub
+                        if not grade_pub.empty:
+                            st.markdown(f"##### {cls_grade} 完整排名")
+                            st.dataframe(
+                                grade_pub[["排名","班級","總扣分","優良次數","總成績","評等"]].reset_index(drop=True),
+                                hide_index=True
+                            )
+                        if pub_time:
+                            st.caption(f"發布時間：{pub_time}")
 
     # --- Mode 3: 晨掃志工隊🧹 ---
     elif app_mode == "晨掃志工隊🧹":
@@ -1959,6 +2109,9 @@ try:
                                 by_grade = (rank_mode == "年級")
                                 fin_ranked = add_rank_and_label(fin, by_grade=by_grade)
                                 detail = build_detail(scored)
+                                # 儲存供發布使用
+                                st.session_state["last_computed_week"] = sel_week
+                                st.session_state["last_computed_ranking"] = fin_ranked
 
                                 # ── 畫面顯示 ──
                                 if by_grade:
@@ -1990,6 +2143,18 @@ try:
                                     file_name=f"衛生成績_第{sel_week}週_{today_tw.strftime('%Y%m%d')}.xlsx",
                                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                                 )
+
+                            # ── 發布按鈕（計算完後才會出現）──
+                            if st.session_state.get("last_computed_week") == sel_week and \
+                               st.session_state.get("last_computed_ranking") is not None:
+                                st.markdown("---")
+                                st.info(f"💡 計算完成後，可將第 {sel_week} 週成績發布給學生查詢。")
+                                if st.button(f"📢 發布第 {sel_week} 週成績給學生", key="publish_week_btn"):
+                                    ok, msg = publish_week_results(sel_week, st.session_state["last_computed_ranking"])
+                                    if ok:
+                                        st.success(f"✅ {msg}")
+                                    else:
+                                        st.error(f"❌ 發布失敗：{msg}")
 
                     with tab_semester:
                         st.write("計算全學期累計總扣分與總成績")
@@ -2197,7 +2362,6 @@ try:
                 if st.button("更新開學日"): save_setting("semester_start", str(nd))
                 
                 st.markdown("---")
-                st.write("📅 **週次手動對照表**（解決寒假跨週問題）")
                 st.write("📅 **週次手動對照表**（解決寒假跨週問題）")
                 st.caption("只需填「錨點」：每個學期重置點的週一日期與週次號碼，用逗號分隔。\n\n例如：`2025-01-23:1,2025-02-23:2`\n\n這樣填即可：第1週從1/23起，第2週從2/23起，第3週之後系統會自動從2/23往後每7天累計，不需要填完所有週次。")
                 curr_week_map = SYSTEM_CONFIG.get("week_map", "")
