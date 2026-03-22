@@ -537,7 +537,7 @@ try:
         try: return [pd.to_datetime(str(r.get("日期", "")).strip()).date() for r in ws.get_all_records() if str(r.get("日期", "")).strip()]
         except: return []
 
-    def is_within_appeal_period(violation_date, appeal_days=3):
+    def is_within_appeal_period(violation_date, appeal_days=2):
         vd = pd.to_datetime(violation_date).date() if isinstance(violation_date, str) else violation_date
         holidays, today, current_date, workdays = load_holidays(), date.today(), vd, 0
         for _ in range(14): 
@@ -1507,7 +1507,7 @@ try:
                     try:
                         current_date, workdays = (pd.to_datetime(str(vd)).date() if isinstance(vd, str) else vd), 0
                         for _ in range(14):
-                            if workdays >= 3: break
+                            if workdays >= 2: break
                             current_date += timedelta(days=1)
                             if current_date.weekday() < 5 and current_date not in holidays: workdays += 1
                         return current_date
