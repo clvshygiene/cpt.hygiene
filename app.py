@@ -49,7 +49,7 @@ st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page
 # — 2. 核心參數與全域設定 —
 
 try:
-TW_TZ = pytz.timezone(‘Asia/Taipei’)
+TW_TZ = pytz.timezone('Asia/Taipei')
 MAX_IMAGE_BYTES = 20 * 1024 * 1024  
 UPLOAD_SEM = threading.BoundedSemaphore(4)
 QUEUE_DB_PATH = "task_queue_v4_wal.db"
