@@ -827,7 +827,8 @@ try:
     def get_week_num(d):
         try:
             if isinstance(d, datetime): d = d.date()
-            # [週次對照表] 優先使用 settings 裡的 week_map 手動對照（格式：2025-01-23:1,2025-02-23:2,...）
+            # [週次對照表] 優先使用 settings 裡的 week_map 手動對照
+            # 格式：2025-01-23:1,2025-02-23:2（只需填「錨點」，後面正常週數自動累計）
             week_map_str = SYSTEM_CONFIG.get("week_map", "")
             if week_map_str.strip():
                 entries = []
@@ -840,22 +841,89 @@ try:
                         except: pass
                 if entries:
                     entries.sort(key=lambda x: x[0])
-                    matched_week = 0
+                    # 找到最後一個「錨點日期 <= d」的錨點，從那個錨點往後正常累計週數
+                    anchor_date, anchor_week = None, 0
                     for start_date, wn in entries:
                         if d >= start_date:
-                            matched_week = wn
+                            anchor_date, anchor_week = start_date, wn
                         else:
                             break
-                    return matched_week if matched_week > 0 else 0
-            # fallback：純數學計算
+                    if anchor_date is not None:
+                        # 從錨點往後每7天加一週
+                        return anchor_week + (d - anchor_date).days // 7
+                    return 0
+            # fallback：純數學計算（未設定 week_map 時使用）
             start = datetime.strptime(SYSTEM_CONFIG["semester_start"], "%Y-%m-%d").date()
             return max(0, ((d - start).days // 7) + 1)
         except: return 0
 
-    st.sidebar.title("🏫 功能選單")
-    
+    # ── 側邊欄樣式注入 ─────────────────────────────────────────
+    st.markdown("""
+    <style>
+    /* 側邊欄背景 */
+    [data-testid="stSidebar"] {
+        background: linear-gradient(160deg, #1a2a4a 0%, #0d1b35 100%);
+    }
+    [data-testid="stSidebar"] * { color: #e8edf5 !important; }
+
+    /* 隱藏預設的 radio label 文字「請選擇模式」*/
+    [data-testid="stSidebar"] .stRadio > label { display: none; }
+
+    /* 讓每個 radio 選項變成獨立按鈕卡片 */
+    [data-testid="stSidebar"] .stRadio div[role="radiogroup"] {
+        display: flex; flex-direction: column; gap: 6px; margin-top: 4px;
+    }
+    [data-testid="stSidebar"] .stRadio div[role="radiogroup"] label {
+        display: flex !important; align-items: center;
+        background: rgba(255,255,255,0.07);
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 10px;
+        padding: 10px 14px;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        font-size: 15px !important;
+        font-weight: 500 !important;
+    }
+    [data-testid="stSidebar"] .stRadio div[role="radiogroup"] label:hover {
+        background: rgba(255,255,255,0.15);
+        border-color: rgba(255,255,255,0.3);
+        transform: translateX(3px);
+    }
+    /* 選中狀態 */
+    [data-testid="stSidebar"] .stRadio div[role="radiogroup"] label:has(input:checked) {
+        background: rgba(99, 179, 237, 0.25);
+        border-color: #63b3ed;
+        color: #ffffff !important;
+    }
+    /* 隱藏原本的圓形 radio 點 */
+    [data-testid="stSidebar"] .stRadio input[type="radio"] { display: none; }
+
+    /* 側邊欄標題區塊 */
+    [data-testid="stSidebar"] h1 {
+        font-size: 20px !important;
+        font-weight: 700 !important;
+        color: #ffffff !important;
+        padding-bottom: 8px;
+        border-bottom: 1px solid rgba(255,255,255,0.15);
+        margin-bottom: 14px !important;
+    }
+
+    /* 底部版本資訊 */
+    .sidebar-footer {
+        position: fixed; bottom: 20px; left: 0;
+        width: 240px; text-align: center;
+        font-size: 11px; color: rgba(255,255,255,0.3);
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.sidebar.title("🏫 衛愛而生")
+    st.sidebar.markdown("<div style='font-size:12px;color:rgba(255,255,255,0.4);margin-top:-12px;margin-bottom:16px;'>中壢家商 衛生組管理系統</div>", unsafe_allow_html=True)
+
     menu_options = ["糾察底家👀", "班級負責人🥸", "晨掃志工隊🧹", "愛校任務認領 🤝", "組長ㄉ窩💃"]
     app_mode = st.sidebar.radio("請選擇模式", menu_options)
+
+    st.sidebar.markdown("<div class='sidebar-footer'>中壢家商 衛生組 © 2025</div>", unsafe_allow_html=True)
 
     # --- Mode: 愛校任務認領 🤝 ---
     if app_mode == "愛校任務認領 🤝":
@@ -1068,22 +1136,42 @@ try:
                     pending_classes = []
 
                     if assigned_classes:
-                        # [V5.28 Patch] 衛生糾察進度與自動核發時數防堵
+                        # [即時進度] 用 session_state 補足背景非同步的延遲
+                        if "submitted_inspections" not in st.session_state:
+                            st.session_state.submitted_inspections = set()
                         completed_records = main_df[(main_df["日期"].astype(str) == str(input_date)) & (main_df["檢查人員"] == inspector_name)]["班級"].tolist()
-                        completed_classes = set(completed_records)
-                        pending_classes = [c for c in assigned_classes if c not in completed_classes]
-                        
-                        st.info(f"📍 今日任務進度：{len(completed_classes)}/{len(assigned_classes)} (尚缺: {', '.join(pending_classes) if pending_classes else '無'})")
-                        
+                        completed_classes = set(completed_records) | {
+                            c for c in st.session_state.submitted_inspections
+                            if c.startswith(f"{input_date}__{inspector_name}__")
+                            and c.split("__")[2] in assigned_classes
+                        }
+                        # 統一清出班級名稱
+                        completed_class_names = set()
+                        for item in completed_classes:
+                            if "__" in str(item):
+                                completed_class_names.add(item.split("__")[2])
+                            else:
+                                completed_class_names.add(item)
+                        pending_classes = [c for c in assigned_classes if c not in completed_class_names]
+
+                        # 合併「任務類型 + 進度」為同一個框
+                        role_label = "🏫 內掃檢查" if role == "內掃檢查" else "🏢 外掃檢查"
+                        progress_text = f"今日任務：{role_label}　|　進度：{len(completed_class_names)}/{len(assigned_classes)}"
+                        if pending_classes:
+                            progress_text += f"　|　尚缺：{', '.join(pending_classes)}"
+                        else:
+                            progress_text += "　|　✅ 今日任務全數完成！"
+                        st.info(progress_text)
+
                         sel_cls = st.radio("選擇負責班級", assigned_classes, key="m1_cls_assigned")
-                        
+
                         # 判斷這是不是最後一個缺少的班級
                         if sel_cls in pending_classes and len(pending_classes) == 1:
                             is_last_task = True
                         elif sel_cls in pending_classes:
                             is_last_task = False
                         else:
-                            is_last_task = False # 代表已經評分過了
+                            is_last_task = False
                     else:
                         st.info("📍 今日任務：機動/隊長/組長自由巡查")
                         temp_g = st.radio("步驟 A: 選擇年級", grades, horizontal=True, key="m1_grade_select")
@@ -1093,50 +1181,98 @@ try:
                     if sel_cls:
                         st.divider()
                         if check_duplicate_record(main_df, input_date, inspector_name, role, sel_cls): st.warning(f"⚠️ 今日已評過 {sel_cls}！")
-                        
+
+                        # [關鍵] check_result 放在 form 外面，才能即時顯示/隱藏違規欄位
+                        check_result = st.radio("檢查結果", ["⭐ 優良", "✅ 普通", "❌ 違規(需扣分)"], horizontal=True, key="m1_check_result")
+
+                        # 違規細節區塊（在 form 外，隨 radio 即時顯示）
+                        in_s, out_s, ph_c, note, sel_violations = 0, 0, 0, "", []
+
+                        if check_result == "❌ 違規(需扣分)":
+                            if role == "內掃檢查":
+                                in_s = st.number_input("內掃扣分", min_value=0, step=1, key="m1_in_s")
+                                st.markdown("**📍 違規位置（可複選）**")
+                                INNER_AREA_OPTIONS = ["走廊", "黑板", "地板", "窗戶(窗溝)", "陽台"]
+                                sel_areas = st.multiselect("違規位置", INNER_AREA_OPTIONS, key="inner_areas")
+                                st.markdown("**⚠️ 違規狀況（可複選）**")
+                                INNER_STATUS_OPTIONS = ["髒亂", "沒拖地", "沒擦拭", "酒精未補", "掃具壞掉未換", "懸掛垃圾未清除", "人工垃圾", "蜘蛛網", "頭髮圈圈", "打掃玩手機"]
+                                sel_violations = st.multiselect("違規狀況", INNER_STATUS_OPTIONS, key="inner_status")
+                                extra_note = st.text_input("📝 其他補充（找不到對應選項時請在此輸入）", key="m1_extra_note")
+                                note_parts = []
+                                if sel_areas: note_parts.append("位置：" + "、".join(sel_areas))
+                                if sel_violations: note_parts.append("狀況：" + "、".join(sel_violations))
+                                if extra_note: note_parts.append(extra_note)
+                                note = " | ".join(note_parts)
+
+                            elif role == "外掃檢查":
+                                out_s = st.number_input("外掃扣分", min_value=0, step=1, key="m1_out_s")
+                                st.markdown("**📍 違規位置**")
+                                loc_col1, loc_col2 = st.columns(2)
+                                BUILDING_OPTIONS = ["", "誠信樓A棟(各處室)", "誠信樓B棟", "樸實樓(合作社)", "勤學樓(烘焙縫紉)", "敬業樓(圖書館)"]
+                                FLOOR_MAP = {
+                                    "誠信樓A棟(各處室)": ["", "1F", "2F", "3F", "4F", "5F", "6F"],
+                                    "誠信樓B棟":         ["", "1F", "2F", "3F", "4F", "5F", "6F"],
+                                    "樸實樓(合作社)":    ["", "1F", "2F", "3F", "4F", "5F"],
+                                    "勤學樓(烘焙縫紉)": ["", "1F", "2F", "3F", "4F", "5F"],
+                                    "敬業樓(圖書館)":   ["", "1F", "2F", "3F"],
+                                }
+                                sel_building = loc_col1.selectbox("大樓", BUILDING_OPTIONS, key="m1_building")
+                                floor_opts = FLOOR_MAP.get(sel_building, ["", "1F", "2F", "3F", "4F", "5F", "6F"])
+                                sel_floor = loc_col2.selectbox("樓層", floor_opts, key="m1_floor")
+                                st.markdown("**⚠️ 違規項目（可複選）**")
+                                OUTER_AREA_OPTIONS = ["男廁", "女廁", "茶水間", "無障礙廁所", "樓梯間", "洗手台", "天花板", "走廊", "地板", "陽台"]
+                                sel_outer_areas = st.multiselect("違規項目", OUTER_AREA_OPTIONS, key="outer_areas")
+                                st.markdown("**⚠️ 違規狀況（可複選）**")
+                                OUTER_STATUS_OPTIONS = ["髒亂", "沒拖地", "沒掃地", "沒擦拭", "酒精未補", "掃具壞掉未換", "人工垃圾", "蜘蛛網", "頭髮圈圈", "打掃玩手機"]
+                                sel_status = st.multiselect("違規狀況", OUTER_STATUS_OPTIONS, key="outer_status")
+                                extra_note = st.text_input("📝 其他補充（找不到對應選項時請在此輸入）", key="m1_extra_note")
+                                note_parts = []
+                                if sel_building: note_parts.append(sel_building)
+                                if sel_floor: note_parts.append(sel_floor)
+                                if sel_outer_areas: note_parts.append("項目：" + "、".join(sel_outer_areas))
+                                if sel_status: note_parts.append("狀況：" + "、".join(sel_status))
+                                if extra_note: note_parts.append(extra_note)
+                                note = " | ".join(note_parts)
+                                sel_violations = sel_outer_areas + sel_status
+
+                        # form 只負責：修正單勾選 + 照片上傳 + 送出按鈕
                         with st.form("score_form", clear_on_submit=True):
-                            in_s, out_s, ph_c, note = 0, 0, 0, ""
-                            check_result = st.radio("檢查結果", ["✨ 乾淨(優良)", "❌ 違規"], horizontal=True)
-                            if check_result == "❌ 違規":
-                                if role == "內掃檢查":
-                                    in_s = st.number_input("內掃扣分", 0)
-                                    note = " ".join([x for x in [st.selectbox("區塊", ["", "走廊", "黑板", "地板"]), st.selectbox("狀況", ["", "髒亂", "沒拖地"]), st.text_input("補充")] if x])
-                                else:
-                                    out_s = st.number_input("外掃扣分", 0)
-                                    note = " ".join([x for x in [st.selectbox("區域", ["", "走廊", "樓梯", "廁所", "操場"]), st.selectbox("狀況", ["", "很髒", "沒掃"]), st.text_input("補充")] if x])
                             is_fix = st.checkbox("🚩 這是修正單")
-                            
-                            # [照片上傳] 提供相簿選取或直接拍照兩種方式
-                            upload_method = st.radio("照片上傳方式", ["📁 從相簿/檔案選取", "📷 直接拍照（不怕照片消失）"], horizontal=True, key="m1_upload_method")
-                            if upload_method == "📷 直接拍照（不怕照片消失）":
-                                cam_img = st.camera_input("拍攝現場照片")
-                                files = [cam_img] if cam_img else []
-                            else:
-                                files = st.file_uploader("📸 違規照片", accept_multiple_files=True)
-                            
+                            # [照片強制上傳] 三種結果都需附照，防止隨意亂評
+                            st.info("📸 請先用手機相機拍好照片存到相簿，再從下方選取上傳。（優良/普通/違規均需附照）")
+                            files = st.file_uploader("選取照片", accept_multiple_files=True, type=['jpg','png','jpeg'])
+
                             if st.form_submit_button("送出"):
                                 if time.time() - st.session_state.last_action_time < 5:
                                     st.warning("⚠️ 系統處理中，請稍候 5 秒再試！")
+                                elif not files:
+                                    st.error("❌ 請先上傳現場照片才能送出！（優良/普通也需要附照）")
                                 else:
                                     st.session_state.last_action_time = time.time()
-                                    if check_result == "✨ 乾淨(優良)":
-                                        # 優良：記錄一筆扣分為0的優良紀錄
-                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(優良)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": "本次檢查表現優良，無扣分項目"}, uploaded_files=files if files else None, award_inspector_hours=is_last_task):
+                                    _submit_key = f"{input_date}__{inspector_name}__{sel_cls}"
+                                    if check_result == "⭐ 優良":
+                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(優良)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": "本次檢查表現優良，無扣分項目"}, uploaded_files=files, award_inspector_hours=is_last_task):
+                                            st.session_state.submitted_inspections.add(_submit_key)
                                             st.success("⭐ 優良紀錄已登記！"); time.sleep(1.5); st.rerun()
-                                    elif (in_s + out_s) > 0 and not files:
-                                        st.error("扣分需照片")
-                                    else:
-                                        # 傳遞 award_inspector_hours 參數，控制背景發放時數
-                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note}, uploaded_files=files, award_inspector_hours=is_last_task):
-                                            if assigned_classes:
-                                                if is_last_task:
-                                                    st.success("✅ 送出成功！今日任務已全數完成，系統將自動核發 0.25 小時！")
+                                    elif check_result == "✅ 普通":
+                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(普通)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": "本次檢查無扣分，表現普通"}, uploaded_files=files, award_inspector_hours=is_last_task):
+                                            st.session_state.submitted_inspections.add(_submit_key)
+                                            st.success("✅ 普通紀錄已登記！"); time.sleep(1.5); st.rerun()
+                                    elif check_result == "❌ 違規(需扣分)":
+                                        if (in_s + out_s) == 0:
+                                            st.error("❌ 選擇違規但扣分為 0，請填入扣分數值！")
+                                        else:
+                                            if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note, "違規細項": "、".join(sel_violations) if sel_violations else ""}, uploaded_files=files, award_inspector_hours=is_last_task):
+                                                st.session_state.submitted_inspections.add(_submit_key)
+                                                if assigned_classes:
+                                                    if is_last_task:
+                                                        st.success("✅ 送出成功！今日任務已全數完成，系統將自動核發 0.25 小時！")
+                                                    else:
+                                                        st.success(f"✅ 送出成功！尚缺 {len(pending_classes)-1} 個班級，請繼續努力！")
                                                 else:
-                                                    st.success(f"✅ 送出成功！尚缺 {len(pending_classes)-1} 個班級，請繼續努力！")
-                                            else:
-                                                st.success("✅ 送出成功！系統將自動排程發放本日 0.25 小時。")
-                                            time.sleep(1.5)
-                                            st.rerun()
+                                                    st.success("✅ 送出成功！系統將自動排程發放本日 0.25 小時。")
+                                                time.sleep(1.5)
+                                                st.rerun()
 
     # --- Mode 2: 班級負責人 ---
     elif app_mode == "班級負責人🥸":
@@ -1165,7 +1301,7 @@ try:
                     disp_time = str(r.get('登錄時間', ''))
                     time_str = disp_time.split(' ')[-1] if disp_time else ''
                     
-                    score_disp = "⭐ 優良 (無扣分)" if "優良" in str(r['評分項目']) else (f"加 {abs(tot)} 分 (學期)" if tot < 0 else f"扣: {tot}")
+                    score_disp = "⭐ 優良 (無扣分)" if "優良" in str(r['評分項目']) else ("🙂 普通 (無扣分)" if "普通" in str(r['評分項目']) else (f"加 {abs(tot)} 分 (學期)" if tot < 0 else f"扣: {tot}"))
                     
                     with st.expander(f"{icon} {r['日期']} {time_str} - {r['評分項目']} ({score_disp})"):
                         st.caption(f"登錄時間：{disp_time if disp_time else '未紀錄'}") 
@@ -1537,12 +1673,96 @@ try:
             with t2:
                 st.subheader("📊 成績總表")
                 full = load_full_semester_data_for_export()
-                
+
+                # ── 共用計算函式 ──────────────────────────────────────────
+                def calc_scores(df_raw):
+                    """回傳含結算欄位的 DataFrame（已排除優良/普通紀錄）"""
+                    df = df_raw[~df_raw["評分項目"].astype(str).str.contains("優良|普通")].copy()
+                    df["內掃結算"] = df["內掃原始分"].clip(upper=2)
+                    df["外掃結算"] = df["外掃原始分"].clip(upper=2)
+                    trash = df["垃圾內掃原始分"] + df["垃圾外掃原始分"]
+                    trash = trash.where(trash > 0, df["垃圾原始分"])
+                    df["垃圾結算"] = trash.clip(upper=2)
+                    df["總扣分"] = df["內掃結算"] + df["外掃結算"] + df["垃圾結算"] + df["晨間打掃原始分"].clip(lower=0) + df["手機人數"]
+                    return df
+
+                def build_ranking(scored_df, df_all, classes_struct, base_score=90):
+                    """依班級彙總扣分，合併完整班級清單，加上總成績與優良次數"""
+                    rep = scored_df.groupby("班級")["總扣分"].sum().reset_index()
+                    # 計算優良次數（含括號內有「優良」的評分項目）
+                    excellent_counts = df_all[df_all["評分項目"].astype(str).str.contains("優良")].groupby("班級").size().reset_index(name="優良次數")
+                    cls_df = pd.DataFrame(classes_struct).rename(columns={"grade": "年級", "name": "班級"})
+                    fin = pd.merge(cls_df, rep, on="班級", how="left").fillna(0)
+                    fin = pd.merge(fin, excellent_counts, on="班級", how="left").fillna(0)
+                    fin["總成績"] = base_score - fin["總扣分"]
+                    fin["優良次數"] = fin["優良次數"].astype(int)
+                    return fin
+
+                def add_rank_and_label(fin_df, by_grade=False, threshold_good=3):
+                    """排序並加上排名、評等欄位；同分以優良次數排名，使用標準競賽排名（並列同名次，下一名跳號）"""
+                    def label(s):
+                        if s == 0:   return "⭐ 優良"
+                        if s <= threshold_good: return "✅ 普通"
+                        return "⚠️ 需加強"
+
+                    def apply_competition_rank(df):
+                        # 先依「總成績高→優良次數多」排序
+                        df = df.sort_values(["總成績", "優良次數"], ascending=[False, False]).reset_index(drop=True)
+                        # 標準競賽排名：同名次並列，下一名跳號（例：1,1,1,4,5）
+                        ranks = []
+                        rank = 1
+                        for i, row in df.iterrows():
+                            if i == 0:
+                                ranks.append(rank)
+                            else:
+                                prev = df.iloc[i-1]
+                                if row["總成績"] == prev["總成績"] and row["優良次數"] == prev["優良次數"]:
+                                    ranks.append(ranks[-1])  # 並列同名次
+                                else:
+                                    rank = i + 1  # 跳到實際位置號
+                                    ranks.append(rank)
+                        df.insert(0, "排名", ranks)
+                        df["評等"] = df["總扣分"].apply(label)
+                        return df
+
+                    if not by_grade:
+                        return apply_competition_rank(fin_df.copy())
+                    else:
+                        pieces = []
+                        for g in sorted(fin_df["年級"].unique()):
+                            if g == "其他": continue
+                            pieces.append(apply_competition_rank(fin_df[fin_df["年級"]==g].copy()))
+                        return pd.concat(pieces, ignore_index=True) if pieces else fin_df
+
+                def build_detail(scored_df):
+                    """各班扣分明細：每筆違規紀錄，含日期/週次/評分項目/扣分/備註"""
+                    cols = ["日期", "週次", "班級", "評分項目", "檢查人員",
+                            "內掃結算", "外掃結算", "垃圾結算", "手機人數", "總扣分", "備註", "違規細項"]
+                    avail = [c for c in cols if c in scored_df.columns]
+                    detail = scored_df[scored_df["總扣分"] > 0][avail].sort_values(["班級","日期"])
+                    return detail
+
+                def to_excel_bytes(sheets_dict):
+                    """產生多分頁 Excel，sheets_dict = {分頁名稱: DataFrame}"""
+                    buf = io.BytesIO()
+                    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                        for sheet_name, df in sheets_dict.items():
+                            safe_name = sheet_name[:31]  # Excel 分頁名稱上限 31 字
+                            df.to_excel(writer, sheet_name=safe_name, index=False)
+                            ws = writer.sheets[safe_name]
+                            # 自動調整欄寬
+                            for col_cells in ws.columns:
+                                max_len = max((len(str(c.value)) if c.value else 0) for c in col_cells)
+                                ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 4, 40)
+                    buf.seek(0)
+                    return buf.getvalue()
+
+                # ── UI ───────────────────────────────────────────────────
                 if full.empty:
                     st.info("目前無評分資料")
                 else:
                     tab_week, tab_semester = st.tabs(["📅 單週成績結算", "🏆 全學期總結算"])
-                    
+
                     with tab_week:
                         available_weeks = sorted([w for w in full["週次"].unique() if w > 0])
                         if not available_weeks:
@@ -1551,82 +1771,106 @@ try:
                             sel_week = st.selectbox("請選擇結算週次", available_weeks, index=len(available_weeks)-1)
                             is_fall = (today_tw.month >= 8 or today_tw.month == 1)
                             default_mode = "年級 (上學期制)" if is_fall else "全校 (下學期制)"
-                            
                             st.info(f"💡 系統偵測目前為 **{'上' if is_fall else '下'}學期**，預設採用 **{default_mode}** 排名。")
                             rank_mode = st.radio("排名方式 (可手動更改)", ["年級", "全校"], index=0 if is_fall else 1, horizontal=True)
-                            
-                            if st.button("🚀 計算當週成績"):
-                                week_df = full[full["週次"] == sel_week].copy()
-                                # 優良紀錄不計入扣分
-                                week_df = week_df[~week_df["評分項目"].astype(str).str.contains("優良")]
-                                week_df["內掃結算"] = week_df["內掃原始分"].clip(upper=2)
-                                week_df["外掃結算"] = week_df["外掃原始分"].clip(upper=2)
-                                trash_total = week_df["垃圾內掃原始分"] + week_df["垃圾外掃原始分"]
-                                trash_total = trash_total.where(trash_total > 0, week_df["垃圾原始分"])
-                                week_df["垃圾結算"] = trash_total.clip(upper=2)
-                                
-                                week_morning_penalty = week_df["晨間打掃原始分"].clip(lower=0)
-                                week_df["總扣分"] = week_df["內掃結算"]+week_df["外掃結算"]+week_df["垃圾結算"]+week_morning_penalty+week_df["手機人數"]
-                                
-                                rep = week_df.groupby("班級")["總扣分"].sum().reset_index()
-                                cls_df = pd.DataFrame(structured_classes).rename(columns={"grade":"年級","name":"班級"})
-                                fin = pd.merge(cls_df, rep, on="班級", how="left").fillna(0)
-                                fin["總成績"] = 90 - fin["總扣分"]
-                                
-                                def get_week_grade_label(s):
-                                    if s == 0: return "⭐ 優良"
-                                    elif s <= 3: return "✅ 普通"
-                                    else: return "⚠️ 需加強"
-                                fin["評等"] = fin["總扣分"].apply(get_week_grade_label)
-                                
-                                if rank_mode == "全校":
-                                    fin_sorted = fin.sort_values("總成績", ascending=False).reset_index(drop=True)
-                                    fin_sorted.insert(0, "排名", range(1, len(fin_sorted) + 1))
-                                    st.dataframe(fin_sorted[["排名", "年級", "班級", "總扣分", "總成績", "評等"]], hide_index=True)
+
+                            if st.button("🚀 計算並顯示當週成績"):
+                                scored = calc_scores(full[full["週次"] == sel_week])
+                                fin = build_ranking(scored, full, structured_classes)
+                                by_grade = (rank_mode == "年級")
+                                fin_ranked = add_rank_and_label(fin, by_grade=by_grade)
+                                detail = build_detail(scored)
+
+                                # ── 畫面顯示 ──
+                                if by_grade:
+                                    for g in sorted(fin_ranked["年級"].unique()):
+                                        st.write(f"#### {g} 排名")
+                                        g_df = fin_ranked[fin_ranked["年級"]==g]
+                                        st.dataframe(g_df[["排名","班級","總扣分","優良次數","總成績","評等"]], hide_index=True)
                                 else:
-                                    for g in sorted(fin["年級"].unique()):
-                                        if g != "其他":
-                                            st.write(f"#### {g} 排名")
-                                            g_df = fin[fin["年級"]==g].sort_values("總成績", ascending=False).reset_index(drop=True).copy()
-                                            g_df.insert(0, "排名", range(1, len(g_df) + 1))
-                                            st.dataframe(g_df[["排名", "班級", "總扣分", "總成績", "評等"]], hide_index=True)
-                    
+                                    st.dataframe(fin_ranked[["排名","年級","班級","總扣分","優良次數","總成績","評等"]], hide_index=True)
+
+                                st.markdown("---")
+                                st.write(f"##### 📋 第 {sel_week} 週扣分明細（共 {len(detail)} 筆）")
+                                if detail.empty:
+                                    st.success("本週無任何扣分紀錄！")
+                                else:
+                                    st.dataframe(detail, hide_index=True)
+
+                                # ── Excel 下載 ──
+                                st.markdown("---")
+                                sheets = {"排名總表": fin_ranked[["排名","年級","班級","總扣分","優良次數","總成績","評等"]]}
+                                if by_grade:
+                                    for g in sorted(fin_ranked["年級"].unique()):
+                                        sheets[f"{g}排名"] = fin_ranked[fin_ranked["年級"]==g][["排名","班級","總扣分","優良次數","總成績","評等"]]
+                                sheets["扣分明細"] = detail
+                                excel_bytes = to_excel_bytes(sheets)
+                                st.download_button(
+                                    label=f"📥 下載第 {sel_week} 週成績報表 (Excel)",
+                                    data=excel_bytes,
+                                    file_name=f"衛生成績_第{sel_week}週_{today_tw.strftime('%Y%m%d')}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                )
+
                     with tab_semester:
                         st.write("計算全學期累計總扣分與總成績")
                         sem_rank_mode = st.radio("學期排名方式", ["全校", "年級"], horizontal=True, key="sem_rank")
-                        
-                        if st.button("🚀 計算全學期成績", key="sem_btn"):
-                            full_calc = full[~full["評分項目"].astype(str).str.contains("優良")].copy()
-                            full_calc["內掃結算"] = full_calc["內掃原始分"].clip(upper=2)
-                            full_calc["外掃結算"] = full_calc["外掃原始分"].clip(upper=2)
-                            trash_total = full_calc["垃圾內掃原始分"] + full_calc["垃圾外掃原始分"]
-                            trash_total = trash_total.where(trash_total > 0, full_calc["垃圾原始分"])
-                            full_calc["垃圾結算"] = trash_total.clip(upper=2)
-                            
-                            full_calc["總扣分"] = full_calc["內掃結算"]+full_calc["外掃結算"]+full_calc["垃圾結算"]+full_calc["晨間打掃原始分"]+full_calc["手機人數"]
-                            rep = full_calc.groupby("班級")["總扣分"].sum().reset_index()
-                            cls_df = pd.DataFrame(structured_classes).rename(columns={"grade":"年級","name":"班級"})
-                            fin = pd.merge(cls_df, rep, on="班級", how="left").fillna(0)
-                            
-                            fin["總成績"] = 90 - fin["總扣分"]
-                            
-                            def get_sem_grade_label(s):
-                                if s == 0: return "⭐ 優良"
-                                elif s <= 10: return "✅ 普通"
-                                else: return "⚠️ 需加強"
-                            fin["評等"] = fin["總扣分"].apply(get_sem_grade_label)
-                            
-                            if sem_rank_mode == "全校":
-                                fin_sorted = fin.sort_values("總成績", ascending=False).reset_index(drop=True)
-                                fin_sorted.insert(0, "排名", range(1, len(fin_sorted) + 1))
-                                st.dataframe(fin_sorted[["排名", "年級", "班級", "總扣分", "總成績", "評等"]], hide_index=True)
+
+                        if st.button("🚀 計算並顯示全學期成績", key="sem_btn"):
+                            scored = calc_scores(full)
+                            fin = build_ranking(scored, full, structured_classes)
+                            by_grade = (sem_rank_mode == "年級")
+                            fin_ranked = add_rank_and_label(fin, by_grade=by_grade, threshold_good=10)
+                            detail = build_detail(scored)
+
+                            # ── 畫面顯示 ──
+                            if by_grade:
+                                for g in sorted(fin_ranked["年級"].unique()):
+                                    st.write(f"#### {g} 排名")
+                                    g_df = fin_ranked[fin_ranked["年級"]==g]
+                                    st.dataframe(g_df[["排名","班級","總扣分","優良次數","總成績","評等"]], hide_index=True)
                             else:
-                                for g in sorted(fin["年級"].unique()):
-                                    if g != "其他":
-                                        st.write(f"#### {g}")
-                                        g_df = fin[fin["年級"]==g].sort_values("總成績", ascending=False).reset_index(drop=True).copy()
-                                        g_df.insert(0, "排名", range(1, len(g_df) + 1))
-                                        st.dataframe(g_df[["排名", "班級", "總扣分", "總成績", "評等"]], hide_index=True)
+                                st.dataframe(fin_ranked[["排名","年級","班級","總扣分","優良次數","總成績","評等"]], hide_index=True)
+
+                            st.markdown("---")
+                            st.write(f"##### 📋 全學期扣分明細（共 {len(detail)} 筆）")
+                            if detail.empty:
+                                st.success("學期內無任何扣分紀錄！")
+                            else:
+                                # 扣分明細太多時，提供依班級篩選
+                                all_cls_options = ["全部班級"] + sorted(detail["班級"].unique().tolist())
+                                sel_cls_filter = st.selectbox("篩選班級（可只看單班明細）", all_cls_options, key="sem_detail_filter")
+                                detail_show = detail if sel_cls_filter == "全部班級" else detail[detail["班級"]==sel_cls_filter]
+                                st.dataframe(detail_show, hide_index=True)
+
+                            # ── Excel 下載（多分頁：總排名 + 各年級 + 各班明細） ──
+                            st.markdown("---")
+                            sheets = {"學期排名總表": fin_ranked[["排名","年級","班級","總扣分","優良次數","總成績","評等"]]}
+                            if by_grade:
+                                for g in sorted(fin_ranked["年級"].unique()):
+                                    sheets[f"{g}排名"] = fin_ranked[fin_ranked["年級"]==g][["排名","班級","總扣分","優良次數","總成績","評等"]]
+                            # 各班各週明細：樞紐表（班級 x 週次）
+                            if not detail.empty:
+                                pivot = detail.pivot_table(index="班級", columns="週次", values="總扣分", aggfunc="sum", fill_value=0)
+                                pivot["學期總扣分"] = pivot.sum(axis=1)
+                                pivot = pivot.reset_index()
+                                sheets["各班週次扣分樞紐"] = pivot
+                                sheets["全學期扣分明細"] = detail
+                                # 每個年級各自一張扣分明細分頁
+                                cls_df_map = pd.DataFrame(structured_classes).rename(columns={"grade":"年級","name":"班級"})
+                                for g in sorted(cls_df_map["年級"].unique()):
+                                    if g == "其他": continue
+                                    g_classes = cls_df_map[cls_df_map["年級"]==g]["班級"].tolist()
+                                    g_detail = detail[detail["班級"].isin(g_classes)]
+                                    if not g_detail.empty:
+                                        sheets[f"{g}扣分明細"] = g_detail
+                            excel_bytes = to_excel_bytes(sheets)
+                            st.download_button(
+                                label="📥 下載全學期成績報表 (Excel，含多分頁)",
+                                data=excel_bytes,
+                                file_name=f"衛生成績_全學期_{today_tw.strftime('%Y%m%d')}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
             with t1:
                 # [V5.29 Patch] 本週晨掃進度追蹤 (含過去缺交)
                 st.subheader("🕵️‍♀️ 晨掃進度追蹤 (本週)")
@@ -1687,9 +1931,25 @@ try:
                         
                 st.markdown("---")
                 st.subheader("📝 待審核回報列表")
-                
-                df = main_df 
-                for i, r in df[df["評分項目"].isin(["晨間打掃", "晨間打掃(當日補掃)", "晨間打掃(補掃)"]) & (df["晨間打掃原始分"]==0) & (df["修正"]!="TRUE")].iterrows():
+
+                # [防跳掉] 用 session_state 記錄本地已審核的 ID，避免每次按鈕都刷新整頁
+                if "approved_morning_ids" not in st.session_state:
+                    st.session_state.approved_morning_ids = set()
+
+                df = main_df
+                pending_df = df[
+                    df["評分項目"].isin(["晨間打掃", "晨間打掃(當日補掃)", "晨間打掃(補掃)"]) &
+                    (df["晨間打掃原始分"] == 0) &
+                    (df["修正"] != "TRUE") &
+                    (~df["紀錄ID"].astype(str).isin(st.session_state.approved_morning_ids))
+                ]
+
+                if pending_df.empty:
+                    st.success("🎉 目前沒有待審核的晨掃回報！")
+                else:
+                    st.caption(f"共 {len(pending_df)} 筆待審核，審核後不會立刻跳頁，可以繼續審核其他筆。")
+
+                for i, r in pending_df.iterrows():
                     with st.container(border=True):
                         c1, c2, c3 = st.columns([2,2,1.3])
                         
@@ -1704,62 +1964,32 @@ try:
                         
                         reply_msg = c1.text_input("💬 給予回應 (可留白)", key=f"rm_{r['紀錄ID']}")
 
+                        def _do_approve(record_id, score_val, eval_label, note_text, reply):
+                            ws = get_worksheet(SHEET_TABS["main"])
+                            id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
+                            if str(record_id) in id_list:
+                                ridx = id_list.index(str(record_id)) + 1
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, score_val)
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, eval_label)
+                                old_note = str(df.loc[df["紀錄ID"].astype(str)==str(record_id), "備註"].iloc[0]) if not df.loc[df["紀錄ID"].astype(str)==str(record_id)].empty else ""
+                                new_note = f"{old_note} \n組長回覆: {reply}" if reply else f"{old_note} \n組長核可: {note_text}"
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
+                                st.session_state.approved_morning_ids.add(str(record_id))
+                                load_main_data.clear()
+                                c1.success(f"✅ 已核可：{note_text}")
+
                         if is_makeup:
                             if c3.button("✅ 4人補掃(學期+1)", key=f"m4_{r['紀錄ID']}"):
-                                ws = get_worksheet(SHEET_TABS["main"])
-                                id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
-                                if str(r["紀錄ID"]) in id_list:
-                                    ridx = id_list.index(str(r["紀錄ID"])) + 1
-                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, -1) 
-                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(學期加分)")
-                                    
-                                    old_note = str(r['備註'])
-                                    new_note = f"{old_note} \n組長回覆: {reply_msg}" if reply_msg else f"{old_note} \n組長核可: 4人補掃(學期總分+1)"
-                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
-                                    load_main_data.clear()
-                                    st.rerun()
-
+                                _do_approve(r["紀錄ID"], -1, "晨間打掃(學期加分)", "4人補掃(學期總分+1)", reply_msg)
                             if c3.button("✅ 2人補掃(學期+1)", key=f"m2_{r['紀錄ID']}"):
-                                ws = get_worksheet(SHEET_TABS["main"])
-                                id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
-                                if str(r["紀錄ID"]) in id_list:
-                                    ridx = id_list.index(str(r["紀錄ID"])) + 1
-                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, -1)
-                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(學期加分)")
-                                    
-                                    old_note = str(r['備註'])
-                                    new_note = f"{old_note} \n組長回覆: {reply_msg}" if reply_msg else f"{old_note} \n組長核可: 2人補掃(學期總分+1)"
-                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
-                                    load_main_data.clear()
-                                    st.rerun()
+                                _do_approve(r["紀錄ID"], -1, "晨間打掃(學期加分)", "2人補掃(學期總分+1)", reply_msg)
                         else:
-                            if c3.button("✅ 4人全到(學期+2)", key=f"p4_{r['紀錄ID']}"): 
-                                ws = get_worksheet(SHEET_TABS["main"])
-                                id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
-                                if str(r["紀錄ID"]) in id_list:
-                                    ridx = id_list.index(str(r["紀錄ID"])) + 1
-                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, -2) 
-                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(學期加分)")
-                                    old_note = str(r['備註'])
-                                    new_note = f"{old_note} \n組長回覆: {reply_msg}" if reply_msg else f"{old_note} \n組長核可: 4人全到(學期總分+2)"
-                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
-                                    load_main_data.clear()
-                                    st.rerun()
+                            if c3.button("✅ 4人全到(學期+2)", key=f"p4_{r['紀錄ID']}"):
+                                _do_approve(r["紀錄ID"], -2, "晨間打掃(學期加分)", "4人全到(學期總分+2)", reply_msg)
+                            if c3.button("✅ 2人全到(學期+1)", key=f"p2_{r['紀錄ID']}"):
+                                _do_approve(r["紀錄ID"], -1, "晨間打掃(學期加分)", "2人全到(學期總分+1)", reply_msg)
 
-                            if c3.button("✅ 2人全到(學期+1)", key=f"p2_{r['紀錄ID']}"): 
-                                ws = get_worksheet(SHEET_TABS["main"])
-                                id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
-                                if str(r["紀錄ID"]) in id_list:
-                                    ridx = id_list.index(str(r["紀錄ID"])) + 1
-                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, -1) 
-                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(學期加分)")
-                                    old_note = str(r['備註'])
-                                    new_note = f"{old_note} \n組長回覆: {reply_msg}" if reply_msg else f"{old_note} \n組長核可: 2人全到(學期總分+1)"
-                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
-                                    load_main_data.clear()
-                                    st.rerun()
-
-                        if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}"): 
+                        if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}"):
                             ws = get_worksheet(SHEET_TABS["main"])
                             id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
                             if str(r["紀錄ID"]) in id_list:
@@ -1769,9 +1999,15 @@ try:
                                 rej_msg = reply_msg if reply_msg else "未達標準，請見諒"
                                 new_note = f"{old_note} \n組長駁回: {rej_msg}"
                                 ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
-                                
+                                st.session_state.approved_morning_ids.add(str(r["紀錄ID"]))
                                 load_main_data.clear()
-                                st.rerun()
+                                c1.error("🗑️ 已駁回")
+
+                if not pending_df.empty or st.session_state.approved_morning_ids:
+                    if st.button("🔄 審核完畢，重新整理列表"):
+                        st.session_state.approved_morning_ids.clear()
+                        load_main_data.clear()
+                        st.rerun()
 
             with t_settings:
                 st.subheader("⚙️ 系統設定與維護")
@@ -1781,7 +2017,8 @@ try:
                 
                 st.markdown("---")
                 st.write("📅 **週次手動對照表**（解決寒假跨週問題）")
-                st.caption("格式：每週一日期:週次號碼，用逗號分隔。例如：2025-01-23:1,2025-02-23:2,2025-03-02:3\n填入後，系統會依此對照計算週次，不再用純數學計算。留空則回到自動計算模式。")
+                st.write("📅 **週次手動對照表**（解決寒假跨週問題）")
+                st.caption("只需填「錨點」：每個學期重置點的週一日期與週次號碼，用逗號分隔。\n\n例如：`2025-01-23:1,2025-02-23:2`\n\n這樣填即可：第1週從1/23起，第2週從2/23起，第3週之後系統會自動從2/23往後每7天累計，不需要填完所有週次。")
                 curr_week_map = SYSTEM_CONFIG.get("week_map", "")
                 new_week_map = st.text_area("週次對照表", value=curr_week_map, placeholder="2025-01-23:1,2025-02-23:2,2025-03-02:3,...")
                 if st.button("💾 儲存週次對照表"):
