@@ -918,6 +918,22 @@ try:
         font-family: 'Noto Sans TC', sans-serif !important;
     }
 
+    /* ── 修正手機上 radio / checkbox / selectbox 文字顏色 ── */
+    .stRadio label p,
+    .stRadio label span,
+    [data-testid="stRadio"] label,
+    [data-testid="stRadio"] p,
+    .stCheckbox label p,
+    .stCheckbox label span,
+    [data-testid="stCheckbox"] label,
+    [data-testid="stSelectbox"] span,
+    [data-testid="stSelectbox"] p,
+    .stSelectbox label,
+    .stMarkdown p,
+    .stText p {
+        color: #1a2a4a !important;
+    }
+
     /* ── 主內容區背景 ── */
     .stApp {
         background: #f0f4f9;
