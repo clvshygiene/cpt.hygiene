@@ -1691,32 +1691,45 @@ try:
                             rank_val = int(cr["排名"])
                             score_val = int(cr["總成績"])
                             deduct_val = int(cr["總扣分"])
-                            grade_val = str(cr["評等"])
                             exc_val = int(cr["優良次數"])
 
-                            color = "#f0fff4" if "優良" in grade_val else ("#fffbeb" if "普通" in grade_val else "#fff5f5")
-                            border = "#38a169" if "優良" in grade_val else ("#f6ad55" if "普通" in grade_val else "#fc8181")
-                            st.markdown(f"""
-                            <div style='background:{color};border:2px solid {border};border-radius:14px;padding:20px 24px;text-align:center;margin-bottom:16px'>
-                                <div style='font-size:14px;color:#718096;margin-bottom:4px'>第 {sel_pub_week} 週 · {cls} · {grade_val}</div>
-                                <div style='font-size:48px;font-weight:700;color:#2d3748'>#{rank_val}</div>
-                                <div style='font-size:15px;color:#4a5568;margin-top:6px'>
-                                    總成績 {score_val} 分 &nbsp;|&nbsp; 扣分 {deduct_val} 分 &nbsp;|&nbsp; ⭐ 優良 {exc_val} 次
-                                </div>
-                            </div>
-                            """, unsafe_allow_html=True)
+                            # 用扣分決定卡片顏色，不顯示評等避免與糾察優良混淆
+                            color = "#f0fff4" if deduct_val == 0 else ("#fffbeb" if deduct_val <= 3 else "#fff5f5")
+                            border = "#38a169" if deduct_val == 0 else ("#f6ad55" if deduct_val <= 3 else "#fc8181")
+                            st.markdown(
+                                f"<div style='background:{color};border:2px solid {border};border-radius:14px;padding:20px 24px;text-align:center;margin-bottom:16px'>"
+                                f"<div style='font-size:14px;color:#718096;margin-bottom:4px'>第 {sel_pub_week} 週 &nbsp;·&nbsp; {cls}</div>"
+                                f"<div style='font-size:48px;font-weight:700;color:#2d3748'>#{rank_val}</div>"
+                                f"<div style='font-size:15px;color:#4a5568;margin-top:6px'>"
+                                f"總成績 {score_val} 分 &nbsp;|&nbsp; 扣分 {deduct_val} 分 &nbsp;|&nbsp; ⭐ 優良評分 {exc_val} 次"
+                                f"</div></div>",
+                                unsafe_allow_html=True
+                            )
                         else:
                             st.warning(f"找不到 {cls} 在第 {sel_pub_week} 週的排名資料。")
 
-                        # 顯示同年級排名
-                        cls_grade = next((c["grade"] for c in structured_classes if c["name"] == cls), "")
-                        grade_pub = week_pub[week_pub["年級"] == cls_grade] if cls_grade else week_pub
-                        if not grade_pub.empty:
-                            st.markdown(f"##### {cls_grade} 完整排名")
+                        # 判斷是否為全校排名：若多個年級的班級排名不從1重新開始，代表是全校制
+                        grades_in_pub = week_pub["年級"].nunique()
+                        max_rank_per_grade = week_pub.groupby("年級")["排名"].min()
+                        is_school_wide = grades_in_pub > 1 and (max_rank_per_grade > 1).any()
+
+                        if is_school_wide:
+                            # 全校排名：顯示所有班級
+                            st.markdown("##### 全校完整排名")
                             st.dataframe(
-                                grade_pub[["排名","班級","總扣分","優良次數","總成績","評等"]].reset_index(drop=True),
+                                week_pub[["排名","年級","班級","總扣分","優良次數","總成績"]].sort_values("排名").reset_index(drop=True),
                                 hide_index=True
                             )
+                        else:
+                            # 年級排名：只顯示同年級
+                            cls_grade = next((c["grade"] for c in structured_classes if c["name"] == cls), "")
+                            grade_pub = week_pub[week_pub["年級"] == cls_grade] if cls_grade else week_pub
+                            if not grade_pub.empty:
+                                st.markdown(f"##### {cls_grade} 完整排名")
+                                st.dataframe(
+                                    grade_pub[["排名","班級","總扣分","優良次數","總成績"]].reset_index(drop=True),
+                                    hide_index=True
+                                )
                         if pub_time:
                             st.caption(f"發布時間：{pub_time}")
 
