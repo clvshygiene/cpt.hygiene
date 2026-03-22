@@ -58,7 +58,7 @@ try:
         "main": "main_data", "settings": "settings", "roster": "roster",
         "inspectors": "inspectors", "duty": "duty",
         "appeals": "appeals", "holidays": "holidays", "service_hours": "service_hours",
-        "office_areas": "office_areas"
+        "office_areas": "office_areas", "published_results": "published_results"
     }
 
     EXPECTED_COLUMNS = [
@@ -545,7 +545,7 @@ try:
             if current_date.weekday() < 5 and current_date not in holidays: workdays += 1
         return today <= current_date
 
-    @st.cache_data(ttl=360)
+    @st.cache_data(ttl=600)   # [效能] 10分鐘，降低尖峰 API 請求頻率
     def load_main_data():
         ws = get_worksheet(SHEET_TABS["main"])
         if not ws: return pd.DataFrame(columns=EXPECTED_COLUMNS)
@@ -593,7 +593,7 @@ try:
             return sorted_all, [{"grade": f"{get_sort_key(c)[0]}年級" if get_sort_key(c)[0]!=99 else "其他", "name": c} for c in sorted_all]
         except: return [], []
 
-    @st.cache_data(ttl=60)
+    @st.cache_data(ttl=300)   # [效能] 5分鐘，尖峰時段不必每分鐘重打
     def get_daily_duty(target_date):
         ws = get_worksheet(SHEET_TABS["duty"])
         if not ws: return pd.DataFrame(), "error"
@@ -636,7 +636,7 @@ try:
             except: return False
         return False
 
-    @st.cache_data(ttl=60)
+    @st.cache_data(ttl=300)   # [效能] 5分鐘，申訴資料不需秒級更新
     def load_appeals():
         ws = get_worksheet(SHEET_TABS["appeals"])
         if not ws: return pd.DataFrame(columns=APPEAL_COLUMNS)
@@ -646,6 +646,54 @@ try:
                 if col not in df.columns: df[col] = "待處理" if col == "處理狀態" else ""
             return df[APPEAL_COLUMNS]
         except: return pd.DataFrame(columns=APPEAL_COLUMNS)
+
+    PUBLISHED_COLS = ["週次", "排名", "年級", "班級", "總扣分", "優良次數", "總成績", "評等", "發布時間"]
+
+    @st.cache_data(ttl=300)   # [效能] 5分鐘快取，發布後學生很快就看得到
+    def load_published_results():
+        ws = get_worksheet(SHEET_TABS["published_results"])
+        if not ws: return pd.DataFrame(columns=PUBLISHED_COLS)
+        try:
+            df = pd.DataFrame(ws.get_all_records())
+            if df.empty: return pd.DataFrame(columns=PUBLISHED_COLS)
+            for col in PUBLISHED_COLS:
+                if col not in df.columns: df[col] = ""
+            for col in ["週次", "排名", "總扣分", "優良次數", "總成績"]:
+                if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+            return df
+        except: return pd.DataFrame(columns=PUBLISHED_COLS)
+
+    def publish_week_results(week_num, fin_ranked_df):
+        """將計算好的週次排名寫入 published_results sheet，同一週再發布會覆蓋舊資料"""
+        ws = get_worksheet(SHEET_TABS["published_results"])
+        if not ws: return False, "無法連線至 Google Sheets"
+        try:
+            # 讀取現有資料，刪除同一週次的舊資料
+            existing = ws.get_all_values()
+            if len(existing) > 1:
+                rows_to_delete = [i+1 for i, row in enumerate(existing[1:], 1)
+                                  if row and str(row[0]) == str(week_num)]
+                for ridx in sorted(rows_to_delete, reverse=True):
+                    ws.delete_rows(ridx + 1)  # +1 因為 header 佔第一行
+
+            # 寫入新資料
+            now_str = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M")
+            for _, row in fin_ranked_df.iterrows():
+                ws.append_row([
+                    int(week_num),
+                    int(row.get("排名", 0)),
+                    str(row.get("年級", "")),
+                    str(row.get("班級", "")),
+                    int(row.get("總扣分", 0)),
+                    int(row.get("優良次數", 0)),
+                    int(row.get("總成績", 0)),
+                    str(row.get("評等", "")),
+                    now_str
+                ])
+            load_published_results.clear()
+            return True, f"第 {week_num} 週成績已發布！學生現在可以查詢。"
+        except Exception as e:
+            return False, str(e)
 
     def save_appeal(entry, proof_file=None):
         pending_count = get_pending_count()
@@ -751,7 +799,10 @@ try:
     def check_duplicate_record(df, check_date, inspector, role, target_class=None):
         if df.empty: return False
         try:
-            mask = (df["日期"].astype(str) == str(check_date)) & (df["檢查人員"] == inspector) & (df["評分項目"] == role)
+            # 同時比對原始 role、以及加了(優良)/(普通) 的變體，避免重複評分
+            mask = (df["日期"].astype(str) == str(check_date)) & \
+                   (df["檢查人員"] == inspector) & \
+                   (df["評分項目"].astype(str).str.startswith(role))
             if target_class: mask &= (df["班級"] == target_class)
             return not df[mask].empty
         except: return False
@@ -794,7 +845,7 @@ try:
         enqueue_task("volunteer_report" if student_list is not None else "main_entry", payload)
         return True
 
-    @st.cache_data(ttl=360)
+    @st.cache_data(ttl=1800)  # [效能] 30分鐘，報表用途不需頻繁更新
     def load_full_semester_data_for_export():
         ws = get_worksheet(SHEET_TABS["main"])
         if not ws: return pd.DataFrame(columns=EXPECTED_COLUMNS)
@@ -857,10 +908,231 @@ try:
             return max(0, ((d - start).days // 7) + 1)
         except: return 0
 
-    st.sidebar.title("🏫 功能選單")
-    
+    # ── 全域樣式注入 ─────────────────────────────────────────
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap');
+
+    /* ── 全域字體 ── */
+    html, body, [class*="css"] {
+        font-family: 'Noto Sans TC', sans-serif !important;
+    }
+
+    /* ── 修正手機上 radio / checkbox / selectbox 文字顏色 ── */
+    .stRadio label p,
+    .stRadio label span,
+    [data-testid="stRadio"] label,
+    [data-testid="stRadio"] p,
+    .stCheckbox label p,
+    .stCheckbox label span,
+    [data-testid="stCheckbox"] label,
+    [data-testid="stSelectbox"] span,
+    [data-testid="stSelectbox"] p,
+    .stSelectbox label,
+    .stMarkdown p,
+    .stText p {
+        color: #1a2a4a !important;
+    }
+
+    /* ── 主內容區背景 ── */
+    .stApp {
+        background: #f0f4f9;
+    }
+    [data-testid="stAppViewContainer"] > .main {
+        background: #f0f4f9;
+    }
+
+    /* ── 主內容區塊加陰影卡片感 ── */
+    [data-testid="stVerticalBlock"] > div > [data-testid="stVerticalBlock"] {
+        background: white;
+        border-radius: 16px;
+        padding: 4px 0;
+    }
+
+    /* ── 頁面標題 h1 ── */
+    h1 {
+        color: #1a2a4a !important;
+        font-weight: 700 !important;
+        font-size: 26px !important;
+        border-left: 5px solid #3182ce;
+        padding-left: 12px !important;
+        margin-bottom: 20px !important;
+    }
+    h2 { color: #2c3e6b !important; font-weight: 600 !important; }
+    h3 { color: #2c4a8a !important; }
+
+    /* ── 所有按鈕 ── */
+    .stButton > button {
+        border-radius: 10px !important;
+        font-weight: 600 !important;
+        font-size: 14px !important;
+        padding: 8px 18px !important;
+        border: none !important;
+        background: linear-gradient(135deg, #2b6cb0, #3182ce) !important;
+        color: white !important;
+        box-shadow: 0 2px 8px rgba(49,130,206,0.35) !important;
+        transition: all 0.2s ease !important;
+    }
+    .stButton > button:hover {
+        background: linear-gradient(135deg, #1a4a8a, #2b6cb0) !important;
+        box-shadow: 0 4px 14px rgba(49,130,206,0.45) !important;
+        transform: translateY(-1px) !important;
+    }
+    .stButton > button:active { transform: translateY(0px) !important; }
+
+    /* ── 下載按鈕特別用綠色 ── */
+    [data-testid="stDownloadButton"] > button {
+        background: linear-gradient(135deg, #276749, #38a169) !important;
+        box-shadow: 0 2px 8px rgba(56,161,105,0.35) !important;
+    }
+    [data-testid="stDownloadButton"] > button:hover {
+        background: linear-gradient(135deg, #1c4f37, #276749) !important;
+    }
+
+    /* ── 表單送出按鈕 ── */
+    [data-testid="stFormSubmitButton"] > button {
+        width: 100% !important;
+        background: linear-gradient(135deg, #553c9a, #6b46c1) !important;
+        box-shadow: 0 2px 8px rgba(107,70,193,0.35) !important;
+        font-size: 16px !important;
+        padding: 12px !important;
+    }
+    [data-testid="stFormSubmitButton"] > button:hover {
+        background: linear-gradient(135deg, #44337a, #553c9a) !important;
+    }
+
+    /* ── input / selectbox / text_area ── */
+    .stTextInput > div > div > input,
+    .stTextArea > div > div > textarea,
+    .stNumberInput > div > div > input {
+        border-radius: 8px !important;
+        border: 1.5px solid #c9d7e8 !important;
+        background: #fafcff !important;
+        font-size: 14px !important;
+        transition: border 0.2s;
+    }
+    .stTextInput > div > div > input:focus,
+    .stTextArea > div > div > textarea:focus {
+        border-color: #3182ce !important;
+        box-shadow: 0 0 0 3px rgba(49,130,206,0.15) !important;
+    }
+
+    /* ── selectbox ── */
+    [data-testid="stSelectbox"] > div > div {
+        border-radius: 8px !important;
+        border: 1.5px solid #c9d7e8 !important;
+        background: #fafcff !important;
+    }
+
+    /* ── info / warning / error / success 提示框 ── */
+    [data-testid="stAlert"] {
+        border-radius: 10px !important;
+        border-left-width: 5px !important;
+        font-size: 14px !important;
+    }
+
+    /* ── expander ── */
+    [data-testid="stExpander"] {
+        border: 1.5px solid #d8e4f0 !important;
+        border-radius: 12px !important;
+        background: white !important;
+        box-shadow: 0 1px 6px rgba(0,0,0,0.06) !important;
+    }
+    [data-testid="stExpander"] summary {
+        font-weight: 600 !important;
+        font-size: 15px !important;
+        color: #1a2a4a !important;
+        padding: 12px 16px !important;
+    }
+
+    /* ── container border ── */
+    [data-testid="stVerticalBlockBorderWrapper"] {
+        border: 1.5px solid #d8e4f0 !important;
+        border-radius: 14px !important;
+        background: white !important;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.05) !important;
+        padding: 12px !important;
+    }
+
+    /* ── dataframe / table ── */
+    [data-testid="stDataFrame"] {
+        border-radius: 10px !important;
+        overflow: hidden !important;
+        box-shadow: 0 1px 8px rgba(0,0,0,0.07) !important;
+    }
+
+    /* ── tabs ── */
+    [data-testid="stTabs"] [role="tab"] {
+        font-weight: 600 !important;
+        font-size: 14px !important;
+        border-radius: 8px 8px 0 0 !important;
+        padding: 8px 16px !important;
+    }
+    [data-testid="stTabs"] [role="tab"][aria-selected="true"] {
+        color: #2b6cb0 !important;
+        border-bottom: 3px solid #3182ce !important;
+    }
+
+    /* ── divider ── */
+    hr { border-color: #d8e4f0 !important; margin: 16px 0 !important; }
+
+    /* ══════════════════════════════
+       側邊欄
+    ══════════════════════════════ */
+    [data-testid="stSidebar"] {
+        background: linear-gradient(160deg, #1a2a4a 0%, #0d1b35 100%) !important;
+    }
+    [data-testid="stSidebar"] * { color: #e8edf5 !important; }
+    [data-testid="stSidebar"] .stRadio > label { display: none; }
+    [data-testid="stSidebar"] .stRadio div[role="radiogroup"] {
+        display: flex; flex-direction: column; gap: 6px; margin-top: 4px;
+    }
+    [data-testid="stSidebar"] .stRadio div[role="radiogroup"] label {
+        display: flex !important; align-items: center;
+        background: rgba(255,255,255,0.07);
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 10px;
+        padding: 10px 14px;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        font-size: 15px !important;
+        font-weight: 500 !important;
+    }
+    [data-testid="stSidebar"] .stRadio div[role="radiogroup"] label:hover {
+        background: rgba(255,255,255,0.15);
+        border-color: rgba(255,255,255,0.3);
+        transform: translateX(3px);
+    }
+    [data-testid="stSidebar"] .stRadio div[role="radiogroup"] label:has(input:checked) {
+        background: rgba(99,179,237,0.25);
+        border-color: #63b3ed;
+        color: #ffffff !important;
+    }
+    [data-testid="stSidebar"] .stRadio input[type="radio"] { display: none; }
+    [data-testid="stSidebar"] h1 {
+        font-size: 20px !important; font-weight: 700 !important;
+        color: #ffffff !important;
+        padding-bottom: 8px;
+        border-bottom: 1px solid rgba(255,255,255,0.15);
+        margin-bottom: 14px !important;
+        border-left: none !important;
+        padding-left: 0 !important;
+    }
+    .sidebar-footer {
+        position: fixed; bottom: 20px; left: 0;
+        width: 240px; text-align: center;
+        font-size: 11px; color: rgba(255,255,255,0.3);
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.sidebar.title("🏫 衛愛而生")
+    st.sidebar.markdown("<div style='font-size:12px;color:rgba(255,255,255,0.4);margin-top:-12px;margin-bottom:16px;'>中壢家商 衛生組管理系統</div>", unsafe_allow_html=True)
+
     menu_options = ["糾察底家👀", "班級負責人🥸", "晨掃志工隊🧹", "愛校任務認領 🤝", "組長ㄉ窩💃"]
     app_mode = st.sidebar.radio("請選擇模式", menu_options)
+
+    st.sidebar.markdown("<div class='sidebar-footer'>中壢家商 衛生組 © 2025</div>", unsafe_allow_html=True)
 
     # --- Mode: 愛校任務認領 🤝 ---
     if app_mode == "愛校任務認領 🤝":
@@ -1076,19 +1348,21 @@ try:
                         # [即時進度] 用 session_state 補足背景非同步的延遲
                         if "submitted_inspections" not in st.session_state:
                             st.session_state.submitted_inspections = set()
-                        completed_records = main_df[(main_df["日期"].astype(str) == str(input_date)) & (main_df["檢查人員"] == inspector_name)]["班級"].tolist()
-                        completed_classes = set(completed_records) | {
-                            c for c in st.session_state.submitted_inspections
-                            if c.startswith(f"{input_date}__{inspector_name}__")
-                            and c.split("__")[2] in assigned_classes
-                        }
-                        # 統一清出班級名稱
-                        completed_class_names = set()
-                        for item in completed_classes:
-                            if "__" in str(item):
-                                completed_class_names.add(item.split("__")[2])
-                            else:
-                                completed_class_names.add(item)
+
+                        # 從 Google Sheet 讀到的已完成班級（字串，直接是班級名稱）
+                        sheet_done = set(
+                            main_df[
+                                (main_df["日期"].astype(str) == str(input_date)) &
+                                (main_df["檢查人員"] == inspector_name)
+                            ]["班級"].astype(str).tolist()
+                        )
+                        # 從 session_state 讀到的本地已送出班級（格式：日期__糾察名__班級）
+                        local_done = set(
+                            key.split("__")[2]
+                            for key in st.session_state.submitted_inspections
+                            if key.startswith(f"{input_date}__{inspector_name}__")
+                        )
+                        completed_class_names = sheet_done | local_done
                         pending_classes = [c for c in assigned_classes if c not in completed_class_names]
 
                         # 合併「任務類型 + 進度」為同一個框
@@ -1216,57 +1490,232 @@ try:
         st.title("🔎 班級成績查詢")
         df, appeals_df = load_main_data(), load_appeals()
         appeal_map = {str(r.get("對應紀錄ID")): {"status": str(r.get("處理狀態", "")), "reply": str(r.get("審核回覆", ""))} for _, r in appeals_df.iterrows()} if not appeals_df.empty else {}
-        
+
         sel_grade_m2 = st.radio("選擇年級", grades, horizontal=True, key="m2_grade_select")
         cls_opts = [c["name"] for c in structured_classes if c["grade"] == sel_grade_m2]
-        
+
         if cls_opts:
             cls = st.selectbox("選擇班級", cls_opts, key="m2_cls_select")
             if cls and not df.empty:
-                for idx, r in df[df["班級"] == cls].sort_values("登錄時間", ascending=False).iterrows():
-                    trash_score = r['垃圾內掃原始分'] + r['垃圾外掃原始分']
-                    if trash_score == 0: trash_score = r['垃圾原始分']
-                    
-                    tot = r['內掃原始分'] + r['外掃原始分'] + trash_score + r['晨間打掃原始分']
-                    rid = str(r['紀錄ID'])
-                    ap_info = appeal_map.get(rid, {})
-                    ap_st = ap_info.get("status")
-                    ap_reply = ap_info.get("reply")
-                    
-                    icon = "✅" if ap_st=="已核可" else "🚫" if ap_st=="已駁回" else "⏳" if ap_st=="待處理" else "🛠️" if str(r['修正'])=="TRUE" else ""
-                    
-                    disp_time = str(r.get('登錄時間', ''))
-                    time_str = disp_time.split(' ')[-1] if disp_time else ''
-                    
-                    score_disp = "⭐ 優良 (無扣分)" if "優良" in str(r['評分項目']) else ("🙂 普通 (無扣分)" if "普通" in str(r['評分項目']) else (f"加 {abs(tot)} 分 (學期)" if tot < 0 else f"扣: {tot}"))
-                    
-                    with st.expander(f"{icon} {r['日期']} {time_str} - {r['評分項目']} ({score_disp})"):
-                        st.caption(f"登錄時間：{disp_time if disp_time else '未紀錄'}") 
-                        st.write(f"🧑‍✈️ **評分人員:** {r.get('檢查人員', '未知')}")
-                        st.write(f"📝 **備註:** {r['備註']}")
-                        
-                        if ap_st:
-                            if ap_st == "待處理": st.info("⏳ 申訴審核中...")
-                            elif ap_st == "已核可": st.success(f"✅ 申訴成功。組長回覆: {ap_reply if ap_reply else '無'}")
-                            elif ap_st == "已駁回": st.error(f"🚫 申訴駁回。組長回覆: {ap_reply if ap_reply else '無'}")
-                            
-                        if str(r['照片路徑']) and "http" in str(r['照片路徑']): st.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=200)
-                        if not ap_st and is_within_appeal_period(r['日期']) and (tot > 0 or r['手機人數'] > 0):
-                            with st.form(f"ap_{rid}"):
-                                # 將原本擠在同一行的程式碼拆成兩行，並各自加上專屬的 key
-                                rsn = st.text_area("理由", key=f"rsn_{rid}")
-                                pf = st.file_uploader("佐證", type=['jpg','png'], key=f"pf_{rid}")
-    
-                                if st.form_submit_button("申訴"):
-                                    if time.time() - st.session_state.last_action_time < 3:
-                                        st.warning("⚠️ 系統處理中，請勿連續點擊！")
-                                    elif rsn and pf:
-                                        st.session_state.last_action_time = time.time()
-                                        if save_appeal({"班級": cls, "違規日期": str(r["日期"]), "違規項目": r['評分項目'], "原始扣分": str(tot), "申訴理由": rsn, "對應紀錄ID": rid}, pf):
-                                            time.sleep(1.5)
-                                            st.rerun()
-                                    else:
-                                        st.error("請填寫理由並上傳照片")
+                cls_df = df[df["班級"] == cls].copy()
+
+                # ── [效能] 預計算申訴期限，不在每筆 loop 裡重複呼叫 ──
+                holidays = load_holidays()
+                def _appeal_deadline(vd):
+                    try:
+                        current_date, workdays = (pd.to_datetime(str(vd)).date() if isinstance(vd, str) else vd), 0
+                        for _ in range(14):
+                            if workdays >= 3: break
+                            current_date += timedelta(days=1)
+                            if current_date.weekday() < 5 and current_date not in holidays: workdays += 1
+                        return current_date
+                    except: return date.today()
+
+                unique_dates = cls_df["日期"].astype(str).unique()
+                appeal_deadline_map = {d: _appeal_deadline(d) for d in unique_dates}
+
+                # ── 摘要卡片 ──
+                now_week = get_week_num(today_tw)
+                week_df = cls_df[cls_df["週次"] == now_week] if "週次" in cls_df.columns else pd.DataFrame()
+
+                def _calc_tot(r):
+                    tr = r['垃圾內掃原始分'] + r['垃圾外掃原始分']
+                    if tr == 0: tr = r['垃圾原始分']
+                    return r['內掃原始分'] + r['外掃原始分'] + tr + r['晨間打掃原始分']
+
+                def _is_real_deduct(r):
+                    item = str(r['評分項目'])
+                    # 排除優良、普通、學期加分（晨掃），以及已修正紀錄
+                    return (not any(x in item for x in ["優良", "普通", "學期加分"])
+                            and str(r['修正']) != "TRUE")
+
+                def _is_bonus(r):
+                    # 學期加分紀錄（晨間打掃(學期加分)，分數為負）
+                    return "學期加分" in str(r['評分項目']) and _calc_tot(r) < 0
+
+                # 本週：只算正數扣分
+                week_deduct = sum(max(_calc_tot(r), 0) for _, r in week_df.iterrows()
+                                  if _is_real_deduct(r)) if not week_df.empty else 0
+                # 學期：扣分與加分分開
+                total_deduct = max(sum(max(_calc_tot(r), 0) for _, r in cls_df.iterrows() if _is_real_deduct(r)), 0)
+                total_bonus  = sum(abs(_calc_tot(r)) for _, r in cls_df.iterrows() if _is_bonus(r))
+
+                pending_appeals = sum(1 for rid in [str(r['紀錄ID']) for _, r in cls_df.iterrows()]
+                                      if appeal_map.get(rid, {}).get("status") == "待處理")
+
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.markdown(
+                    f"<div style='background:#f0f7ff;border-radius:12px;padding:14px 16px;border-left:4px solid #3182ce'>"
+                    f"<div style='font-size:12px;color:#555;margin-bottom:4px'>本週扣分</div>"
+                    f"<div style='font-size:26px;font-weight:700;color:{'#e53e3e' if week_deduct>0 else '#38a169'}'>{week_deduct} 分</div>"
+                    f"</div>", unsafe_allow_html=True)
+                mc2.markdown(
+                    f"<div style='background:#f0f7ff;border-radius:12px;padding:14px 16px;border-left:4px solid #805ad5'>"
+                    f"<div style='font-size:12px;color:#555;margin-bottom:4px'>待處理申訴</div>"
+                    f"<div style='font-size:26px;font-weight:700;color:{'#d69e2e' if pending_appeals>0 else '#38a169'}'>{pending_appeals} 件</div>"
+                    f"</div>", unsafe_allow_html=True)
+                # 第三張卡片：有加分時同時顯示扣分與加分
+                if total_bonus > 0:
+                    mc3_content = (
+                        f"<div style='font-size:12px;color:#555;margin-bottom:4px'>學期扣分 / 加分</div>"
+                        f"<div style='font-size:22px;font-weight:700;color:#e53e3e'>{total_deduct} 分</div>"
+                        f"<div style='font-size:14px;font-weight:600;color:#38a169;margin-top:2px'>🌟 加分 {total_bonus} 分</div>"
+                    )
+                else:
+                    mc3_content = (
+                        f"<div style='font-size:12px;color:#555;margin-bottom:4px'>學期累計扣分</div>"
+                        f"<div style='font-size:26px;font-weight:700;color:{'#e53e3e' if total_deduct>0 else '#38a169'}'>{total_deduct} 分</div>"
+                    )
+                mc3.markdown(
+                    f"<div style='background:#f0f7ff;border-radius:12px;padding:14px 16px;border-left:4px solid #dd6b20'>"
+                    f"{mc3_content}</div>", unsafe_allow_html=True)
+
+                st.markdown("<div style='margin-top:16px'></div>", unsafe_allow_html=True)
+
+                # ── 分頁 ──
+                tab_records, tab_ranking = st.tabs(["📋 扣分明細", "🏆 各週排名"])
+
+                with tab_records:
+                    records = cls_df.sort_values("登錄時間", ascending=False)
+                    if records.empty:
+                        st.success("🎉 目前沒有任何評分紀錄！")
+                    else:
+                        for idx, r in records.iterrows():
+                            trash_score = r['垃圾內掃原始分'] + r['垃圾外掃原始分']
+                            if trash_score == 0: trash_score = r['垃圾原始分']
+                            tot = r['內掃原始分'] + r['外掃原始分'] + trash_score + r['晨間打掃原始分']
+                            rid = str(r['紀錄ID'])
+                            ap_info = appeal_map.get(rid, {})
+                            ap_st = ap_info.get("status")
+                            ap_reply = ap_info.get("reply")
+                            is_excellent = "優良" in str(r['評分項目'])
+                            is_normal = "普通" in str(r['評分項目'])
+                            is_corrected = str(r['修正']) == "TRUE"
+
+                            # 決定卡片顏色
+                            if ap_st == "已核可" or is_corrected:
+                                card_color, border_color, tag_bg, tag_color = "#f0fff4","#38a169","#c6f6d5","#276749"
+                                tag_text = "✅ 申訴成功" if ap_st == "已核可" else "🛠️ 已修正"
+                            elif ap_st == "已駁回":
+                                card_color, border_color, tag_bg, tag_color, tag_text = "#fff5f5","#fc8181","#fed7d7","#9b2c2c","🚫 申訴駁回"
+                            elif ap_st == "待處理":
+                                card_color, border_color, tag_bg, tag_color, tag_text = "#fffbeb","#f6ad55","#fefcbf","#744210","⏳ 申訴中"
+                            elif is_excellent:
+                                card_color, border_color, tag_bg, tag_color, tag_text = "#f0fff4","#68d391","#c6f6d5","#276749","⭐ 優良"
+                            elif is_normal:
+                                card_color, border_color, tag_bg, tag_color, tag_text = "#f7fafc","#a0aec0","#edf2f7","#4a5568","✅ 普通"
+                            elif "學期加分" in str(r['評分項目']):
+                                card_color, border_color, tag_bg, tag_color = "#f0fff4","#38a169","#c6f6d5","#276749"
+                                tag_text = f"🌟 學期加 {abs(tot)} 分"
+                            else:
+                                card_color, border_color, tag_bg, tag_color = "#fff5f5","#fc8181","#fed7d7","#9b2c2c"
+                                if tot < 0:
+                                    card_color, border_color, tag_bg, tag_color = "#f0fff4","#38a169","#c6f6d5","#276749"
+                                    tag_text = f"🌟 學期加 {abs(tot)} 分"
+                                else:
+                                    tag_text = f"❌ 扣 {tot} 分"
+
+                            disp_time = str(r.get('登錄時間', ''))
+                            date_str = str(r['日期'])
+                            week_str = f"第{r.get('週次','')}週"
+
+                            # [關鍵修正] 預先組好所有動態欄位，避免巢狀 f-string 破壞 HTML 結構
+                            import html as _html
+                            inspector_safe = _html.escape(str(r.get('檢查人員', '未知')))
+                            item_safe      = _html.escape(str(r['評分項目']))
+                            note_raw       = str(r.get('備註', '')).strip()
+                            note_part      = f"&nbsp;|&nbsp; 📝 {_html.escape(note_raw)}" if note_raw else ""
+                            time_part      = f'<div style="font-size:12px;color:#718096;margin-top:4px">登錄：{_html.escape(disp_time)}</div>' if disp_time else ""
+
+                            st.markdown(
+                                f"<div style='background:{card_color};border:1.5px solid {border_color};border-radius:12px;padding:12px 16px;margin-bottom:10px'>"
+                                f"<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px'>"
+                                f"<div style='font-weight:600;font-size:15px'>{date_str} <span style='color:#718096;font-size:13px'>{week_str}</span></div>"
+                                f"<span style='background:{tag_bg};color:{tag_color};border-radius:20px;padding:3px 12px;font-size:13px;font-weight:600'>{tag_text}</span>"
+                                f"</div>"
+                                f"<div style='font-size:13px;color:#4a5568;margin-top:6px'>🧑‍✈️ {inspector_safe} &nbsp;|&nbsp; 📌 {item_safe}{note_part}</div>"
+                                f"{time_part}"
+                                f"</div>",
+                                unsafe_allow_html=True
+                            )
+
+                            # 申訴回覆
+                            if ap_st == "已核可":
+                                st.success(f"✅ 申訴成功。組長回覆：{ap_reply if ap_reply else '無'}")
+                            elif ap_st == "已駁回":
+                                st.error(f"🚫 申訴駁回。組長回覆：{ap_reply if ap_reply else '無'}")
+                            elif ap_st == "待處理":
+                                st.info("⏳ 申訴審核中，請耐心等候...")
+
+                            # 違規照片
+                            if str(r.get('照片路徑','')).strip() and "http" in str(r['照片路徑']):
+                                with st.expander("📷 查看照片"):
+                                    st.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=200)
+
+                            # 申訴表單（使用預計算的期限，不重複呼叫函式）
+                            deadline = appeal_deadline_map.get(date_str, date.today())
+                            if not ap_st and date.today() <= deadline and (tot > 0 or r['手機人數'] > 0):
+                                with st.expander(f"📣 提出申訴（截止 {deadline.strftime('%m/%d')}）"):
+                                    with st.form(f"ap_{rid}"):
+                                        rsn = st.text_area("申訴理由", key=f"rsn_{rid}")
+                                        pf = st.file_uploader("佐證照片", type=['jpg','png'], key=f"pf_{rid}")
+                                        if st.form_submit_button("送出申訴"):
+                                            if time.time() - st.session_state.last_action_time < 3:
+                                                st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                                            elif rsn and pf:
+                                                st.session_state.last_action_time = time.time()
+                                                if save_appeal({"班級": cls, "違規日期": date_str, "違規項目": r['評分項目'], "原始扣分": str(tot), "申訴理由": rsn, "對應紀錄ID": rid}, pf):
+                                                    time.sleep(1.5)
+                                                    st.rerun()
+                                            else:
+                                                st.error("請填寫理由並上傳照片")
+
+                with tab_ranking:
+                    pub_df = load_published_results()
+                    if pub_df.empty:
+                        st.info("📭 組長尚未發布任何週次的成績，請耐心等候！")
+                    else:
+                        available_pub_weeks = sorted(pub_df["週次"].unique(), reverse=True)
+                        sel_pub_week = st.selectbox("選擇查詢週次", available_pub_weeks,
+                                                    format_func=lambda w: f"第 {w} 週", key="m2_pub_week")
+                        week_pub = pub_df[pub_df["週次"] == sel_pub_week]
+                        cls_row = week_pub[week_pub["班級"] == cls]
+
+                        pub_time = week_pub["發布時間"].iloc[0] if not week_pub.empty else ""
+
+                        if not cls_row.empty:
+                            cr = cls_row.iloc[0]
+                            rank_val = int(cr["排名"])
+                            score_val = int(cr["總成績"])
+                            deduct_val = int(cr["總扣分"])
+                            grade_val = str(cr["評等"])
+                            exc_val = int(cr["優良次數"])
+
+                            color = "#f0fff4" if "優良" in grade_val else ("#fffbeb" if "普通" in grade_val else "#fff5f5")
+                            border = "#38a169" if "優良" in grade_val else ("#f6ad55" if "普通" in grade_val else "#fc8181")
+                            st.markdown(f"""
+                            <div style='background:{color};border:2px solid {border};border-radius:14px;padding:20px 24px;text-align:center;margin-bottom:16px'>
+                                <div style='font-size:14px;color:#718096;margin-bottom:4px'>第 {sel_pub_week} 週 · {cls} · {grade_val}</div>
+                                <div style='font-size:48px;font-weight:700;color:#2d3748'>#{rank_val}</div>
+                                <div style='font-size:15px;color:#4a5568;margin-top:6px'>
+                                    總成績 {score_val} 分 &nbsp;|&nbsp; 扣分 {deduct_val} 分 &nbsp;|&nbsp; ⭐ 優良 {exc_val} 次
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        else:
+                            st.warning(f"找不到 {cls} 在第 {sel_pub_week} 週的排名資料。")
+
+                        # 顯示同年級排名
+                        cls_grade = next((c["grade"] for c in structured_classes if c["name"] == cls), "")
+                        grade_pub = week_pub[week_pub["年級"] == cls_grade] if cls_grade else week_pub
+                        if not grade_pub.empty:
+                            st.markdown(f"##### {cls_grade} 完整排名")
+                            st.dataframe(
+                                grade_pub[["排名","班級","總扣分","優良次數","總成績","評等"]].reset_index(drop=True),
+                                hide_index=True
+                            )
+                        if pub_time:
+                            st.caption(f"發布時間：{pub_time}")
 
     # --- Mode 3: 晨掃志工隊🧹 ---
     elif app_mode == "晨掃志工隊🧹":
@@ -1717,6 +2166,9 @@ try:
                                 by_grade = (rank_mode == "年級")
                                 fin_ranked = add_rank_and_label(fin, by_grade=by_grade)
                                 detail = build_detail(scored)
+                                # 儲存供發布使用
+                                st.session_state["last_computed_week"] = sel_week
+                                st.session_state["last_computed_ranking"] = fin_ranked
 
                                 # ── 畫面顯示 ──
                                 if by_grade:
@@ -1748,6 +2200,18 @@ try:
                                     file_name=f"衛生成績_第{sel_week}週_{today_tw.strftime('%Y%m%d')}.xlsx",
                                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                                 )
+
+                            # ── 發布按鈕（計算完後才會出現）──
+                            if st.session_state.get("last_computed_week") == sel_week and \
+                               st.session_state.get("last_computed_ranking") is not None:
+                                st.markdown("---")
+                                st.info(f"💡 計算完成後，可將第 {sel_week} 週成績發布給學生查詢。")
+                                if st.button(f"📢 發布第 {sel_week} 週成績給學生", key="publish_week_btn"):
+                                    ok, msg = publish_week_results(sel_week, st.session_state["last_computed_ranking"])
+                                    if ok:
+                                        st.success(f"✅ {msg}")
+                                    else:
+                                        st.error(f"❌ 發布失敗：{msg}")
 
                     with tab_semester:
                         st.write("計算全學期累計總扣分與總成績")
@@ -1908,7 +2372,9 @@ try:
                                 ridx = id_list.index(str(record_id)) + 1
                                 ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, score_val)
                                 ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, eval_label)
-                                old_note = str(df.loc[df["紀錄ID"].astype(str)==str(record_id), "備註"].iloc[0]) if not df.loc[df["紀錄ID"].astype(str)==str(record_id)].empty else ""
+                                # [Fix③] 明確使用 main_df，不依賴外層 df 變數
+                                matched = main_df.loc[main_df["紀錄ID"].astype(str) == str(record_id), "備註"]
+                                old_note = str(matched.iloc[0]) if not matched.empty else ""
                                 new_note = f"{old_note} \n組長回覆: {reply}" if reply else f"{old_note} \n組長核可: {note_text}"
                                 ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
                                 st.session_state.approved_morning_ids.add(str(record_id))
@@ -1953,7 +2419,6 @@ try:
                 if st.button("更新開學日"): save_setting("semester_start", str(nd))
                 
                 st.markdown("---")
-                st.write("📅 **週次手動對照表**（解決寒假跨週問題）")
                 st.write("📅 **週次手動對照表**（解決寒假跨週問題）")
                 st.caption("只需填「錨點」：每個學期重置點的週一日期與週次號碼，用逗號分隔。\n\n例如：`2025-01-23:1,2025-02-23:2`\n\n這樣填即可：第1週從1/23起，第2週從2/23起，第3週之後系統會自動從2/23往後每7天累計，不需要填完所有週次。")
                 curr_week_map = SYSTEM_CONFIG.get("week_map", "")
