@@ -1217,7 +1217,7 @@ try:
             <div class="mascot-container-h">
                 <img src="{mascot_url}" class="mascot-img-h" />
                 <div class="speech-bubble-h">
-                    <strong>📢 組長廣播 / 糾察重點：</strong><br><br>
+                    <strong>📢 組長廣播 / 糾察重點：</strong><br>
                     {formatted_hygiene}
                 </div>
             </div>
@@ -1849,7 +1849,7 @@ try:
                         <div class="mascot-container">
                             <img src="{mascot_url}" class="mascot-img" />
                             <div class="speech-bubble">
-                                <strong>📢 組長廣播 / 今日任務：</strong><br><br>
+                                <strong>📢 組長廣播 / 今日任務：</strong><br>
                                 {formatted_task}
                             </div>
                         </div>
