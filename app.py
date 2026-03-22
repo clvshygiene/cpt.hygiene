@@ -1101,7 +1101,7 @@ try:
                         
                         with st.form("score_form", clear_on_submit=True):
                             in_s, out_s, ph_c, note = 0, 0, 0, ""
-                            check_result = st.radio("檢查結果", ["⭐ 優良", "✅ 普通", "❌ 違規(需扣分)"], horizontal=True)
+                            check_result = st.radio("檢查結果", ["⭐ 優良", "🙂 普通", "❌ 違規(需扣分)"], horizontal=True)
                             if check_result == "❌ 違規(需扣分)":
                                 if role == "內掃檢查":
                                     in_s = st.number_input("內掃扣分", 0)
@@ -1124,7 +1124,7 @@ try:
                                         # 優良：記錄一筆扣分為0的優良紀錄
                                         if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(優良)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": "本次檢查表現優良，無扣分項目"}, uploaded_files=files if files else None, award_inspector_hours=is_last_task):
                                             st.success("⭐ 優良紀錄已登記！"); time.sleep(1.5); st.rerun()
-                                    elif check_result == "✅ 普通":
+                                    elif check_result == "🙂 普通":
                                         # 普通：記錄一筆扣分為0的普通紀錄
                                         if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(普通)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": "本次檢查無扣分，表現普通"}, uploaded_files=files if files else None, award_inspector_hours=is_last_task):
                                             st.success("✅ 普通紀錄已登記！"); time.sleep(1.5); st.rerun()
@@ -1169,7 +1169,7 @@ try:
                     disp_time = str(r.get('登錄時間', ''))
                     time_str = disp_time.split(' ')[-1] if disp_time else ''
                     
-                    score_disp = "⭐ 優良 (無扣分)" if "優良" in str(r['評分項目']) else ("✅ 普通 (無扣分)" if "普通" in str(r['評分項目']) else (f"加 {abs(tot)} 分 (學期)" if tot < 0 else f"扣: {tot}"))
+                    score_disp = "⭐ 優良 (無扣分)" if "優良" in str(r['評分項目']) else ("🙂 普通 (無扣分)" if "普通" in str(r['評分項目']) else (f"加 {abs(tot)} 分 (學期)" if tot < 0 else f"扣: {tot}"))
                     
                     with st.expander(f"{icon} {r['日期']} {time_str} - {r['評分項目']} ({score_disp})"):
                         st.caption(f"登錄時間：{disp_time if disp_time else '未紀錄'}") 
@@ -1541,12 +1541,78 @@ try:
             with t2:
                 st.subheader("📊 成績總表")
                 full = load_full_semester_data_for_export()
-                
+
+                # ── 共用計算函式 ──────────────────────────────────────────
+                def calc_scores(df_raw):
+                    """回傳含結算欄位的 DataFrame（已排除優良/普通紀錄）"""
+                    df = df_raw[~df_raw["評分項目"].astype(str).str.contains("優良|普通")].copy()
+                    df["內掃結算"] = df["內掃原始分"].clip(upper=2)
+                    df["外掃結算"] = df["外掃原始分"].clip(upper=2)
+                    trash = df["垃圾內掃原始分"] + df["垃圾外掃原始分"]
+                    trash = trash.where(trash > 0, df["垃圾原始分"])
+                    df["垃圾結算"] = trash.clip(upper=2)
+                    df["總扣分"] = df["內掃結算"] + df["外掃結算"] + df["垃圾結算"] + df["晨間打掃原始分"].clip(lower=0) + df["手機人數"]
+                    return df
+
+                def build_ranking(scored_df, classes_struct, base_score=90):
+                    """依班級彙總扣分，合併完整班級清單，加上總成績"""
+                    rep = scored_df.groupby("班級")["總扣分"].sum().reset_index()
+                    cls_df = pd.DataFrame(classes_struct).rename(columns={"grade": "年級", "name": "班級"})
+                    fin = pd.merge(cls_df, rep, on="班級", how="left").fillna(0)
+                    fin["總成績"] = base_score - fin["總扣分"]
+                    return fin
+
+                def add_rank_and_label(fin_df, by_grade=False, threshold_good=3):
+                    """排序並加上排名、評等欄位；by_grade=True 時各年級獨立排名"""
+                    def label(s):
+                        if s == 0:   return "⭐ 優良"
+                        if s <= threshold_good: return "✅ 普通"
+                        return "⚠️ 需加強"
+
+                    if not by_grade:
+                        out = fin_df.sort_values("總成績", ascending=False).reset_index(drop=True).copy()
+                        out.insert(0, "排名", range(1, len(out)+1))
+                        out["評等"] = out["總扣分"].apply(label)
+                        return out
+                    else:
+                        pieces = []
+                        for g in sorted(fin_df["年級"].unique()):
+                            if g == "其他": continue
+                            g_df = fin_df[fin_df["年級"]==g].sort_values("總成績", ascending=False).reset_index(drop=True).copy()
+                            g_df.insert(0, "排名", range(1, len(g_df)+1))
+                            g_df["評等"] = g_df["總扣分"].apply(label)
+                            pieces.append(g_df)
+                        return pd.concat(pieces, ignore_index=True) if pieces else fin_df
+
+                def build_detail(scored_df):
+                    """各班扣分明細：每筆違規紀錄，含日期/週次/評分項目/扣分/備註"""
+                    cols = ["日期", "週次", "班級", "評分項目", "檢查人員",
+                            "內掃結算", "外掃結算", "垃圾結算", "手機人數", "總扣分", "備註", "違規細項"]
+                    avail = [c for c in cols if c in scored_df.columns]
+                    detail = scored_df[scored_df["總扣分"] > 0][avail].sort_values(["班級","日期"])
+                    return detail
+
+                def to_excel_bytes(sheets_dict):
+                    """產生多分頁 Excel，sheets_dict = {分頁名稱: DataFrame}"""
+                    buf = io.BytesIO()
+                    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                        for sheet_name, df in sheets_dict.items():
+                            safe_name = sheet_name[:31]  # Excel 分頁名稱上限 31 字
+                            df.to_excel(writer, sheet_name=safe_name, index=False)
+                            ws = writer.sheets[safe_name]
+                            # 自動調整欄寬
+                            for col_cells in ws.columns:
+                                max_len = max((len(str(c.value)) if c.value else 0) for c in col_cells)
+                                ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 4, 40)
+                    buf.seek(0)
+                    return buf.getvalue()
+
+                # ── UI ───────────────────────────────────────────────────
                 if full.empty:
                     st.info("目前無評分資料")
                 else:
                     tab_week, tab_semester = st.tabs(["📅 單週成績結算", "🏆 全學期總結算"])
-                    
+
                     with tab_week:
                         available_weeks = sorted([w for w in full["週次"].unique() if w > 0])
                         if not available_weeks:
@@ -1555,82 +1621,106 @@ try:
                             sel_week = st.selectbox("請選擇結算週次", available_weeks, index=len(available_weeks)-1)
                             is_fall = (today_tw.month >= 8 or today_tw.month == 1)
                             default_mode = "年級 (上學期制)" if is_fall else "全校 (下學期制)"
-                            
                             st.info(f"💡 系統偵測目前為 **{'上' if is_fall else '下'}學期**，預設採用 **{default_mode}** 排名。")
                             rank_mode = st.radio("排名方式 (可手動更改)", ["年級", "全校"], index=0 if is_fall else 1, horizontal=True)
-                            
-                            if st.button("🚀 計算當週成績"):
-                                week_df = full[full["週次"] == sel_week].copy()
-                                # 優良/普通紀錄不計入扣分
-                                week_df = week_df[~week_df["評分項目"].astype(str).str.contains("優良|普通")]
-                                week_df["內掃結算"] = week_df["內掃原始分"].clip(upper=2)
-                                week_df["外掃結算"] = week_df["外掃原始分"].clip(upper=2)
-                                trash_total = week_df["垃圾內掃原始分"] + week_df["垃圾外掃原始分"]
-                                trash_total = trash_total.where(trash_total > 0, week_df["垃圾原始分"])
-                                week_df["垃圾結算"] = trash_total.clip(upper=2)
-                                
-                                week_morning_penalty = week_df["晨間打掃原始分"].clip(lower=0)
-                                week_df["總扣分"] = week_df["內掃結算"]+week_df["外掃結算"]+week_df["垃圾結算"]+week_morning_penalty+week_df["手機人數"]
-                                
-                                rep = week_df.groupby("班級")["總扣分"].sum().reset_index()
-                                cls_df = pd.DataFrame(structured_classes).rename(columns={"grade":"年級","name":"班級"})
-                                fin = pd.merge(cls_df, rep, on="班級", how="left").fillna(0)
-                                fin["總成績"] = 90 - fin["總扣分"]
-                                
-                                def get_week_grade_label(s):
-                                    if s == 0: return "⭐ 優良"
-                                    elif s <= 3: return "✅ 普通"
-                                    else: return "⚠️ 需加強"
-                                fin["評等"] = fin["總扣分"].apply(get_week_grade_label)
-                                
-                                if rank_mode == "全校":
-                                    fin_sorted = fin.sort_values("總成績", ascending=False).reset_index(drop=True)
-                                    fin_sorted.insert(0, "排名", range(1, len(fin_sorted) + 1))
-                                    st.dataframe(fin_sorted[["排名", "年級", "班級", "總扣分", "總成績", "評等"]], hide_index=True)
+
+                            if st.button("🚀 計算並顯示當週成績"):
+                                scored = calc_scores(full[full["週次"] == sel_week])
+                                fin = build_ranking(scored, structured_classes)
+                                by_grade = (rank_mode == "年級")
+                                fin_ranked = add_rank_and_label(fin, by_grade=by_grade)
+                                detail = build_detail(scored)
+
+                                # ── 畫面顯示 ──
+                                if by_grade:
+                                    for g in sorted(fin_ranked["年級"].unique()):
+                                        st.write(f"#### {g} 排名")
+                                        g_df = fin_ranked[fin_ranked["年級"]==g]
+                                        st.dataframe(g_df[["排名","班級","總扣分","總成績","評等"]], hide_index=True)
                                 else:
-                                    for g in sorted(fin["年級"].unique()):
-                                        if g != "其他":
-                                            st.write(f"#### {g} 排名")
-                                            g_df = fin[fin["年級"]==g].sort_values("總成績", ascending=False).reset_index(drop=True).copy()
-                                            g_df.insert(0, "排名", range(1, len(g_df) + 1))
-                                            st.dataframe(g_df[["排名", "班級", "總扣分", "總成績", "評等"]], hide_index=True)
-                    
+                                    st.dataframe(fin_ranked[["排名","年級","班級","總扣分","總成績","評等"]], hide_index=True)
+
+                                st.markdown("---")
+                                st.write(f"##### 📋 第 {sel_week} 週扣分明細（共 {len(detail)} 筆）")
+                                if detail.empty:
+                                    st.success("本週無任何扣分紀錄！")
+                                else:
+                                    st.dataframe(detail, hide_index=True)
+
+                                # ── Excel 下載 ──
+                                st.markdown("---")
+                                sheets = {"排名總表": fin_ranked[["排名","年級","班級","總扣分","總成績","評等"]]}
+                                if by_grade:
+                                    for g in sorted(fin_ranked["年級"].unique()):
+                                        sheets[f"{g}排名"] = fin_ranked[fin_ranked["年級"]==g][["排名","班級","總扣分","總成績","評等"]]
+                                sheets["扣分明細"] = detail
+                                excel_bytes = to_excel_bytes(sheets)
+                                st.download_button(
+                                    label=f"📥 下載第 {sel_week} 週成績報表 (Excel)",
+                                    data=excel_bytes,
+                                    file_name=f"衛生成績_第{sel_week}週_{today_tw.strftime('%Y%m%d')}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                )
+
                     with tab_semester:
                         st.write("計算全學期累計總扣分與總成績")
                         sem_rank_mode = st.radio("學期排名方式", ["全校", "年級"], horizontal=True, key="sem_rank")
-                        
-                        if st.button("🚀 計算全學期成績", key="sem_btn"):
-                            full_calc = full[~full["評分項目"].astype(str).str.contains("優良|普通")].copy()
-                            full_calc["內掃結算"] = full_calc["內掃原始分"].clip(upper=2)
-                            full_calc["外掃結算"] = full_calc["外掃原始分"].clip(upper=2)
-                            trash_total = full_calc["垃圾內掃原始分"] + full_calc["垃圾外掃原始分"]
-                            trash_total = trash_total.where(trash_total > 0, full_calc["垃圾原始分"])
-                            full_calc["垃圾結算"] = trash_total.clip(upper=2)
-                            
-                            full_calc["總扣分"] = full_calc["內掃結算"]+full_calc["外掃結算"]+full_calc["垃圾結算"]+full_calc["晨間打掃原始分"]+full_calc["手機人數"]
-                            rep = full_calc.groupby("班級")["總扣分"].sum().reset_index()
-                            cls_df = pd.DataFrame(structured_classes).rename(columns={"grade":"年級","name":"班級"})
-                            fin = pd.merge(cls_df, rep, on="班級", how="left").fillna(0)
-                            
-                            fin["總成績"] = 90 - fin["總扣分"]
-                            
-                            def get_sem_grade_label(s):
-                                if s == 0: return "⭐ 優良"
-                                elif s <= 10: return "✅ 普通"
-                                else: return "⚠️ 需加強"
-                            fin["評等"] = fin["總扣分"].apply(get_sem_grade_label)
-                            
-                            if sem_rank_mode == "全校":
-                                fin_sorted = fin.sort_values("總成績", ascending=False).reset_index(drop=True)
-                                fin_sorted.insert(0, "排名", range(1, len(fin_sorted) + 1))
-                                st.dataframe(fin_sorted[["排名", "年級", "班級", "總扣分", "總成績", "評等"]], hide_index=True)
+
+                        if st.button("🚀 計算並顯示全學期成績", key="sem_btn"):
+                            scored = calc_scores(full)
+                            fin = build_ranking(scored, structured_classes)
+                            by_grade = (sem_rank_mode == "年級")
+                            fin_ranked = add_rank_and_label(fin, by_grade=by_grade, threshold_good=10)
+                            detail = build_detail(scored)
+
+                            # ── 畫面顯示 ──
+                            if by_grade:
+                                for g in sorted(fin_ranked["年級"].unique()):
+                                    st.write(f"#### {g} 排名")
+                                    g_df = fin_ranked[fin_ranked["年級"]==g]
+                                    st.dataframe(g_df[["排名","班級","總扣分","總成績","評等"]], hide_index=True)
                             else:
-                                for g in sorted(fin["年級"].unique()):
-                                    if g != "其他":
-                                        st.write(f"#### {g}")
-                                        g_df = fin[fin["年級"]==g].sort_values("總成績", ascending=False).reset_index(drop=True).copy()
-                                        g_df.insert(0, "排名", range(1, len(g_df) + 1))
-                                        st.dataframe(g_df[["排名", "班級", "總扣分", "總成績", "評等"]], hide_index=True)
+                                st.dataframe(fin_ranked[["排名","年級","班級","總扣分","總成績","評等"]], hide_index=True)
+
+                            st.markdown("---")
+                            st.write(f"##### 📋 全學期扣分明細（共 {len(detail)} 筆）")
+                            if detail.empty:
+                                st.success("學期內無任何扣分紀錄！")
+                            else:
+                                # 扣分明細太多時，提供依班級篩選
+                                all_cls_options = ["全部班級"] + sorted(detail["班級"].unique().tolist())
+                                sel_cls_filter = st.selectbox("篩選班級（可只看單班明細）", all_cls_options, key="sem_detail_filter")
+                                detail_show = detail if sel_cls_filter == "全部班級" else detail[detail["班級"]==sel_cls_filter]
+                                st.dataframe(detail_show, hide_index=True)
+
+                            # ── Excel 下載（多分頁：總排名 + 各年級 + 各班明細） ──
+                            st.markdown("---")
+                            sheets = {"學期排名總表": fin_ranked[["排名","年級","班級","總扣分","總成績","評等"]]}
+                            if by_grade:
+                                for g in sorted(fin_ranked["年級"].unique()):
+                                    sheets[f"{g}排名"] = fin_ranked[fin_ranked["年級"]==g][["排名","班級","總扣分","總成績","評等"]]
+                            # 各班各週明細：樞紐表（班級 x 週次）
+                            if not detail.empty:
+                                pivot = detail.pivot_table(index="班級", columns="週次", values="總扣分", aggfunc="sum", fill_value=0)
+                                pivot["學期總扣分"] = pivot.sum(axis=1)
+                                pivot = pivot.reset_index()
+                                sheets["各班週次扣分樞紐"] = pivot
+                                sheets["全學期扣分明細"] = detail
+                                # 每個年級各自一張扣分明細分頁
+                                cls_df_map = pd.DataFrame(structured_classes).rename(columns={"grade":"年級","name":"班級"})
+                                for g in sorted(cls_df_map["年級"].unique()):
+                                    if g == "其他": continue
+                                    g_classes = cls_df_map[cls_df_map["年級"]==g]["班級"].tolist()
+                                    g_detail = detail[detail["班級"].isin(g_classes)]
+                                    if not g_detail.empty:
+                                        sheets[f"{g}扣分明細"] = g_detail
+                            excel_bytes = to_excel_bytes(sheets)
+                            st.download_button(
+                                label="📥 下載全學期成績報表 (Excel，含多分頁)",
+                                data=excel_bytes,
+                                file_name=f"衛生成績_全學期_{today_tw.strftime('%Y%m%d')}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
             with t1:
                 # [V5.29 Patch] 本週晨掃進度追蹤 (含過去缺交)
                 st.subheader("🕵️‍♀️ 晨掃進度追蹤 (本週)")
