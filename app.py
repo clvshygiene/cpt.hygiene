@@ -1138,8 +1138,7 @@ try:
     app_mode = st.sidebar.radio("請選擇模式", menu_options)
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown("📅 [衛生組公告欄兼行事曆](https://www.notion.so/312b7f229eea80c584a1e794c7b955a4)")
-    st.sidebar.markdown("🐻‍❄️ [衛生組Instagram](https://www.instagram.com/clvs_captain.h/)")
+    st.sidebar.markdown("📅 [衛生組行事曆](https://www.notion.so/312b7f229eea80c584a1e794c7b955a4)")
     st.sidebar.markdown("<div class='sidebar-footer'>中壢家商 衛生組 © 2025</div>", unsafe_allow_html=True)
 
     # --- Mode: 愛校任務認領 🤝 ---
@@ -1196,7 +1195,7 @@ try:
 
     # --- Mode 1: 糾察評分 ---
     elif app_mode == "糾察底家👀":
-        st.title("📝 糾察評分系統")
+        st.title("📝 衛生糾察評分系統")
         if "team_logged_in" not in st.session_state: st.session_state["team_logged_in"] = False
 
         daily_hygiene = SYSTEM_CONFIG.get("daily_hygiene_task", "")
@@ -1920,7 +1919,9 @@ try:
                                 else:
                                     # 依據 is_makeup 變更存入的任務名稱
                                     task_name = "晨間打掃(補掃)" if is_makeup else "晨間打掃"
-                                    
+                                    # [給分自動計算] 把應到人數也存進備註，供組長審核時自動算分
+                                    score_note = f"[應到:{n_std}人 實到:{len(all_present)}人 {'補掃' if is_makeup else '準時'}] {final_note}"
+
                                     ok = save_entry(
                                         {
                                             "日期": str(today_tw), 
@@ -1929,7 +1930,7 @@ try:
                                             "檢查人員": f"志工(實到:{len(all_present)})", 
                                             "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), 
                                             "晨間打掃原始分": 0, 
-                                            "備註": final_note
+                                            "備註": score_note
                                         }, 
                                         uploaded_files=all_files, 
                                         student_list=all_present, 
@@ -2450,56 +2451,89 @@ try:
 
                 for i, r in pending_df.iterrows():
                     with st.container(border=True):
-                        c1, c2, c3 = st.columns([2,2,1.3])
-                        
+                        c1, c2, c3 = st.columns([2, 2, 1.3])
+
                         is_makeup = "補掃" in str(r["評分項目"])
                         title_badge = "🩹 **[補掃]**" if is_makeup else "🧹"
-                        
-                        c1.write(f"{title_badge} **{r['班級']}** | {r['檢查人員']}")
-                        c1.caption(f"登錄時間：{r['登錄時間']}") 
-                        
-                        if "http" in str(r['照片路徑']): 
-                            c2.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=150) 
-                        
+
+                        # ── 自動解析應到/實到人數，計算建議給分 ──
+                        note_str = str(r.get("備註", ""))
+                        inspector_str = str(r.get("檢查人員", ""))
+
+                        # 從備註解析應到人數（格式：[應到:4人 實到:3人 ...]）
+                        import re as _re
+                        m_req = _re.search(r"應到:(\d+)人", note_str)
+                        m_act = _re.search(r"實到:(\d+)人", note_str)
+                        # fallback：從檢查人員欄位解析實到
+                        if not m_act:
+                            m_act = _re.search(r"實到:(\d+)", inspector_str)
+
+                        n_required = int(m_req.group(1)) if m_req else None
+                        n_actual   = int(m_act.group(1)) if m_act else None
+
+                        # 計算建議給分：基礎分依應到人數，不足打折，補掃再打折
+                        if n_required is not None and n_actual is not None:
+                            base_score  = 2.0 if n_required >= 4 else 1.0
+                            full_attend = n_actual >= n_required
+                            attend_mult = 1.0 if full_attend else 0.5
+                            makeup_mult = 0.5 if is_makeup else 1.0
+                            suggested   = base_score * attend_mult * makeup_mult
+                            score_label = (f"應到 {n_required} 人，實到 {n_actual} 人"
+                                           f"{'（人數足夠）' if full_attend else '（人數不足）'}"
+                                           f"{'，補掃' if is_makeup else ''}"
+                                           f" → 建議給 **{suggested:g} 分**")
+                            score_val = -suggested  # 負數代表學期加分
+                        else:
+                            suggested   = None
+                            score_label = "⚠️ 無法自動解析人數，請手動判斷"
+                            score_val   = None
+
+                        c1.write(f"{title_badge} **{r['班級']}** | {inspector_str}")
+                        c1.caption(f"登錄時間：{r['登錄時間']}")
+                        c1.info(score_label)
+
+                        if "http" in str(r['照片路徑']):
+                            c2.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=150)
+
                         reply_msg = c1.text_input("💬 給予回應 (可留白)", key=f"rm_{r['紀錄ID']}")
 
-                        def _do_approve(record_id, score_val, eval_label, note_text, reply):
+                        def _do_approve(record_id, s_val, note_text, reply):
                             ws = get_worksheet(SHEET_TABS["main"])
-                            id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
+                            id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
                             if str(record_id) in id_list:
                                 ridx = id_list.index(str(record_id)) + 1
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分")+1, score_val)
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, eval_label)
-                                # [Fix③] 明確使用 main_df，不依賴外層 df 變數
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分") + 1, s_val)
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, "晨間打掃(學期加分)")
                                 matched = main_df.loc[main_df["紀錄ID"].astype(str) == str(record_id), "備註"]
                                 old_note = str(matched.iloc[0]) if not matched.empty else ""
                                 new_note = f"{old_note} \n組長回覆: {reply}" if reply else f"{old_note} \n組長核可: {note_text}"
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註") + 1, new_note)
                                 st.session_state.approved_morning_ids.add(str(record_id))
                                 load_main_data.clear()
-                                c1.success(f"✅ 已核可：{note_text}")
+                                c1.success(f"✅ 已核可，學期加 {abs(s_val):g} 分")
 
-                        if is_makeup:
-                            if c3.button("✅ 4人補掃(學期+1)", key=f"m4_{r['紀錄ID']}"):
-                                _do_approve(r["紀錄ID"], -1, "晨間打掃(學期加分)", "4人補掃(學期總分+1)", reply_msg)
-                            if c3.button("✅ 2人補掃(學期+1)", key=f"m2_{r['紀錄ID']}"):
-                                _do_approve(r["紀錄ID"], -1, "晨間打掃(學期加分)", "2人補掃(學期總分+1)", reply_msg)
+                        # ── 審核按鈕：給分 or 駁回 ──
+                        if score_val is not None:
+                            if c3.button(f"✅ 給分 ({suggested:g}分)", key=f"approve_{r['紀錄ID']}"):
+                                _do_approve(r["紀錄ID"], score_val,
+                                            f"給分{suggested:g}分（{score_label.split('→')[0].strip()}）",
+                                            reply_msg)
                         else:
-                            if c3.button("✅ 4人全到(學期+2)", key=f"p4_{r['紀錄ID']}"):
-                                _do_approve(r["紀錄ID"], -2, "晨間打掃(學期加分)", "4人全到(學期總分+2)", reply_msg)
-                            if c3.button("✅ 2人全到(學期+1)", key=f"p2_{r['紀錄ID']}"):
-                                _do_approve(r["紀錄ID"], -1, "晨間打掃(學期加分)", "2人全到(學期總分+1)", reply_msg)
+                            # 無法自動計算時，提供手動選項
+                            manual_score = c3.selectbox("給分", [2, 1, 0.5, 0.25], key=f"manual_{r['紀錄ID']}")
+                            if c3.button("✅ 給分", key=f"approve_{r['紀錄ID']}"):
+                                _do_approve(r["紀錄ID"], -manual_score, f"手動給分 {manual_score} 分", reply_msg)
 
                         if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}"):
                             ws = get_worksheet(SHEET_TABS["main"])
-                            id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID")+1)
+                            id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
                             if str(r["紀錄ID"]) in id_list:
                                 ridx = id_list.index(str(r["紀錄ID"])) + 1
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目")+1, "晨間打掃(已駁回)")
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, "晨間打掃(已駁回)")
                                 old_note = str(r['備註'])
-                                rej_msg = reply_msg if reply_msg else "未達標準，請見諒"
+                                rej_msg  = reply_msg if reply_msg else "未達標準，請見諒"
                                 new_note = f"{old_note} \n組長駁回: {rej_msg}"
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註")+1, new_note)
+                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註") + 1, new_note)
                                 st.session_state.approved_morning_ids.add(str(r["紀錄ID"]))
                                 load_main_data.clear()
                                 c1.error("🗑️ 已駁回")
@@ -2535,7 +2569,7 @@ try:
                 
                 st.markdown("---")
                 
-                st.write("📢 糾察每日廣播/提醒")
+                st.write("📢 衛生糾察每日廣播/提醒")
                 current_hygiene_task = SYSTEM_CONFIG.get("daily_hygiene_task", "今日無特殊任務，請確實完成各區檢查即可！")
                 new_hygiene_task = st.text_area("請輸入想給糾察隊看的話（例如：今天重點檢查黑板、窗台）", value=current_hygiene_task)
                 if st.button("💾 更新糾察任務"): 
