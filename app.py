@@ -1138,7 +1138,7 @@ try:
     app_mode = st.sidebar.radio("請選擇模式", menu_options)
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown("📅 [衛生組行事曆](https://www.notion.so/312b7f229eea80c584a1e794c7b955a4)")
+    st.sidebar.markdown("📅 [衛生組公告欄兼行事曆](https://www.notion.so/312b7f229eea80c584a1e794c7b955a4)")
     st.sidebar.markdown("🐻‍❄️ [衛生組Instagram](https://www.instagram.com/clvs_captain.h/)")
     st.sidebar.markdown("<div class='sidebar-footer'>中壢家商 衛生組 © 2025</div>", unsafe_allow_html=True)
 
@@ -1196,7 +1196,7 @@ try:
 
     # --- Mode 1: 糾察評分 ---
     elif app_mode == "糾察底家👀":
-        st.title("📝 衛生糾察評分系統")
+        st.title("📝 糾察評分系統")
         if "team_logged_in" not in st.session_state: st.session_state["team_logged_in"] = False
 
         daily_hygiene = SYSTEM_CONFIG.get("daily_hygiene_task", "")
