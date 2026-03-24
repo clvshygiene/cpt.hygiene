@@ -1407,7 +1407,13 @@ try:
                         # 違規細節區塊（在 form 外，隨 radio 即時顯示）
                         in_s, out_s, ph_c, note, sel_violations = 0, 0, 0, "", []
 
-                        if check_result == "❌ 違規(需扣分)":
+                        if check_result == "⭐ 優良":
+                            # [需求2] 優良備註欄
+                            st.markdown("**📝 優良原因（選填）**")
+                            excellent_note = st.text_input("請簡單描述優良原因，例如：地板乾淨、掃具整齊", key="m1_excellent_note")
+                            st.caption("⏳ 優良紀錄將送交組長審核，審核通過前學生端顯示為「普通」。")
+
+                        elif check_result == "❌ 違規(需扣分)":
                             if role == "內掃檢查":
                                 in_s = st.number_input("內掃扣分", min_value=0, step=1, key="m1_in_s")
                                 st.markdown("**📍 違規位置（可複選）**")
@@ -1470,9 +1476,12 @@ try:
                                     st.session_state.last_action_time = time.time()
                                     _submit_key = f"{input_date}__{inspector_name}__{sel_cls}"
                                     if check_result == "⭐ 優良":
-                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(優良)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": "本次檢查表現優良，無扣分項目"}, uploaded_files=files, award_inspector_hours=is_last_task):
+                                        # [需求3] 存為「待審優良」，組長審核後才正式升為優良
+                                        _exc_note = st.session_state.get("m1_excellent_note", "").strip()
+                                        _note_text = f"優良原因：{_exc_note}" if _exc_note else "本次檢查表現優良，無扣分項目（待組長審核）"
+                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(待審優良)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": _note_text}, uploaded_files=files, award_inspector_hours=is_last_task):
                                             st.session_state.submitted_inspections.add(_submit_key)
-                                            st.success("⭐ 優良紀錄已登記！"); time.sleep(1.5); st.rerun()
+                                            st.success("⭐ 優良紀錄已送出！等待組長審核中..."); time.sleep(1.5); st.rerun()
                                     elif check_result == "✅ 普通":
                                         if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(普通)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": "本次檢查無扣分，表現普通"}, uploaded_files=files, award_inspector_hours=is_last_task):
                                             st.session_state.submitted_inspections.add(_submit_key)
@@ -1598,8 +1607,9 @@ try:
                             ap_info = appeal_map.get(rid, {})
                             ap_st = ap_info.get("status")
                             ap_reply = ap_info.get("reply")
-                            is_excellent = "優良" in str(r['評分項目'])
-                            is_normal = "普通" in str(r['評分項目'])
+                            is_excellent = "優良" in str(r['評分項目']) and "待審" not in str(r['評分項目'])
+                            is_pending_excellent = "待審優良" in str(r['評分項目'])  # 待審中，學生看普通
+                            is_normal = "普通" in str(r['評分項目']) or is_pending_excellent
                             is_corrected = str(r['修正']) == "TRUE"
 
                             # 決定卡片顏色
@@ -1657,28 +1667,32 @@ try:
                             elif ap_st == "待處理":
                                 st.info("⏳ 申訴審核中，請耐心等候...")
 
-                            # 違規照片
-                            if str(r.get('照片路徑','')).strip() and "http" in str(r['照片路徑']):
-                                with st.expander("📷 查看照片"):
-                                    st.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=200)
-
-                            # 申訴表單（使用預計算的期限，不重複呼叫函式）
+                            # [需求1] 照片與申訴整合在同一個展開區塊
+                            has_photo = str(r.get('照片路徑','')).strip() and "http" in str(r['照片路徑'])
                             deadline = appeal_deadline_map.get(date_str, date.today())
-                            if not ap_st and date.today() <= deadline and (tot > 0 or r['手機人數'] > 0):
-                                with st.expander(f"📣 提出申訴（截止 {deadline.strftime('%m/%d')}）"):
-                                    with st.form(f"ap_{rid}"):
-                                        rsn = st.text_area("申訴理由", key=f"rsn_{rid}")
-                                        pf = st.file_uploader("佐證照片", type=['jpg','png'], key=f"pf_{rid}")
-                                        if st.form_submit_button("送出申訴"):
-                                            if time.time() - st.session_state.last_action_time < 3:
-                                                st.warning("⚠️ 系統處理中，請勿連續點擊！")
-                                            elif rsn and pf:
-                                                st.session_state.last_action_time = time.time()
-                                                if save_appeal({"班級": cls, "違規日期": date_str, "違規項目": r['評分項目'], "原始扣分": str(tot), "申訴理由": rsn, "對應紀錄ID": rid}, pf):
-                                                    time.sleep(1.5)
-                                                    st.rerun()
-                                            else:
-                                                st.error("請填寫理由並上傳照片")
+                            can_appeal = not ap_st and date.today() <= deadline and (tot > 0 or r['手機人數'] > 0)
+
+                            if has_photo or can_appeal:
+                                with st.expander("📋 查看詳情" + (f"　|　📣 可申訴（截止 {deadline.strftime('%m/%d')}）" if can_appeal else "")):
+                                    if has_photo:
+                                        st.markdown("**📷 評分照片**")
+                                        st.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=200)
+                                    if can_appeal:
+                                        st.markdown("---")
+                                        st.markdown("**📣 提出申訴**")
+                                        with st.form(f"ap_{rid}"):
+                                            rsn = st.text_area("申訴理由（必填）", key=f"rsn_{rid}")
+                                            pf = st.file_uploader("佐證照片（選填）", type=['jpg','png'], key=f"pf_{rid}")
+                                            if st.form_submit_button("送出申訴"):
+                                                if time.time() - st.session_state.last_action_time < 3:
+                                                    st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                                                elif not rsn:
+                                                    st.error("請填寫申訴理由")
+                                                else:
+                                                    st.session_state.last_action_time = time.time()
+                                                    if save_appeal({"班級": cls, "違規日期": date_str, "違規項目": r['評分項目'], "原始扣分": str(tot), "申訴理由": rsn, "對應紀錄ID": rid}, pf if pf else None):
+                                                        time.sleep(1.5)
+                                                        st.rerun()
 
                 with tab_ranking:
                     pub_df = load_published_results()
@@ -1958,8 +1972,8 @@ try:
         pwd_input = st.text_input("管理密碼", type="password", key="admin_pwd")
         if pwd_input == st.secrets["system_config"]["admin_password"]:
             
-            t_mon, t_rollcall, t4, t_appeal, t2, t1, t_settings, t3 = st.tabs([
-                "👀 衛生糾察", "👮 環保糾察", "📝 扣分明細", "📣 申訴", "📊 成績總表", 
+            t_mon, t_rollcall, t4, t_appeal, t_excellent, t2, t1, t_settings, t3 = st.tabs([
+                "👀 衛生糾察", "👮 環保糾察", "📝 扣分明細", "📣 申訴", "⭐ 優良審核", "📊 成績總表", 
                 "🧹 晨掃審核", "⚙️ 設定", "🏫 返校打掃"
             ])
             
@@ -2074,6 +2088,56 @@ try:
                             if col_btn2.button("🚫 駁回維持原判", key=f"ng_{i}"): 
                                 update_appeal_status(i, "已駁回", r["對應紀錄ID"], reply_text)
                                 st.rerun()
+
+            with t_excellent:
+                st.subheader("⭐ 優良審核")
+                ex_df = load_main_data()
+                pending_ex = ex_df[ex_df["評分項目"].astype(str).str.contains("待審優良")] if not ex_df.empty else pd.DataFrame()
+
+                if pending_ex.empty:
+                    st.success("🎉 目前沒有待審核的優良紀錄！")
+                else:
+                    st.caption(f"共 {len(pending_ex)} 筆待審核，審核後不會跳頁，可以繼續審核其他筆。")
+                    if "approved_excellent_ids" not in st.session_state:
+                        st.session_state.approved_excellent_ids = set()
+
+                    for _, r in pending_ex.iterrows():
+                        rid = str(r['紀錄ID'])
+                        if rid in st.session_state.approved_excellent_ids:
+                            continue
+                        with st.container(border=True):
+                            c1, c2, c3 = st.columns([2, 2, 1])
+                            c1.write(f"⭐ **{r['班級']}** | {r['檢查人員']}")
+                            c1.caption(f"{r['日期']} | {r['評分項目']}")
+                            c1.write(f"📝 {r['備註']}")
+                            if "http" in str(r.get('照片路徑', '')):
+                                c2.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=150)
+                            if c3.button("✅ 核可優良", key=f"ex_ok_{rid}"):
+                                ws = get_worksheet(SHEET_TABS["main"])
+                                id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
+                                if rid in id_list:
+                                    ridx = id_list.index(rid) + 1
+                                    # 把評分項目從「(待審優良)」改成「(優良)」
+                                    new_item = str(r['評分項目']).replace("(待審優良)", "(優良)")
+                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, new_item)
+                                    st.session_state.approved_excellent_ids.add(rid)
+                                    load_main_data.clear()
+                                    c1.success("✅ 已核可為優良！")
+                            if c3.button("🚫 駁回(改普通)", key=f"ex_ng_{rid}"):
+                                ws = get_worksheet(SHEET_TABS["main"])
+                                id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
+                                if rid in id_list:
+                                    ridx = id_list.index(rid) + 1
+                                    new_item = str(r['評分項目']).replace("(待審優良)", "(普通)")
+                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, new_item)
+                                    st.session_state.approved_excellent_ids.add(rid)
+                                    load_main_data.clear()
+                                    c1.info("已改為普通。")
+
+                    if st.button("🔄 重新整理列表", key="refresh_excellent"):
+                        st.session_state.approved_excellent_ids.clear()
+                        load_main_data.clear()
+                        st.rerun()
 
             with t2:
                 st.subheader("📊 成績總表")
@@ -2471,7 +2535,7 @@ try:
                 
                 st.markdown("---")
                 
-                st.write("📢 衛生糾察每日廣播/提醒")
+                st.write("📢 糾察每日廣播/提醒")
                 current_hygiene_task = SYSTEM_CONFIG.get("daily_hygiene_task", "今日無特殊任務，請確實完成各區檢查即可！")
                 new_hygiene_task = st.text_area("請輸入想給糾察隊看的話（例如：今天重點檢查黑板、窗台）", value=current_hygiene_task)
                 if st.button("💾 更新糾察任務"): 
