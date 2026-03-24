@@ -1353,10 +1353,11 @@ try:
                     is_last_task = True
                     pending_classes = []
 
+                    # [初始化] 確保所有糾察（含機動/組長）都能使用此 key
+                    if "submitted_inspections" not in st.session_state:
+                        st.session_state.submitted_inspections = set()
+
                     if assigned_classes:
-                        # [即時進度] 用 session_state 補足背景非同步的延遲
-                        if "submitted_inspections" not in st.session_state:
-                            st.session_state.submitted_inspections = set()
 
                         # 從 Google Sheet 讀到的已完成班級（字串，直接是班級名稱）
                         sheet_done = set(
