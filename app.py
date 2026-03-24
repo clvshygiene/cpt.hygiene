@@ -1409,9 +1409,7 @@ try:
                         in_s, out_s, ph_c, note, sel_violations = 0, 0, 0, "", []
 
                         if check_result == "⭐ 優良":
-                            # [需求2] 優良備註欄
-                            st.markdown("**📝 優良原因（選填）**")
-                            excellent_note = st.text_input("請簡單描述優良原因，例如：地板乾淨、掃具整齊", key="m1_excellent_note")
+                            # [需求2] 優良備註欄 - 放在 form 外顯示說明
                             st.caption("⏳ 優良紀錄將送交組長審核，審核通過前學生端顯示為「普通」。")
 
                         elif check_result == "❌ 違規(需扣分)":
@@ -1462,8 +1460,13 @@ try:
                                 sel_violations = sel_outer_areas + sel_status
 
                         # form 只負責：修正單勾選 + 照片上傳 + 送出按鈕
+                        excellent_note_form = ""  # 預設值，避免未定義
                         with st.form("score_form", clear_on_submit=True):
                             is_fix = st.checkbox("🚩 這是修正單")
+                            # 優良備註在 form 內，避免 session_state key 問題
+                            if check_result == "⭐ 優良":
+                                st.markdown("**📝 優良原因（選填）**")
+                                excellent_note_form = st.text_input("請簡單描述優良原因，例如：地板乾淨、掃具整齊", key="m1_excellent_note_form")
                             # [照片強制上傳] 三種結果都需附照，防止隨意亂評
                             st.info("📸 請先用手機相機拍好照片存到相簿，再從下方選取上傳。（優良/普通/違規均需附照）")
                             files = st.file_uploader("選取照片", accept_multiple_files=True, type=['jpg','png','jpeg'])
@@ -1478,7 +1481,11 @@ try:
                                     _submit_key = f"{input_date}__{inspector_name}__{sel_cls}"
                                     if check_result == "⭐ 優良":
                                         # [需求3] 存為「待審優良」，組長審核後才正式升為優良
-                                        _exc_note = st.session_state.get("m1_excellent_note", "").strip()
+                                        # 從 form 內的變數讀取（避免 session_state key error）
+                                        try:
+                                            _exc_note = excellent_note_form.strip() if excellent_note_form else ""
+                                        except Exception:
+                                            _exc_note = ""
                                         _note_text = f"優良原因：{_exc_note}" if _exc_note else "本次檢查表現優良，無扣分項目（待組長審核）"
                                         if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(待審優良)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": _note_text}, uploaded_files=files, award_inspector_hours=is_last_task):
                                             st.session_state.submitted_inspections.add(_submit_key)
