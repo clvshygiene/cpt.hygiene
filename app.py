@@ -726,10 +726,10 @@ try:
             if current_date.weekday() < 5 and current_date not in holidays: workdays += 1
         return today <= current_date
 
-    @st.cache_data(ttl=600)   # [效能] 10分鐘，降低尖峰 API 請求頻率
-    def load_main_data(current_week: int = 0):
-        # current_week 作為 cache key 的一部分：週次換了就自動 invalidate
-        # 傳入 0 代表不過濾（相容舊呼叫），傳入實際週次則只保留近兩週資料
+    @st.cache_data(ttl=600)   # [效能] 10分鐘快取，尖峰時段降低 API 請求頻率
+    def load_main_data():
+        # 讀取整學期 main_data，統一快取一份。
+        # 需要近兩週過濾的地方在 UI 層自己用 df[df["週次"] >= now_week-2] 處理。
         ws = get_worksheet(SHEET_TABS["main"])
         if not ws: return pd.DataFrame(columns=EXPECTED_COLUMNS)
         try:
@@ -742,11 +742,7 @@ try:
             for col in ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數", "週次"]:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
             if "修正" in df.columns: df["修正"] = df["修正"].astype(str).apply(lambda x: True if x.upper() == "TRUE" else False)
-            df = df[EXPECTED_COLUMNS]
-            # 近兩週過濾：只保留 current_week-2 以上的資料
-            if current_week >= 3 and "週次" in df.columns:
-                df = df[df["週次"] >= current_week - 2]
-            return df
+            return df[EXPECTED_COLUMNS]
         except Exception as e:
             print(f"[load_main_data] {e}")
             return pd.DataFrame(columns=EXPECTED_COLUMNS)
@@ -1072,23 +1068,9 @@ try:
         enqueue_task("volunteer_report" if student_list is not None else "main_entry", payload)
         return True
 
-    @st.cache_data(ttl=600)   # [效能] 申訴核可後最多10分鐘內會反映（配合報表計算）
     def load_full_semester_data_for_export():
-        ws = get_worksheet(SHEET_TABS["main"])
-        if not ws: return pd.DataFrame(columns=EXPECTED_COLUMNS)
-        try:
-            df = pd.DataFrame(ws.get_all_records())
-            if df.empty: return pd.DataFrame(columns=EXPECTED_COLUMNS)
-            for col in EXPECTED_COLUMNS:
-                if col not in df.columns: df[col] = ""
-            for col in ["備註", "違規細項", "班級", "檢查人員", "修正", "晨掃未到者", "照片路徑", "紀錄ID"]:
-                if col in df.columns: df[col] = df[col].fillna("").astype(str)
-            for col in ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數", "週次"]:
-                if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-            return df[EXPECTED_COLUMNS]
-        except Exception as e:
-            print(f"[load_semester_data] {e}")
-            return pd.DataFrame()
+        # 直接重用 load_main_data 的快取，不重複讀 Sheets，記憶體只存一份
+        return load_main_data()
 
     # ==========================================
     # 3. 主程式 UI 啟動前準備
@@ -1481,7 +1463,11 @@ try:
                 input_date = c_d.date_input("檢查日期", today_tw)
                 role = c_r.radio("檢查項目", allowed_roles, horizontal=True, key="m1_role_radio") if len(allowed_roles)>1 else allowed_roles[0]
                 week_num = get_week_num(input_date)
-                main_df = load_main_data(get_week_num(today_tw))
+                main_df = load_main_data()
+                # 糾察評分只需近兩週資料（查重複用），在 UI 層過濾
+                now_week = get_week_num(today_tw)
+                if now_week >= 3:
+                    main_df = main_df[main_df["週次"] >= now_week - 2]
 
                 if role == "垃圾/回收檢查":
                     st.info("🗑️ 資源回收與垃圾檢查 (每日每班此項目總扣分上限2分將於結算時自動卡控)")
@@ -2036,7 +2022,11 @@ try:
                 st.info("🔧 **[測試機特權開啟]** 目前已超過 16:00，但因為是 DEV 環境，允許繼續測試！")
                 
             my_cls = st.selectbox("選擇班級", all_classes, key="m3_cls_select")
-            main_df = load_main_data(get_week_num(today_tw))
+            main_df = load_main_data()
+            # 晨掃填報只需近兩週資料
+            _now_week = get_week_num(today_tw)
+            if _now_week >= 3:
+                main_df = main_df[main_df["週次"] >= _now_week - 2]
             
             # [新增防呆] 建立一個本地暫存，記住剛送出的班級
             if "just_submitted_morning" not in st.session_state:
@@ -2257,7 +2247,11 @@ try:
                 monitor_date = st.date_input("監控日期", today_tw, key="monitor_date")
                 st.caption(f"📅 此區顯示負責「內掃、外掃、機動」的評分糾察進度。")
 
-                df = load_main_data(get_week_num(today_tw))
+                df = load_main_data()
+                # 監控只需近兩週
+                _nw = get_week_num(today_tw)
+                if _nw >= 3:
+                    df = df[df["週次"] >= _nw - 2]
                 submitted_names = set()
                 if not df.empty:
                     today_records = df[df["日期"].astype(str) == str(monitor_date)]
@@ -2329,7 +2323,7 @@ try:
                                     st.warning("沒有可發放時數的對象")
 
             with t4:
-                df = load_main_data(get_week_num(today_tw))
+                df = load_main_data()
                 if not df.empty:
                     st.dataframe(df[["登錄時間", "日期", "班級", "評分項目", "檢查人員", "備註", "違規細項", "紀錄ID"]].sort_values("登錄時間", ascending=False))
 
@@ -2366,7 +2360,7 @@ try:
 
             with t_excellent:
                 st.subheader("⭐ 優良審核")
-                ex_df = load_main_data(get_week_num(today_tw))
+                ex_df = load_main_data()
                 pending_ex = ex_df[ex_df["評分項目"].astype(str).str.contains("待審優良")] if not ex_df.empty else pd.DataFrame()
 
                 if pending_ex.empty:
@@ -2659,7 +2653,11 @@ try:
             with t1:
                 # [V5.29 Patch] 本週晨掃進度追蹤 (含過去缺交)
                 st.subheader("🕵️‍♀️ 晨掃進度追蹤 (本週)")
-                main_df = load_main_data(get_week_num(today_tw))
+                main_df = load_main_data()
+                # 晨掃進度追蹤只需近兩週
+                _nw2 = get_week_num(today_tw)
+                if _nw2 >= 3:
+                    main_df = main_df[main_df["週次"] >= _nw2 - 2]
                 
                 from datetime import timedelta
                 # 計算本週一是哪一天
