@@ -364,6 +364,7 @@ try:
             print(f"[pending_count] {e}")
             return 0
 
+    @st.cache_data(ttl=15)  # 15秒快取，避免管理後台每次重繪都打 Sheets API
     def get_queue_metrics():
         metrics = {"pending": 0, "retry": 0, "failed": 0, "oldest_pending_sec": 0, "recent_errors": []}
         try:
