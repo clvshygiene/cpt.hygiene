@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import os
-import smtplib
 import time
 import io
 import traceback
@@ -13,8 +12,6 @@ import json
 import random
 import concurrent.futures
 from contextlib import closing
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from datetime import datetime, date, timedelta
 from datetime import timezone
 import pytz
@@ -235,7 +232,8 @@ try:
                     return sheet.worksheet(tab_name)
                 except gspread.WorksheetNotFound:
                     cols = 20 if tab_name != "appeals" else 15
-                    ws = sheet.add_worksheet(title=tab_name, rows=500, cols=cols)
+                    init_rows = 2000 if tab_name == "task_queue" else 500
+                    ws = sheet.add_worksheet(title=tab_name, rows=init_rows, cols=cols)
                     if tab_name == "appeals": ws.append_row(APPEAL_COLUMNS)
                     if tab_name == "service_hours": ws.append_row(["日期", "學號", "班級", "類別", "時數", "紀錄ID"])
                     if tab_name == "holidays": ws.append_row(["日期", "說明"])
@@ -399,23 +397,32 @@ try:
         return None
 
     def update_task_status(task_id, status, attempts, last_error, _row_idx=None):
-        # [Fix #3-B] 用 _row_idx 直接定位 Sheets 行，避免重新搜尋
+        # DONE → 直接刪行，讓 task_queue 不積累；失敗/重試才保留並更新
         try:
             ws = get_worksheet(SHEET_TABS["task_queue"])
             if not ws: return
+
+            # 定位行號
             if _row_idx:
-                ws.update_cell(_row_idx, _QCOL_STATUS,   status)
-                ws.update_cell(_row_idx, _QCOL_ATTEMPTS, attempts)
-                if last_error:
-                    ws.update_cell(_row_idx, _QCOL_ERROR, str(last_error)[:200])
+                ridx = _row_idx
             else:
                 ids = ws.col_values(1)[1:]
-                if task_id in ids:
-                    ridx = ids.index(task_id) + 2
-                    ws.update_cell(ridx, _QCOL_STATUS,   status)
-                    ws.update_cell(ridx, _QCOL_ATTEMPTS, attempts)
-                    if last_error:
-                        ws.update_cell(ridx, _QCOL_ERROR, str(last_error)[:200])
+                if task_id not in ids: return
+                ridx = ids.index(task_id) + 2
+
+            if status == "DONE":
+                # 成功完成 → 直接刪除這行，task_queue 永遠不會積累歷史紀錄
+                try:
+                    ws.delete_rows(ridx)
+                except Exception as e:
+                    print(f"[task_queue] 刪行失敗（忽略）: {e}")
+            else:
+                # FAILED 或 RETRY → 更新狀態保留供查閱
+                ws.batch_update([
+                    {"range": f"E{ridx}", "values": [[status]]},
+                    {"range": f"F{ridx}", "values": [[attempts]]},
+                    {"range": f"G{ridx}", "values": [[str(last_error)[:200] if last_error else ""]]}
+                ])
         except Exception as e:
             print(f"update_task_status error: {e}")
 
@@ -628,13 +635,10 @@ try:
         except Exception as e: return False, str(e)
 
     def background_worker(stop_event=None):
-        print("[worker] ▶ Worker 執行緒已進入 background_worker()")
         try: add_script_run_ctx(threading.current_thread(), get_script_run_ctx())
         except: pass
-        cycle = 0
         while True:
             if stop_event and stop_event.is_set(): break
-            cycle += 1
             try: update_worker_heartbeat()
             except Exception as e:
                 print(f"[worker] heartbeat 寫入失敗: {e}")
@@ -642,14 +646,13 @@ try:
                 # [Fix #3-C] 每輪只讀一次 Sheets task_queue，避免 rate limit
                 ws = get_worksheet(SHEET_TABS["task_queue"])
                 if not ws:
-                    print(f"[worker] cycle={cycle} get_worksheet 返回 None，等待 5 秒")
                     time.sleep(5.0)
                     continue
 
                 try:
                     records = ws.get_all_records()
                 except Exception as e:
-                    print(f"[worker] cycle={cycle} get_all_records 失敗: {e}")
+                    print(f"[worker] get_all_records 失敗: {e}")
                     time.sleep(10.0)
                     continue
 
@@ -693,7 +696,6 @@ try:
         except Exception as e:
             print(f"[worker_start] add_script_run_ctx 失敗（忽略）: {e}")
         t.start()
-        print(f"[worker_start] ✅ Worker 執行緒已啟動，is_alive={t.is_alive()}")
         return stop_event
     _ = ensure_worker_started()
 
