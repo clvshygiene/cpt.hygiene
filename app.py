@@ -19,7 +19,7 @@ from datetime import datetime, date, timedelta
 from datetime import timezone
 import pytz
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials as SACredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
@@ -197,14 +197,19 @@ try:
     # ==========================================
     @st.cache_resource
     def get_credentials():
+        # [Fix #7] 改用 google-auth，取代已停止維護的 oauth2client
+        # SACredentials 支援執行緒安全的自動 token 刷新
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         if "gcp_service_account" not in st.secrets:
             return None
-        return ServiceAccountCredentials.from_json_keyfile_dict(dict(st.secrets["gcp_service_account"]), scope)
+        return SACredentials.from_service_account_info(
+            dict(st.secrets["gcp_service_account"]), scopes=scope
+        )
 
     def get_gspread_client():
         creds = get_credentials()
-        return gspread.authorize(creds) if creds else None
+        # [Fix #7] gspread.Client(auth=creds) 是 google-auth 的正確用法
+        return gspread.Client(auth=creds) if creds else None
 
     def get_drive_service():
         creds = get_credentials()
@@ -401,6 +406,76 @@ try:
     # ==========================================
     # 背景處理邏輯
     # ==========================================
+
+    def fetch_all_pending_service_tasks(max_attempts=6):
+        # [Fix #3] 一次撈出所有待處理的 service_hours_only 任務，供批次寫入使用
+        sql = (
+            "SELECT id, task_type, payload_json, attempts FROM task_queue "
+            "WHERE status IN ('PENDING', 'RETRY') AND task_type='service_hours_only' AND attempts < ? "
+            "ORDER BY created_ts ASC"
+        )
+        try:
+            with closing(open_queue_conn()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cur = conn.cursor()
+                cur.execute(sql, (max_attempts,))
+                rows = cur.fetchall()
+                if not rows:
+                    conn.execute("COMMIT")
+                    return []
+                ids = [r[0] for r in rows]
+                placeholders = ",".join(["?" for _ in ids])
+                cur.execute(
+                    f"UPDATE task_queue SET status='IN_PROGRESS', attempts=attempts+1 WHERE id IN ({placeholders})",
+                    ids
+                )
+                conn.execute("COMMIT")
+                return [
+                    {"id": r[0], "task_type": r[1],
+                     "payload": json.loads(r[2] or "{}"), "attempts": r[3] + 1}
+                    for r in rows
+                ]
+        except Exception as e:
+            print(f"[batch] 批次抓取 service_hours 任務失敗: {e}")
+            return []
+
+    def process_service_tasks_batch(tasks):
+        # [Fix #3] 把多個 service_hours_only 任務的所有學生合併，一次 append_rows 寫入
+        is_dry_run = str(st.secrets.get("system_config", {}).get("dry_run", "false")).lower() in ["true", "1"]
+        if is_dry_run:
+            return True, "DRY_RUN_SUCCESS"
+        rows_to_write = []
+        for task in tasks:
+            payload = task["payload"]
+            t_date = payload.get("date", str(date.today()))
+            t_cat  = payload.get("category", "")
+            for sid in payload.get("student_list", []):
+                try:
+                    with closing(open_queue_conn()) as conn:
+                        conn.execute(
+                            "INSERT INTO service_issued VALUES (?, ?, ?)",
+                            (t_date, str(sid), t_cat)
+                        )
+                    rows_to_write.append([
+                        t_date, str(sid),
+                        payload.get("class_name", ""), t_cat,
+                        str(payload.get("hours", 0.5)),
+                        uuid.uuid4().hex[:8]
+                    ])
+                except sqlite3.IntegrityError:
+                    pass  # 已發放過，跳過
+        if not rows_to_write:
+            return True, None  # 全部都是重複，視為成功
+        try:
+            def _batch_action():
+                ws = get_worksheet(SHEET_TABS["service_hours"])
+                if not ws: raise Exception("無法取得 service_hours 工作表")
+                ws.append_rows(rows_to_write, value_input_option="RAW")
+            execute_with_retry(_batch_action)
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
     def _append_main_entry_row(entry):
         def _action():
             ws = get_worksheet(SHEET_TABS["main"])
@@ -459,17 +534,10 @@ try:
             time.sleep(random.uniform(0.3, 0.6))
             return True, "DRY_RUN_SUCCESS"
 
+        # [Fix #3] service_hours_only 現在由 Worker 批次處理（process_service_tasks_batch）
+        # 保留此分支只作為 fallback：若任務因故繞過批次路徑，仍可單筆處理
         if task_type == "service_hours_only":
-            try:
-                for sid in payload.get("student_list", []):
-                    log_entry = {
-                        "日期": payload.get("date", str(date.today())), "學號": sid,
-                        "班級": payload.get("class_name", ""), "類別": payload.get("category", ""), 
-                        "時數": payload.get("hours", 0.5), "紀錄ID": uuid.uuid4().hex[:8]
-                    }
-                    _append_service_row_unique(log_entry) 
-                return True, None
-            except Exception as e: return False, str(e)
+            return process_service_tasks_batch([task])
 
         entry = payload.get("entry", {})
         try:
@@ -488,11 +556,29 @@ try:
                 # [V5.28] 根據參數決定是否發放時數 (預設發放，以防其他地方使用)
                 if "學號:" in inspector_name and payload.get("award_inspector_hours", True):
                     sid = inspector_name.split("學號:")[1].strip()
-                    _append_service_row_unique({"日期": entry.get("日期"), "學號": sid, "班級": "", "類別": "整潔評分糾察", "時數": 0.25, "紀錄ID": uuid.uuid4().hex[:8]}) 
-                
+                    _append_service_row_unique({"日期": entry.get("日期"), "學號": sid, "班級": "", "類別": "整潔評分糾察", "時數": 0.25, "紀錄ID": uuid.uuid4().hex[:8]})
+
                 if task_type == "volunteer_report":
+                    # [Fix #3] volunteer_report 多名學生的時數改為批次寫入（1 次 append_rows）
+                    svc_rows = []
+                    t_date = entry.get("日期", str(date.today()))
+                    t_cat  = payload.get("custom_category", "晨掃志工")
                     for sid in payload.get("student_list", []):
-                        _append_service_row_unique({"日期": entry.get("日期", str(date.today())), "學號": sid, "班級": entry.get("班級", ""), "類別": payload.get("custom_category", "晨掃志工"), "時數": payload.get("custom_hours", 0.5), "紀錄ID": uuid.uuid4().hex[:8]})
+                        try:
+                            with closing(open_queue_conn()) as conn:
+                                conn.execute("INSERT INTO service_issued VALUES (?, ?, ?)", (t_date, str(sid), t_cat))
+                            svc_rows.append([
+                                t_date, str(sid), entry.get("班級", ""), t_cat,
+                                str(payload.get("custom_hours", 0.5)), uuid.uuid4().hex[:8]
+                            ])
+                        except sqlite3.IntegrityError:
+                            pass  # 已發放，跳過
+                    if svc_rows:
+                        def _svc_batch():
+                            ws = get_worksheet(SHEET_TABS["service_hours"])
+                            if not ws: raise Exception("無法取得 service_hours 工作表")
+                            ws.append_rows(svc_rows, value_input_option="RAW")
+                        execute_with_retry(_svc_batch)
 
             elif task_type == "appeal_entry":
                 image_info = payload.get("image_file")
@@ -508,14 +594,31 @@ try:
         except: pass
         while True:
             if stop_event and stop_event.is_set(): break
-            update_worker_heartbeat() 
+            update_worker_heartbeat()
             try:
+                # [Fix #3] 優先批次處理所有 service_hours_only 任務（1 次 API call）
+                svc_tasks = fetch_all_pending_service_tasks()
+                if svc_tasks:
+                    ok, err = process_service_tasks_batch(svc_tasks)
+                    if ok:
+                        update_last_success_time()
+                    else:
+                        if err and "DRY_RUN" not in err: update_last_error_summary(err)
+                    final_status = "DONE" if ok else "FAILED"
+                    for t in svc_tasks:
+                        update_task_status(t["id"], final_status, t["attempts"], err)
+                    time.sleep(0.5)
+                    continue  # 繼續下一輪，優先清空 service_hours 佇列
+
+                # 處理含照片的任務（main_entry / volunteer_report / appeal_entry）逐筆進行
                 task = fetch_next_task()
-                if not task: time.sleep(2.0); continue
+                if not task:
+                    time.sleep(5.0)  # [Fix #3] 無任務時等 5 秒，減少空轉 API 呼叫
+                    continue
                 ok, err = process_task(task)
-                
+
                 if ok: update_last_success_time()
-                else: 
+                else:
                     if err and "DRY_RUN" not in err: update_last_error_summary(err)
 
                 try:
