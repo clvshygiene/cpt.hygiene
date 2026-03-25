@@ -628,23 +628,28 @@ try:
         except Exception as e: return False, str(e)
 
     def background_worker(stop_event=None):
+        print("[worker] ▶ Worker 執行緒已進入 background_worker()")
         try: add_script_run_ctx(threading.current_thread(), get_script_run_ctx())
         except: pass
+        cycle = 0
         while True:
             if stop_event and stop_event.is_set(): break
+            cycle += 1
             try: update_worker_heartbeat()
-            except: pass
+            except Exception as e:
+                print(f"[worker] heartbeat 寫入失敗: {e}")
             try:
                 # [Fix #3-C] 每輪只讀一次 Sheets task_queue，避免 rate limit
                 ws = get_worksheet(SHEET_TABS["task_queue"])
                 if not ws:
+                    print(f"[worker] cycle={cycle} get_worksheet 返回 None，等待 5 秒")
                     time.sleep(5.0)
                     continue
 
                 try:
                     records = ws.get_all_records()
                 except Exception as e:
-                    print(f"[worker] get_all_records 失敗: {e}")
+                    print(f"[worker] cycle={cycle} get_all_records 失敗: {e}")
                     time.sleep(10.0)
                     continue
 
@@ -683,8 +688,12 @@ try:
     def ensure_worker_started():
         stop_event = threading.Event()
         t = threading.Thread(target=background_worker, args=(stop_event,), daemon=True)
-        add_script_run_ctx(t)
+        try:
+            add_script_run_ctx(t)
+        except Exception as e:
+            print(f"[worker_start] add_script_run_ctx 失敗（忽略）: {e}")
         t.start()
+        print(f"[worker_start] ✅ Worker 執行緒已啟動，is_alive={t.is_alive()}")
         return stop_event
     _ = ensure_worker_started()
 
