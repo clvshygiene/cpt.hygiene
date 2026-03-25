@@ -260,7 +260,9 @@ try:
             img.save(out_buffer, format="JPEG", quality=quality, optimize=True)
             out_buffer.seek(0)
             return out_buffer
-        except: return io.BytesIO(file_bytes)
+        except Exception as e:
+            print(f"[compress_image] {e}")
+            return io.BytesIO(file_bytes)
 
     def upload_image_to_drive(file_obj, filename):
         def _upload_action():
@@ -272,7 +274,7 @@ try:
                 fields='id', supportsAllDrives=True
             ).execute()
             try: service.permissions().create(fileId=file.get('id'), body={'role': 'reader', 'type': 'anyone'}).execute()
-            except: pass 
+            except Exception: pass  # 設公開權限失敗可忽略，不影響上傳
             return f"https://drive.google.com/thumbnail?id={file.get('id')}&sz=w1000"
         return execute_with_retry(_upload_action)
 
@@ -298,13 +300,13 @@ try:
         try:
             with closing(open_local_db()) as conn:
                 conn.execute("INSERT OR REPLACE INTO system_status VALUES ('worker_heartbeat', ?)", (str(time.time()),))
-        except: pass
+        except Exception as e: print(f"[heartbeat] {e}")
 
     def update_last_success_time():
         try:
             with closing(open_local_db()) as conn:
                 conn.execute("INSERT OR REPLACE INTO system_status VALUES ('last_success_time', ?)", (str(time.time()),))
-        except: pass
+        except Exception as e: print(f"[last_success] {e}")
 
     def get_worker_heartbeat_sec():
         try:
@@ -313,7 +315,7 @@ try:
                 cur.execute("SELECT val FROM system_status WHERE key='worker_heartbeat'")
                 row = cur.fetchone()
                 if row: return time.time() - float(row[0])
-        except: pass
+        except Exception as e: print(f"[heartbeat_sec] {e}")
         return 999999
 
     def get_last_success_sec():
@@ -323,7 +325,7 @@ try:
                 cur.execute("SELECT val FROM system_status WHERE key='last_success_time'")
                 row = cur.fetchone()
                 if row: return time.time() - float(row[0])
-        except: pass
+        except Exception as e: print(f"[last_success_sec] {e}")
         return 999999
 
     # ==========================================
@@ -358,7 +360,9 @@ try:
             if not ws: return 0
             statuses = ws.col_values(_QCOL_STATUS)[1:]  # 跳過標題列
             return sum(1 for s in statuses if s in ("PENDING", "RETRY"))
-        except: return 0
+        except Exception as e:
+            print(f"[pending_count] {e}")
+            return 0
 
     def get_queue_metrics():
         metrics = {"pending": 0, "retry": 0, "failed": 0, "oldest_pending_sec": 0, "recent_errors": []}
@@ -376,11 +380,11 @@ try:
                 try:
                     oldest = min(r["created_ts"] for r in pending_recs)
                     metrics["oldest_pending_sec"] = (datetime.now(pytz.utc) - datetime.fromisoformat(oldest.replace("Z", "+00:00"))).total_seconds()
-                except: pass
+                except Exception: pass
             err_recs = sorted([r for r in records if r.get("status") in ("FAILED", "RETRY") and r.get("last_error")],
                               key=lambda x: x.get("created_ts", ""), reverse=True)[:5]
             metrics["recent_errors"] = [(r.get("last_error"), r.get("created_ts")) for r in err_recs]
-        except: pass
+        except Exception as e: print(f"[queue_metrics] {e}")
         return metrics
 
     def fetch_next_task(max_attempts=6):
@@ -570,7 +574,7 @@ try:
             with closing(open_local_db()) as conn:
                 short_msg = str(err_msg)[:120]
                 conn.execute("INSERT OR REPLACE INTO system_status VALUES ('last_error_summary', ?)", (short_msg,))
-        except: pass
+        except Exception as e: print(f"[error_summary] {e}")
 
     def get_last_error_summary():
         try:
@@ -579,7 +583,9 @@ try:
                 cur.execute("SELECT val FROM system_status WHERE key='last_error_summary'")
                 row = cur.fetchone()
                 return row[0] if row else "無紀錄"
-        except: return "無紀錄"
+        except Exception as e:
+            print(f"[error_summary_read] {e}")
+            return "無紀錄"
 
     def process_task(task):
         task_type, payload = task["task_type"], task["payload"]
@@ -636,7 +642,7 @@ try:
 
     def background_worker(stop_event=None):
         try: add_script_run_ctx(threading.current_thread(), get_script_run_ctx())
-        except: pass
+        except Exception: pass  # Streamlit context 在背景執行緒可能不存在，忽略
         while True:
             if stop_event and stop_event.is_set(): break
             try: update_worker_heartbeat()
@@ -707,7 +713,9 @@ try:
         ws = get_worksheet(SHEET_TABS["holidays"])
         if not ws: return []
         try: return [pd.to_datetime(str(r.get("日期", "")).strip()).date() for r in ws.get_all_records() if str(r.get("日期", "")).strip()]
-        except: return []
+        except Exception as e:
+            print(f"[load_holidays] {e}")
+            return []
 
     def is_within_appeal_period(violation_date, appeal_days=3):
         vd = pd.to_datetime(violation_date).date() if isinstance(violation_date, str) else violation_date
@@ -733,7 +741,9 @@ try:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
             if "修正" in df.columns: df["修正"] = df["修正"].astype(str).apply(lambda x: True if x.upper() == "TRUE" else False)
             return df[EXPECTED_COLUMNS]
-        except: return pd.DataFrame(columns=EXPECTED_COLUMNS)
+        except Exception as e:
+            print(f"[load_main_data] {e}")
+            return pd.DataFrame(columns=EXPECTED_COLUMNS)
 
     @st.cache_data(ttl=21600)
     def load_roster_dict():
@@ -743,7 +753,9 @@ try:
             df = pd.DataFrame(ws.get_all_records())
             id_c, cls_c = next((c for c in df.columns if "學號" in c), None), next((c for c in df.columns if "班級" in c), None)
             return {clean_id(row[id_c]): str(row[cls_c]).strip() for _, row in df.iterrows()} if id_c and cls_c else {}
-        except: return {}
+        except Exception as e:
+            print(f"[load_roster_dict] {e}")
+            return {}
     
     @st.cache_data(ttl=3600)
     def load_sorted_classes():
@@ -767,7 +779,9 @@ try:
                 return (g, dep, cls)
             sorted_all = sorted(unique, key=get_sort_key)
             return sorted_all, [{"grade": f"{get_sort_key(c)[0]}年級" if get_sort_key(c)[0]!=99 else "其他", "name": c} for c in sorted_all]
-        except: return [], []
+        except Exception as e:
+            print(f"[load_sorted_classes] {e}")
+            return [], []
 
     @st.cache_data(ttl=300)   # [效能] 5分鐘，尖峰時段不必每分鐘重打
     def get_daily_duty(target_date):
@@ -781,14 +795,18 @@ try:
                 df[date_col] = pd.to_datetime(df[date_col], errors='coerce').dt.date
                 return df[df[date_col] == (target_date if isinstance(target_date, date) else target_date.date())], "success"
             return pd.DataFrame(), "missing_cols"
-        except: return pd.DataFrame(), "error"
+        except Exception as e:
+            print(f"[get_daily_duty] {e}")
+            return pd.DataFrame(), "error"
 
     @st.cache_data(ttl=3600)
     def load_office_area_map():
         ws = get_worksheet(SHEET_TABS["office_areas"])
         if not ws: return {}
         try: return {str(r.get("區域名稱", "")).strip(): str(r.get("負責班級", "")).strip() for r in ws.get_all_records() if str(r.get("區域名稱", "")).strip()}
-        except: return {}
+        except Exception as e:
+            print(f"[load_office_area_map] {e}")
+            return {}
 
     @st.cache_data(ttl=21600)
     def load_settings():
@@ -798,7 +816,7 @@ try:
             try:
                 for row in ws.get_all_values():
                     if len(row)>=2: config[row[0]] = int(row[1]) if row[0] == "standard_n" else row[1]
-            except: pass
+            except Exception as e: print(f"[load_settings] {e}")
         return config
 
     def save_setting(key, val):
@@ -810,7 +828,9 @@ try:
                 else: ws.append_row([key, val])
                 st.cache_data.clear()
                 return True
-            except: return False
+            except Exception as e:
+                print(f"[save_setting] {e}")
+                return False
         return False
 
     @st.cache_data(ttl=300)   # [效能] 5分鐘，申訴資料不需秒級更新
@@ -822,7 +842,9 @@ try:
             for col in APPEAL_COLUMNS:
                 if col not in df.columns: df[col] = "待處理" if col == "處理狀態" else ""
             return df[APPEAL_COLUMNS]
-        except: return pd.DataFrame(columns=APPEAL_COLUMNS)
+        except Exception as e:
+            print(f"[load_appeals] {e}")
+            return pd.DataFrame(columns=APPEAL_COLUMNS)
 
     PUBLISHED_COLS = ["週次", "排名", "年級", "班級", "總扣分", "優良次數", "總成績", "評等", "排名模式", "發布時間"]
 
@@ -838,7 +860,9 @@ try:
             for col in ["週次", "排名", "總扣分", "優良次數", "總成績"]:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
             return df
-        except: return pd.DataFrame(columns=PUBLISHED_COLS)
+        except Exception as e:
+            print(f"[load_published_results] {e}")
+            return pd.DataFrame(columns=PUBLISHED_COLS)
 
     def publish_week_results(week_num, fin_ranked_df, rank_mode="全校"):
         """將計算好的週次排名寫入 published_results sheet，同一週再發布會覆蓋舊資料"""
@@ -971,7 +995,9 @@ try:
                         "raw_role": s_role
                     })
             return inspectors or default
-        except: return default
+        except Exception as e:
+            print(f"[load_inspector_list] {e}")
+            return default
 
     def check_duplicate_record(df, check_date, inspector, role, target_class=None):
         if df.empty: return False
@@ -982,7 +1008,9 @@ try:
                    (df["評分項目"].astype(str).str.startswith(role))
             if target_class: mask &= (df["班級"] == target_class)
             return not df[mask].empty
-        except: return False
+        except Exception as e:
+            print(f"[check_duplicate] {e}")
+            return False
 
     # [V5.28] 加入 award_inspector_hours 控制是否發放時數
     def save_entry(new_entry, uploaded_files=None, student_list=None, custom_hours=0.5, custom_category="晨掃志工", award_inspector_hours=True):
@@ -1018,11 +1046,15 @@ try:
                         print(f"Drive 上傳失敗 ({fname}): {e}")
                         return None
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(valid_files), 4)) as pool:
-                    results = list(pool.map(_upload_one, valid_files))
+                with st.spinner(f"📤 照片上傳中（共 {len(valid_files)} 張），請勿關閉頁面或重複按送出..."):
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(valid_files), 4)) as pool:
+                        results = list(pool.map(_upload_one, valid_files))
                 drive_links = [r for r in results if r]
+                failed_count = len(valid_files) - len(drive_links)
                 if drive_links:
                     new_entry["照片路徑"] = ";".join(drive_links)
+                if failed_count > 0:
+                    st.warning(f"⚠️ {failed_count} 張照片上傳失敗，資料已送出但不含這些照片。請截圖後告知組長補傳。")
 
         payload = {
             "entry": new_entry,
@@ -1048,7 +1080,9 @@ try:
             for col in ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數", "週次"]:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
             return df[EXPECTED_COLUMNS]
-        except: return pd.DataFrame()
+        except Exception as e:
+            print(f"[load_semester_data] {e}")
+            return pd.DataFrame()
 
     # ==========================================
     # 3. 主程式 UI 啟動前準備
@@ -1078,7 +1112,7 @@ try:
                         date_str, wn = item.rsplit(":", 1)
                         try:
                             entries.append((datetime.strptime(date_str.strip(), "%Y-%m-%d").date(), int(wn.strip())))
-                        except: pass
+                        except Exception: pass
                 if entries:
                     entries.sort(key=lambda x: x[0])
                     # 找到最後一個「錨點日期 <= d」的錨點，從那個錨點往後正常累計週數
@@ -1095,7 +1129,9 @@ try:
             # fallback：純數學計算（未設定 week_map 時使用）
             start = datetime.strptime(SYSTEM_CONFIG["semester_start"], "%Y-%m-%d").date()
             return max(0, ((d - start).days // 7) + 1)
-        except: return 0
+        except Exception as e:
+            print(f"[mode3_check] {e}")
+            return 0
 
     # ── 全域樣式注入 ─────────────────────────────────────────
     st.markdown("""
@@ -1724,7 +1760,7 @@ try:
                             current_date += timedelta(days=1)
                             if current_date.weekday() < 5 and current_date not in holidays: workdays += 1
                         return current_date
-                    except: return date.today()
+                    except Exception: return date.today()
 
                 unique_dates = cls_df["日期"].astype(str).unique()
                 appeal_deadline_map = {d: _appeal_deadline(d) for d in unique_dates}
@@ -2019,7 +2055,7 @@ try:
                         has_duty = True
                         area_name_str = str(m_d.iloc[0].get('掃地區域', '未指定區域'))
                         try: n_std = int(m_d.iloc[0].get('標準人數', 4))
-                        except: n_std = 4
+                        except Exception: n_std = 4
                 
                 is_makeup = False
                 found_duty = has_duty
@@ -2038,7 +2074,7 @@ try:
                                 if start_of_week <= r_date <= today_tw:
                                     already_done = True
                                     break
-                            except: pass
+                            except Exception: pass  # 日期解析失敗忽略
 
                     # 如果本週「還沒交過」，才開啟時光機去查哪一天缺交
                     if not already_done:
@@ -2053,7 +2089,7 @@ try:
                                 if not m_p.empty:
                                     area_name_str = str(m_p.iloc[0].get('掃地區域', '未指定區域'))
                                     try: n_std = int(m_p.iloc[0].get('標準人數', 4))
-                                    except: n_std = 4
+                                    except Exception: n_std = 4
                                     is_makeup = True # 判定為跨日補掃
                                     found_duty = True
                                     break
@@ -2642,7 +2678,7 @@ try:
                             r_date = pd.to_datetime(str(r["日期"])).date()
                             if start_of_week <= r_date <= today_tw:
                                 submitted_classes.add(str(r["班級"]))
-                        except: pass
+                        except Exception: pass  # 日期解析失敗忽略
                         
                 # 3. 交叉比對找出缺交名單
                 today_missing = []
