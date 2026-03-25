@@ -19,7 +19,7 @@ from datetime import datetime, date, timedelta
 from datetime import timezone
 import pytz
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials as SACredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
@@ -197,26 +197,42 @@ try:
     # ==========================================
     @st.cache_resource
     def get_credentials():
+        # [Fix #7] 改用 google-auth，取代已停止維護的 oauth2client
+        # SACredentials 支援執行緒安全的自動 token 刷新
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         if "gcp_service_account" not in st.secrets:
             return None
-        return ServiceAccountCredentials.from_json_keyfile_dict(dict(st.secrets["gcp_service_account"]), scope)
+        return SACredentials.from_service_account_info(
+            dict(st.secrets["gcp_service_account"]), scopes=scope
+        )
 
     def get_gspread_client():
         creds = get_credentials()
-        return gspread.authorize(creds) if creds else None
+        # [Fix #7] gspread.Client(auth=creds) 是 google-auth 的正確用法
+        return gspread.Client(auth=creds) if creds else None
 
     def get_drive_service():
         creds = get_credentials()
         return build('drive', 'v3', credentials=creds, cache_discovery=False) if creds else None
 
-    def get_worksheet(tab_name):
+    @st.cache_resource
+    def get_spreadsheet():
+        # [Fix #9] 快取整個 Spreadsheet 物件，避免每次 get_worksheet 都重新 open_by_url
         client = get_gspread_client()
         if not client: return None
+        try:
+            return client.open_by_url(SHEET_URL)
+        except Exception as e:
+            print(f"[get_spreadsheet] 無法開啟試算表: {e}")
+            return None
+
+    def get_worksheet(tab_name):
+        # [Fix #9] 改用快取的 Spreadsheet 物件，只在找不到分頁時才建立新分頁
+        sheet = get_spreadsheet()
+        if not sheet: return None
         for attempt in range(4):
             try:
-                sheet = client.open_by_url(SHEET_URL)
-                try: 
+                try:
                     return sheet.worksheet(tab_name)
                 except gspread.WorksheetNotFound:
                     cols = 20 if tab_name != "appeals" else 15
@@ -228,7 +244,7 @@ try:
                     if tab_name == "published_results": ws.append_row(["週次", "排名", "年級", "班級", "總扣分", "優良次數", "總成績", "評等", "排名模式", "發布時間"])
                     return ws
             except Exception as e:
-                if "429" in str(e): 
+                if "429" in str(e):
                     time.sleep(2 * (attempt + 1) + random.uniform(0, 1))
                     continue
                 else: return None
@@ -390,6 +406,76 @@ try:
     # ==========================================
     # 背景處理邏輯
     # ==========================================
+
+    def fetch_all_pending_service_tasks(max_attempts=6):
+        # [Fix #3] 一次撈出所有待處理的 service_hours_only 任務，供批次寫入使用
+        sql = (
+            "SELECT id, task_type, payload_json, attempts FROM task_queue "
+            "WHERE status IN ('PENDING', 'RETRY') AND task_type='service_hours_only' AND attempts < ? "
+            "ORDER BY created_ts ASC"
+        )
+        try:
+            with closing(open_queue_conn()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cur = conn.cursor()
+                cur.execute(sql, (max_attempts,))
+                rows = cur.fetchall()
+                if not rows:
+                    conn.execute("COMMIT")
+                    return []
+                ids = [r[0] for r in rows]
+                placeholders = ",".join(["?" for _ in ids])
+                cur.execute(
+                    f"UPDATE task_queue SET status='IN_PROGRESS', attempts=attempts+1 WHERE id IN ({placeholders})",
+                    ids
+                )
+                conn.execute("COMMIT")
+                return [
+                    {"id": r[0], "task_type": r[1],
+                     "payload": json.loads(r[2] or "{}"), "attempts": r[3] + 1}
+                    for r in rows
+                ]
+        except Exception as e:
+            print(f"[batch] 批次抓取 service_hours 任務失敗: {e}")
+            return []
+
+    def process_service_tasks_batch(tasks):
+        # [Fix #3] 把多個 service_hours_only 任務的所有學生合併，一次 append_rows 寫入
+        is_dry_run = str(st.secrets.get("system_config", {}).get("dry_run", "false")).lower() in ["true", "1"]
+        if is_dry_run:
+            return True, "DRY_RUN_SUCCESS"
+        rows_to_write = []
+        for task in tasks:
+            payload = task["payload"]
+            t_date = payload.get("date", str(date.today()))
+            t_cat  = payload.get("category", "")
+            for sid in payload.get("student_list", []):
+                try:
+                    with closing(open_queue_conn()) as conn:
+                        conn.execute(
+                            "INSERT INTO service_issued VALUES (?, ?, ?)",
+                            (t_date, str(sid), t_cat)
+                        )
+                    rows_to_write.append([
+                        t_date, str(sid),
+                        payload.get("class_name", ""), t_cat,
+                        str(payload.get("hours", 0.5)),
+                        uuid.uuid4().hex[:8]
+                    ])
+                except sqlite3.IntegrityError:
+                    pass  # 已發放過，跳過
+        if not rows_to_write:
+            return True, None  # 全部都是重複，視為成功
+        try:
+            def _batch_action():
+                ws = get_worksheet(SHEET_TABS["service_hours"])
+                if not ws: raise Exception("無法取得 service_hours 工作表")
+                ws.append_rows(rows_to_write, value_input_option="RAW")
+            execute_with_retry(_batch_action)
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
     def _append_main_entry_row(entry):
         def _action():
             ws = get_worksheet(SHEET_TABS["main"])
@@ -448,17 +534,10 @@ try:
             time.sleep(random.uniform(0.3, 0.6))
             return True, "DRY_RUN_SUCCESS"
 
+        # [Fix #3] service_hours_only 現在由 Worker 批次處理（process_service_tasks_batch）
+        # 保留此分支只作為 fallback：若任務因故繞過批次路徑，仍可單筆處理
         if task_type == "service_hours_only":
-            try:
-                for sid in payload.get("student_list", []):
-                    log_entry = {
-                        "日期": payload.get("date", str(date.today())), "學號": sid,
-                        "班級": payload.get("class_name", ""), "類別": payload.get("category", ""), 
-                        "時數": payload.get("hours", 0.5), "紀錄ID": uuid.uuid4().hex[:8]
-                    }
-                    _append_service_row_unique(log_entry) 
-                return True, None
-            except Exception as e: return False, str(e)
+            return process_service_tasks_batch([task])
 
         entry = payload.get("entry", {})
         try:
@@ -477,11 +556,29 @@ try:
                 # [V5.28] 根據參數決定是否發放時數 (預設發放，以防其他地方使用)
                 if "學號:" in inspector_name and payload.get("award_inspector_hours", True):
                     sid = inspector_name.split("學號:")[1].strip()
-                    _append_service_row_unique({"日期": entry.get("日期"), "學號": sid, "班級": "", "類別": "整潔評分糾察", "時數": 0.25, "紀錄ID": uuid.uuid4().hex[:8]}) 
-                
+                    _append_service_row_unique({"日期": entry.get("日期"), "學號": sid, "班級": "", "類別": "整潔評分糾察", "時數": 0.25, "紀錄ID": uuid.uuid4().hex[:8]})
+
                 if task_type == "volunteer_report":
+                    # [Fix #3] volunteer_report 多名學生的時數改為批次寫入（1 次 append_rows）
+                    svc_rows = []
+                    t_date = entry.get("日期", str(date.today()))
+                    t_cat  = payload.get("custom_category", "晨掃志工")
                     for sid in payload.get("student_list", []):
-                        _append_service_row_unique({"日期": entry.get("日期", str(date.today())), "學號": sid, "班級": entry.get("班級", ""), "類別": payload.get("custom_category", "晨掃志工"), "時數": payload.get("custom_hours", 0.5), "紀錄ID": uuid.uuid4().hex[:8]})
+                        try:
+                            with closing(open_queue_conn()) as conn:
+                                conn.execute("INSERT INTO service_issued VALUES (?, ?, ?)", (t_date, str(sid), t_cat))
+                            svc_rows.append([
+                                t_date, str(sid), entry.get("班級", ""), t_cat,
+                                str(payload.get("custom_hours", 0.5)), uuid.uuid4().hex[:8]
+                            ])
+                        except sqlite3.IntegrityError:
+                            pass  # 已發放，跳過
+                    if svc_rows:
+                        def _svc_batch():
+                            ws = get_worksheet(SHEET_TABS["service_hours"])
+                            if not ws: raise Exception("無法取得 service_hours 工作表")
+                            ws.append_rows(svc_rows, value_input_option="RAW")
+                        execute_with_retry(_svc_batch)
 
             elif task_type == "appeal_entry":
                 image_info = payload.get("image_file")
@@ -497,14 +594,31 @@ try:
         except: pass
         while True:
             if stop_event and stop_event.is_set(): break
-            update_worker_heartbeat() 
+            update_worker_heartbeat()
             try:
+                # [Fix #3] 優先批次處理所有 service_hours_only 任務（1 次 API call）
+                svc_tasks = fetch_all_pending_service_tasks()
+                if svc_tasks:
+                    ok, err = process_service_tasks_batch(svc_tasks)
+                    if ok:
+                        update_last_success_time()
+                    else:
+                        if err and "DRY_RUN" not in err: update_last_error_summary(err)
+                    final_status = "DONE" if ok else "FAILED"
+                    for t in svc_tasks:
+                        update_task_status(t["id"], final_status, t["attempts"], err)
+                    time.sleep(0.5)
+                    continue  # 繼續下一輪，優先清空 service_hours 佇列
+
+                # 處理含照片的任務（main_entry / volunteer_report / appeal_entry）逐筆進行
                 task = fetch_next_task()
-                if not task: time.sleep(2.0); continue
+                if not task:
+                    time.sleep(5.0)  # [Fix #3] 無任務時等 5 秒，減少空轉 API 呼叫
+                    continue
                 ok, err = process_task(task)
-                
+
                 if ok: update_last_success_time()
-                else: 
+                else:
                     if err and "DRY_RUN" not in err: update_last_error_summary(err)
 
                 try:
@@ -636,7 +750,8 @@ try:
                 cell = ws.find(key)
                 if cell: ws.update_cell(cell.row, cell.col+1, val)
                 else: ws.append_row([key, val])
-                st.cache_data.clear(); return True
+                st.cache_data.clear()
+                return True
             except: return False
         return False
 
@@ -1401,7 +1516,12 @@ try:
 
                     if sel_cls:
                         st.divider()
-                        if check_duplicate_record(main_df, input_date, inspector_name, role, sel_cls): st.warning(f"⚠️ 今日已評過 {sel_cls}！")
+                        # [Fix #6] 雙重防呆：先查 session_state（即時），再查快取 df（補強）
+                        _submit_key_check = f"{input_date}__{inspector_name}__{sel_cls}"
+                        _already_in_session = _submit_key_check in st.session_state.submitted_inspections
+                        _already_in_sheet   = check_duplicate_record(main_df, input_date, inspector_name, role, sel_cls)
+                        if _already_in_session or _already_in_sheet:
+                            st.warning(f"⚠️ 今日已評過 {sel_cls}！")
 
                         # [關鍵] check_result 放在 form 外面，才能即時顯示/隱藏違規欄位
                         check_result = st.radio("檢查結果", ["⭐ 優良", "✅ 普通", "❌ 違規(需扣分)"], horizontal=True, key="m1_check_result")
@@ -2018,7 +2138,7 @@ try:
             
             t_mon, t_rollcall, t4, t_appeal, t_excellent, t2, t1, t_settings, t3 = st.tabs([
                 "👀 衛生糾察", "👮 環保糾察", "📝 扣分明細", "📣 申訴", "⭐ 優良審核", "📊 成績總表", 
-                "🧹 晨掃審核", "⚙️ 設定", "🏫 返校打掃"
+                "🧹 晨掃審核", "⚙️ 設定", "🎖️ 服務時數發放"
             ])
             
             with t_mon:
@@ -2503,6 +2623,23 @@ try:
                 else:
                     st.caption(f"共 {len(pending_df)} 筆待審核，審核後不會立刻跳頁，可以繼續審核其他筆。")
 
+                # [Fix #5] _do_approve 移至迴圈外，所有依賴都透過參數明確傳入，
+                # 避免 Python closure 在迴圈中捕捉到最後一次的 r 變數
+                def _do_approve(record_id, s_val, note_text, reply, col_ref, cached_main_df):
+                    ws = get_worksheet(SHEET_TABS["main"])
+                    id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
+                    if str(record_id) in id_list:
+                        ridx = id_list.index(str(record_id)) + 1
+                        ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分") + 1, s_val)
+                        ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, "晨間打掃(學期加分)")
+                        matched = cached_main_df.loc[cached_main_df["紀錄ID"].astype(str) == str(record_id), "備註"]
+                        old_note = str(matched.iloc[0]) if not matched.empty else ""
+                        new_note = f"{old_note} \n組長回覆: {reply}" if reply else f"{old_note} \n組長核可: {note_text}"
+                        ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註") + 1, new_note)
+                        st.session_state.approved_morning_ids.add(str(record_id))
+                        load_main_data.clear()
+                        col_ref.success(f"✅ 已核可，學期加 {abs(s_val):g} 分")
+
                 for i, r in pending_df.iterrows():
                     with st.container(border=True):
                         c1, c2, c3 = st.columns([2, 2, 1.3])
@@ -2551,32 +2688,18 @@ try:
 
                         reply_msg = c1.text_input("💬 給予回應 (可留白)", key=f"rm_{r['紀錄ID']}")
 
-                        def _do_approve(record_id, s_val, note_text, reply):
-                            ws = get_worksheet(SHEET_TABS["main"])
-                            id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
-                            if str(record_id) in id_list:
-                                ridx = id_list.index(str(record_id)) + 1
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分") + 1, s_val)
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, "晨間打掃(學期加分)")
-                                matched = main_df.loc[main_df["紀錄ID"].astype(str) == str(record_id), "備註"]
-                                old_note = str(matched.iloc[0]) if not matched.empty else ""
-                                new_note = f"{old_note} \n組長回覆: {reply}" if reply else f"{old_note} \n組長核可: {note_text}"
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註") + 1, new_note)
-                                st.session_state.approved_morning_ids.add(str(record_id))
-                                load_main_data.clear()
-                                c1.success(f"✅ 已核可，學期加 {abs(s_val):g} 分")
-
                         # ── 審核按鈕：給分 or 駁回 ──
                         if score_val is not None:
                             if c3.button(f"✅ 給分 ({suggested:g}分)", key=f"approve_{r['紀錄ID']}"):
                                 _do_approve(r["紀錄ID"], score_val,
                                             f"給分{suggested:g}分（{score_label.split('→')[0].strip()}）",
-                                            reply_msg)
+                                            reply_msg, c1, main_df)
                         else:
                             # 無法自動計算時，提供手動選項
                             manual_score = c3.selectbox("給分", [2, 1, 0.5, 0.25], key=f"manual_{r['紀錄ID']}")
                             if c3.button("✅ 給分", key=f"approve_{r['紀錄ID']}"):
-                                _do_approve(r["紀錄ID"], -manual_score, f"手動給分 {manual_score} 分", reply_msg)
+                                _do_approve(r["紀錄ID"], -manual_score, f"手動給分 {manual_score} 分",
+                                            reply_msg, c1, main_df)
 
                         if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}"):
                             ws = get_worksheet(SHEET_TABS["main"])
@@ -2642,37 +2765,160 @@ try:
                 if st.button("🔄 重讀名單 (清除快取)"): st.cache_data.clear(); st.success("已清除快取！")
 
             with t3:
-                c1, c2 = st.columns(2)
-                rd, rc = c1.date_input("日期", today_tw, key="ret_date"), c2.selectbox("班級", all_classes, key="ret_cls")
-                mems = [s for s, c in ROSTER_DICT.items() if c == rc]
-                if mems:
-                    with st.form("ret_clean"):
-                        absent = st.multiselect("缺席名單", mems)
-                        pool = [m for m in mems if m not in absent]
-                        base_h = st.number_input("基礎時數", value=2.0, step=0.5)
-                        spec = st.multiselect("加強組", pool)
-                        spec_h = st.number_input("特別時數", value=3.0, step=0.5)
-                        pf = st.file_uploader("照片", type=['jpg','png'])
-                        
-                        if st.form_submit_button("發放"):
+                st.subheader("🎖️ 服務時數發放")
+
+                # ── 共用欄位 ──
+                SVC_CATEGORIES = ["返校打掃", "校外服務", "社區服務", "班級義工", "其他（手動輸入）"]
+                c_s1, c_s2 = st.columns(2)
+                rd = c_s1.date_input("日期", today_tw, key="svc_date")
+                sel_cat = c_s2.selectbox("活動類別", SVC_CATEGORIES, key="svc_cat")
+
+                if sel_cat == "其他（手動輸入）":
+                    custom_cat_input = st.text_input("請輸入活動名稱", key="svc_custom_cat", placeholder="例如：環境清潔日")
+                    base_category = custom_cat_input.strip() if custom_cat_input.strip() else "其他"
+                else:
+                    base_category = sel_cat
+
+                remark_input = st.text_input("備註（選填）", key="svc_remark", placeholder="例如：返校打掃第一梯次")
+                # 備註塞入類別欄，格式：活動名稱｜備註內容（不改 Sheet 欄位結構）
+                final_category = f"{base_category}｜{remark_input.strip()}" if remark_input.strip() else base_category
+
+                st.markdown("---")
+                target_mode = st.radio("發放對象模式", ["🏫 班級模式", "🔢 直接輸入學號"], horizontal=True, key="svc_mode")
+                st.markdown("")
+
+                # ── 班級模式 ──
+                if target_mode == "🏫 班級模式":
+                    rc = st.selectbox("選擇班級", all_classes, key="svc_cls")
+                    mems = [s for s, c_val in ROSTER_DICT.items() if c_val == rc]
+
+                    if not mems:
+                        st.warning("⚠️ 此班級在 Roster 中找不到成員，請確認 Google Sheet。")
+                    else:
+                        with st.form("svc_class_form"):
+                            absent = st.multiselect(f"❌ 缺席名單（共 {len(mems)} 人，扣除法）", mems, key="svc_absent")
+                            pool = [m for m in mems if m not in absent]
+                            st.caption(f"✅ 一般組：{len(pool)} 人")
+                            base_h = st.number_input("基礎時數", value=2.0, step=0.5, min_value=0.0, key="svc_base_h")
+
+                            st.markdown("---")
+                            spec = st.multiselect("⭐ 加強組（從一般組挑選，另給不同時數）", pool, key="svc_spec")
+                            spec_h = st.number_input("加強組時數", value=3.0, step=0.5, min_value=0.0, key="svc_spec_h")
+                            st.caption("（若無加強組，此欄留空即可，不影響結果）")
+
+                            pf = st.file_uploader("📸 照片（選填）", type=['jpg', 'png', 'jpeg'], key="svc_pf_cls")
+
+                            if st.form_submit_button("🚀 發放"):
+                                if time.time() - st.session_state.last_action_time < 3:
+                                    st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                                elif not pool:
+                                    st.error("❌ 發放名單為空，請確認名單設定！")
+                                else:
+                                    st.session_state.last_action_time = time.time()
+                                    norm = [m for m in pool if m not in spec]
+                                    ok_norm, ok_spec = True, True
+
+                                    fb = None
+                                    if pf:
+                                        pf.seek(0)
+                                        fb = pf.read()
+
+                                    if norm:
+                                        files_norm = [io.BytesIO(fb)] if fb else None
+                                        if files_norm: files_norm[0].name = "p.jpg"
+                                        ok_norm = save_entry(
+                                            {"日期": str(rd), "班級": rc, "評分項目": "服務時數發放",
+                                             "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")},
+                                            files_norm, norm, base_h, final_category
+                                        )
+                                    if spec:
+                                        files_spec = [io.BytesIO(fb)] if fb else None
+                                        if files_spec: files_spec[0].name = "p.jpg"
+                                        ok_spec = save_entry(
+                                            {"日期": str(rd), "班級": rc, "評分項目": "服務時數發放",
+                                             "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")},
+                                            files_spec, spec, spec_h, f"{final_category}(加強)"
+                                        )
+
+                                    if ok_norm and ok_spec:
+                                        result_msg = f"✅ 已發放！一般組 {len(norm)} 人 ({base_h}h)"
+                                        if spec:
+                                            result_msg += f"，加強組 {len(spec)} 人 ({spec_h}h)"
+                                        st.success(result_msg)
+                                        time.sleep(1.5)
+                                        st.rerun()
+
+                # ── 直接輸入學號模式 ──
+                else:
+                    raw_sid_input = st.text_area(
+                        "輸入學號（每行一個，或用逗號分隔）",
+                        key="svc_sid_raw",
+                        placeholder="例如：\n112001\n112002, 112003",
+                        height=150
+                    )
+
+                    # 即時解析與驗證（放在 form 外，輸入時即時顯示結果）
+                    valid_ids, invalid_ids = [], []
+                    if raw_sid_input.strip():
+                        raw_ids_list = [s.strip() for s in re.split(r'[\n,、，\s]+', raw_sid_input) if s.strip()]
+                        for sid in raw_ids_list:
+                            cleaned_sid = clean_id(sid)
+                            if cleaned_sid in ROSTER_DICT:
+                                if cleaned_sid not in valid_ids:
+                                    valid_ids.append(cleaned_sid)
+                            else:
+                                if sid not in invalid_ids:
+                                    invalid_ids.append(sid)
+
+                    if valid_ids:
+                        st.success(f"✅ 有效學號 {len(valid_ids)} 人，通過驗證，將發放服務時數。")
+                    if invalid_ids:
+                        st.error(f"❌ 以下學號不在 Roster 名單中，請確認後再送出：**{', '.join(invalid_ids)}**")
+
+                    with st.form("svc_sid_form"):
+                        hours_sid = st.number_input("時數（全體統一）", value=1.0, step=0.5, min_value=0.0, key="svc_sid_h")
+                        pf_sid = st.file_uploader("📸 照片（選填）", type=['jpg', 'png', 'jpeg'], key="svc_pf_sid")
+
+                        if st.form_submit_button("🚀 發放"):
                             if time.time() - st.session_state.last_action_time < 3:
                                 st.warning("⚠️ 系統處理中，請勿連續點擊！")
-                            elif pf:
-                                st.session_state.last_action_time = time.time()
-                                pf.seek(0); fb = pf.read()
-                                norm = [m for m in pool if m not in spec]
-                                ok_norm, ok_spec = True, True
-                                if norm: 
-                                    pf_n = io.BytesIO(fb); pf_n.name="p.jpg"
-                                    ok_norm = save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")}, [pf_n], norm, base_h, "返校打掃(一般)")
-                                if spec: 
-                                    pf_s = io.BytesIO(fb); pf_s.name="p.jpg"
-                                    ok_spec = save_entry({"日期": str(rd), "班級": rc, "評分項目": "返校打掃", "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")}, [pf_s], spec, spec_h, "返校打掃(加強)")
-                                
-                                if ok_norm and ok_spec:
-                                    st.success("已登記！"); time.sleep(1.5); st.rerun()
+                            elif invalid_ids:
+                                st.error(f"❌ 尚有 {len(invalid_ids)} 個無效學號，請先修正後再送出！")
+                            elif not valid_ids:
+                                st.error("❌ 請先在上方輸入至少一個有效學號！")
                             else:
-                                st.error("需上傳照片")
+                                st.session_state.last_action_time = time.time()
+
+                                # 按班級分組，讓 service_hours 的班級欄位正確對應
+                                cls_groups = {}
+                                for sid in valid_ids:
+                                    cls_name = ROSTER_DICT.get(sid, "")
+                                    if cls_name not in cls_groups:
+                                        cls_groups[cls_name] = []
+                                    cls_groups[cls_name].append(sid)
+
+                                fb_sid = None
+                                if pf_sid:
+                                    pf_sid.seek(0)
+                                    fb_sid = pf_sid.read()
+
+                                all_ok = True
+                                for i, (cls_name, sids) in enumerate(cls_groups.items()):
+                                    # 照片只在第一個班級群組帶入，避免重複上傳到 Drive
+                                    files_sid = [io.BytesIO(fb_sid)] if (fb_sid and i == 0) else None
+                                    if files_sid: files_sid[0].name = "p.jpg"
+                                    ok = save_entry(
+                                        {"日期": str(rd), "班級": cls_name, "評分項目": "服務時數發放",
+                                         "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")},
+                                        files_sid, sids, hours_sid, final_category
+                                    )
+                                    if not ok:
+                                        all_ok = False
+
+                                if all_ok:
+                                    st.success(f"✅ 已為 {len(valid_ids)} 位同學發放 {hours_sid}h 服務時數！")
+                                    time.sleep(1.5)
+                                    st.rerun()
 
         elif pwd_input != "":
             st.error("密碼錯誤")
