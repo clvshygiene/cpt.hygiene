@@ -387,23 +387,13 @@ try:
 
     def fetch_next_task(max_attempts=6):
         # [Fix #3-B] 從 Sheets 讀取第一筆 PENDING 任務，標記為 IN_PROGRESS
+        # 注意：background_worker 已改用 _extract_next_task(ws, records) 避免重複讀
+        # 此函式保留供緊急 fallback 使用
         try:
             ws = get_worksheet(SHEET_TABS["task_queue"])
             if not ws: return None
             records = ws.get_all_records()
-            for i, r in enumerate(records):
-                if r.get("status") in ("PENDING", "RETRY") and int(r.get("attempts", 0)) < max_attempts:
-                    row_idx = i + 2  # +1 header, +1 因為 1-indexed
-                    attempts_new = int(r.get("attempts", 0)) + 1
-                    ws.update_cell(row_idx, _QCOL_STATUS,   "IN_PROGRESS")
-                    ws.update_cell(row_idx, _QCOL_ATTEMPTS, attempts_new)
-                    return {
-                        "id":        r["id"],
-                        "task_type": r["task_type"],
-                        "payload":   json.loads(r.get("payload_json") or "{}"),
-                        "attempts":  attempts_new,
-                        "_row_idx":  row_idx
-                    }
+            return _extract_next_task(ws, records, max_attempts)
         except Exception as e:
             print(f"fetch_next_task error: {e}")
         return None
@@ -435,34 +425,67 @@ try:
 
     def fetch_all_pending_service_tasks(max_attempts=6):
         # [Fix #3-B] 從 Sheets 批次撈出所有 service_hours_only PENDING 任務
+        # 注意：此函式現在接受外部 ws + records，避免在同一 Worker 輪次重複讀 Sheets
+        # 實際呼叫由 background_worker 統一管理（見下方）
         try:
             ws = get_worksheet(SHEET_TABS["task_queue"])
             if not ws: return []
             records = ws.get_all_records()
-            result = []
-            batch_updates = []
-            for i, r in enumerate(records):
-                if (r.get("task_type") == "service_hours_only"
-                        and r.get("status") in ("PENDING", "RETRY")
-                        and int(r.get("attempts", 0)) < max_attempts):
-                    row_idx   = i + 2
-                    att_new   = int(r.get("attempts", 0)) + 1
-                    result.append({
-                        "id":        r["id"],
-                        "task_type": r["task_type"],
-                        "payload":   json.loads(r.get("payload_json") or "{}"),
-                        "attempts":  att_new,
-                        "_row_idx":  row_idx
-                    })
-                    # 準備 batch_update：status = IN_PROGRESS, attempts++
-                    batch_updates.append({"range": f"E{row_idx}", "values": [["IN_PROGRESS"]]})
-                    batch_updates.append({"range": f"F{row_idx}", "values": [[att_new]]})
-            if batch_updates:
-                ws.batch_update(batch_updates)
-            return result
+            return _extract_svc_tasks(ws, records, max_attempts)
         except Exception as e:
             print(f"[batch] 批次抓取 service_hours 任務失敗: {e}")
             return []
+
+    def _extract_svc_tasks(ws, records, max_attempts=6):
+        # 從已讀取的 records 中提取 service_hours_only 任務，避免重複讀 Sheets
+        result = []
+        batch_updates = []
+        for i, r in enumerate(records):
+            if (r.get("task_type") == "service_hours_only"
+                    and r.get("status") in ("PENDING", "RETRY")
+                    and int(r.get("attempts", 0)) < max_attempts):
+                row_idx = i + 2
+                att_new = int(r.get("attempts", 0)) + 1
+                result.append({
+                    "id":        r["id"],
+                    "task_type": r["task_type"],
+                    "payload":   json.loads(r.get("payload_json") or "{}"),
+                    "attempts":  att_new,
+                    "_row_idx":  row_idx
+                })
+                batch_updates.append({"range": f"E{row_idx}", "values": [["IN_PROGRESS"]]})
+                batch_updates.append({"range": f"F{row_idx}", "values": [[att_new]]})
+        if batch_updates:
+            try:
+                ws.batch_update(batch_updates)
+            except Exception as e:
+                print(f"[batch_update] 標記 IN_PROGRESS 失敗: {e}")
+        return result
+
+    def _extract_next_task(ws, records, max_attempts=6):
+        # 從已讀取的 records 中取出第一筆非 service_hours_only 的 PENDING 任務
+        for i, r in enumerate(records):
+            if (r.get("task_type") != "service_hours_only"
+                    and r.get("status") in ("PENDING", "RETRY")
+                    and int(r.get("attempts", 0)) < max_attempts):
+                row_idx = i + 2
+                attempts_new = int(r.get("attempts", 0)) + 1
+                try:
+                    ws.batch_update([
+                        {"range": f"E{row_idx}", "values": [["IN_PROGRESS"]]},
+                        {"range": f"F{row_idx}", "values": [[attempts_new]]}
+                    ])
+                except Exception as e:
+                    print(f"[fetch_next] 標記 IN_PROGRESS 失敗: {e}")
+                    return None
+                return {
+                    "id":        r["id"],
+                    "task_type": r["task_type"],
+                    "payload":   json.loads(r.get("payload_json") or "{}"),
+                    "attempts":  attempts_new,
+                    "_row_idx":  row_idx
+                }
+        return None
 
     def process_service_tasks_batch(tasks):
         # [Fix #3] 把多個 service_hours_only 任務的所有學生合併，一次 append_rows 寫入
@@ -609,38 +632,52 @@ try:
         except: pass
         while True:
             if stop_event and stop_event.is_set(): break
-            update_worker_heartbeat()
+            try: update_worker_heartbeat()
+            except: pass
             try:
-                # [Fix #3] 優先批次處理所有 service_hours_only 任務（1 次 API call）
-                svc_tasks = fetch_all_pending_service_tasks()
+                # [Fix #3-C] 每輪只讀一次 Sheets task_queue，避免 rate limit
+                ws = get_worksheet(SHEET_TABS["task_queue"])
+                if not ws:
+                    time.sleep(5.0)
+                    continue
+
+                try:
+                    records = ws.get_all_records()
+                except Exception as e:
+                    print(f"[worker] get_all_records 失敗: {e}")
+                    time.sleep(10.0)
+                    continue
+
+                # 優先批次清空所有 service_hours_only 任務
+                svc_tasks = _extract_svc_tasks(ws, records)
                 if svc_tasks:
                     ok, err = process_service_tasks_batch(svc_tasks)
-                    if ok:
-                        update_last_success_time()
+                    if ok: update_last_success_time()
                     else:
                         if err and "DRY_RUN" not in err: update_last_error_summary(err)
                     final_status = "DONE" if ok else "FAILED"
                     for t in svc_tasks:
                         update_task_status(t["id"], final_status, t["attempts"], err, _row_idx=t.get("_row_idx"))
-                    time.sleep(0.5)
-                    continue  # 繼續下一輪，優先清空 service_hours 佇列
-
-                # 處理含照片的任務（main_entry / volunteer_report / appeal_entry）逐筆進行
-                task = fetch_next_task()
-                if not task:
-                    time.sleep(5.0)  # [Fix #3] 無任務時等 5 秒，減少空轉 API 呼叫
+                    time.sleep(1.0)
                     continue
-                ok, err = process_task(task)
 
+                # 處理含照片的任務（同一批 records，不重複讀）
+                task = _extract_next_task(ws, records)
+                if not task:
+                    time.sleep(5.0)
+                    continue
+
+                ok, err = process_task(task)
                 if ok: update_last_success_time()
                 else:
                     if err and "DRY_RUN" not in err: update_last_error_summary(err)
 
-                # [Fix #3-B] 照片已在 save_entry/save_appeal 同步上傳，Worker 不再需要清理本機檔案
                 if not ok and err and "FILE_NOT_FOUND" in str(err): task["attempts"] = 999
                 update_task_status(task["id"], "DONE" if ok else ("FAILED" if task["attempts"] >= 6 else "RETRY"), task["attempts"], err, _row_idx=task.get("_row_idx"))
-                time.sleep(0.5)
-            except Exception as e: time.sleep(3.0)
+                time.sleep(1.0)
+            except Exception as e:
+                print(f"[worker] 未預期例外: {e}")
+                time.sleep(5.0)
 
     @st.cache_resource
     def ensure_worker_started():
