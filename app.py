@@ -727,7 +727,9 @@ try:
         return today <= current_date
 
     @st.cache_data(ttl=600)   # [效能] 10分鐘，降低尖峰 API 請求頻率
-    def load_main_data():
+    def load_main_data(current_week: int = 0):
+        # current_week 作為 cache key 的一部分：週次換了就自動 invalidate
+        # 傳入 0 代表不過濾（相容舊呼叫），傳入實際週次則只保留近兩週資料
         ws = get_worksheet(SHEET_TABS["main"])
         if not ws: return pd.DataFrame(columns=EXPECTED_COLUMNS)
         try:
@@ -740,7 +742,11 @@ try:
             for col in ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數", "週次"]:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
             if "修正" in df.columns: df["修正"] = df["修正"].astype(str).apply(lambda x: True if x.upper() == "TRUE" else False)
-            return df[EXPECTED_COLUMNS]
+            df = df[EXPECTED_COLUMNS]
+            # 近兩週過濾：只保留 current_week-2 以上的資料
+            if current_week >= 3 and "週次" in df.columns:
+                df = df[df["週次"] >= current_week - 2]
+            return df
         except Exception as e:
             print(f"[load_main_data] {e}")
             return pd.DataFrame(columns=EXPECTED_COLUMNS)
@@ -1475,7 +1481,7 @@ try:
                 input_date = c_d.date_input("檢查日期", today_tw)
                 role = c_r.radio("檢查項目", allowed_roles, horizontal=True, key="m1_role_radio") if len(allowed_roles)>1 else allowed_roles[0]
                 week_num = get_week_num(input_date)
-                main_df = load_main_data()
+                main_df = load_main_data(get_week_num(today_tw))
 
                 if role == "垃圾/回收檢查":
                     st.info("🗑️ 資源回收與垃圾檢查 (每日每班此項目總扣分上限2分將於結算時自動卡控)")
@@ -1739,7 +1745,7 @@ try:
     # --- Mode 2: 班級負責人 ---
     elif app_mode == "班級負責人🥸":
         st.title("🔎 班級成績查詢")
-        df, appeals_df = load_main_data(), load_appeals()
+        df, appeals_df = load_main_data(get_week_num(today_tw)), load_appeals()
         appeal_map = {str(r.get("對應紀錄ID")): {"status": str(r.get("處理狀態", "")), "reply": str(r.get("審核回覆", ""))} for _, r in appeals_df.iterrows()} if not appeals_df.empty else {}
 
         sel_grade_m2 = st.radio("選擇年級", grades, horizontal=True, key="m2_grade_select")
@@ -2030,7 +2036,7 @@ try:
                 st.info("🔧 **[測試機特權開啟]** 目前已超過 16:00，但因為是 DEV 環境，允許繼續測試！")
                 
             my_cls = st.selectbox("選擇班級", all_classes, key="m3_cls_select")
-            main_df = load_main_data()
+            main_df = load_main_data(get_week_num(today_tw))
             
             # [新增防呆] 建立一個本地暫存，記住剛送出的班級
             if "just_submitted_morning" not in st.session_state:
@@ -2251,7 +2257,7 @@ try:
                 monitor_date = st.date_input("監控日期", today_tw, key="monitor_date")
                 st.caption(f"📅 此區顯示負責「內掃、外掃、機動」的評分糾察進度。")
 
-                df = load_main_data()
+                df = load_main_data(get_week_num(today_tw))
                 submitted_names = set()
                 if not df.empty:
                     today_records = df[df["日期"].astype(str) == str(monitor_date)]
@@ -2323,7 +2329,7 @@ try:
                                     st.warning("沒有可發放時數的對象")
 
             with t4:
-                df = load_main_data()
+                df = load_main_data(get_week_num(today_tw))
                 if not df.empty:
                     st.dataframe(df[["登錄時間", "日期", "班級", "評分項目", "檢查人員", "備註", "違規細項", "紀錄ID"]].sort_values("登錄時間", ascending=False))
 
@@ -2360,7 +2366,7 @@ try:
 
             with t_excellent:
                 st.subheader("⭐ 優良審核")
-                ex_df = load_main_data()
+                ex_df = load_main_data(get_week_num(today_tw))
                 pending_ex = ex_df[ex_df["評分項目"].astype(str).str.contains("待審優良")] if not ex_df.empty else pd.DataFrame()
 
                 if pending_ex.empty:
@@ -2653,7 +2659,7 @@ try:
             with t1:
                 # [V5.29 Patch] 本週晨掃進度追蹤 (含過去缺交)
                 st.subheader("🕵️‍♀️ 晨掃進度追蹤 (本週)")
-                main_df = load_main_data()
+                main_df = load_main_data(get_week_num(today_tw))
                 
                 from datetime import timedelta
                 # 計算本週一是哪一天
