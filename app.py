@@ -1745,7 +1745,7 @@ try:
     # --- Mode 2: 班級負責人 ---
     elif app_mode == "班級負責人🥸":
         st.title("🔎 班級成績查詢")
-        df, appeals_df = load_main_data(get_week_num(today_tw)), load_appeals()
+        df, appeals_df = load_full_semester_data_for_export(), load_appeals()  # 班級負責人需要整學期資料才能正確顯示學期累計扣分
         appeal_map = {str(r.get("對應紀錄ID")): {"status": str(r.get("處理狀態", "")), "reply": str(r.get("審核回覆", ""))} for _, r in appeals_df.iterrows()} if not appeals_df.empty else {}
 
         sel_grade_m2 = st.radio("選擇年級", grades, horizontal=True, key="m2_grade_select")
