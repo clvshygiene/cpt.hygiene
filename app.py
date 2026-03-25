@@ -1608,18 +1608,55 @@ try:
                     if records.empty:
                         st.success("🎉 目前沒有任何評分紀錄！")
                     else:
+                        import html as _html
+
+                        # [修正] 同班+同日+同評分項目合併成一張卡片，避免多張照片變多筆
+                        # 先把評分項目正規化（把 待審優良 統一視為 普通 顯示用）
+                        def _display_item(item):
+                            return str(item).replace("(待審優良)", "(普通)")
+
+                        seen_groups = {}  # key=(日期, 評分項目顯示名) → 代表row index
+                        group_photos = {}  # key → 所有照片 list
+                        group_rids = {}   # key → 所有 rid list
+
                         for idx, r in records.iterrows():
+                            date_str = str(r['日期'])
+                            item_disp = _display_item(r['評分項目'])
+                            gkey = (date_str, item_disp)
+                            if gkey not in seen_groups:
+                                seen_groups[gkey] = idx
+                                group_photos[gkey] = []
+                                group_rids[gkey] = []
+                            # 合併照片
+                            if str(r.get('照片路徑', '')).strip() and "http" in str(r['照片路徑']):
+                                group_photos[gkey] += [p for p in str(r['照片路徑']).split(";") if "http" in p]
+                            group_rids[gkey].append(str(r['紀錄ID']))
+
+                        for gkey, rep_idx in seen_groups.items():
+                            r = records.loc[rep_idx]
+                            date_str, item_disp = gkey
+                            rid = str(r['紀錄ID'])
+                            all_photos = group_photos[gkey]
+                            all_rids   = group_rids[gkey]
+
+                            # 申訴狀態：只要有任何一筆 rid 有申訴，就顯示
+                            ap_info = {}
+                            for _rid in all_rids:
+                                if _rid in appeal_map:
+                                    ap_info = appeal_map[_rid]
+                                    rid = _rid  # 用有申訴紀錄的那筆 rid 做申訴對應
+                                    break
+                            ap_st    = ap_info.get("status")
+                            ap_reply = ap_info.get("reply")
+
                             trash_score = r['垃圾內掃原始分'] + r['垃圾外掃原始分']
                             if trash_score == 0: trash_score = r['垃圾原始分']
                             tot = r['內掃原始分'] + r['外掃原始分'] + trash_score + r['晨間打掃原始分']
-                            rid = str(r['紀錄ID'])
-                            ap_info = appeal_map.get(rid, {})
-                            ap_st = ap_info.get("status")
-                            ap_reply = ap_info.get("reply")
+
                             is_excellent = "優良" in str(r['評分項目']) and "待審" not in str(r['評分項目'])
-                            is_pending_excellent = "待審優良" in str(r['評分項目'])  # 待審中，學生看普通
+                            is_pending_excellent = "待審優良" in str(r['評分項目'])
                             is_normal = "普通" in str(r['評分項目']) or is_pending_excellent
-                            is_corrected = str(r['修正']) == "TRUE"
+                            is_corrected = r['修正'] is True or str(r['修正']).upper() == "TRUE"
 
                             # 決定卡片顏色
                             if ap_st == "已核可" or is_corrected:
@@ -1644,14 +1681,10 @@ try:
                                 else:
                                     tag_text = f"❌ 扣 {tot} 分"
 
-                            disp_time = str(r.get('登錄時間', ''))
-                            date_str = str(r['日期'])
                             week_str = f"第{r.get('週次','')}週"
-
-                            # [關鍵修正] 預先組好所有動態欄位，避免巢狀 f-string 破壞 HTML 結構
-                            import html as _html
+                            disp_time = str(r.get('登錄時間', ''))
                             inspector_safe = _html.escape(str(r.get('檢查人員', '未知')))
-                            item_safe      = _html.escape(str(r['評分項目']))
+                            item_safe      = _html.escape(item_disp)
                             note_raw       = str(r.get('備註', '')).strip()
                             note_part      = f"&nbsp;|&nbsp; 📝 {_html.escape(note_raw)}" if note_raw else ""
                             time_part      = f'<div style="font-size:12px;color:#718096;margin-top:4px">登錄：{_html.escape(disp_time)}</div>' if disp_time else ""
@@ -1676,8 +1709,8 @@ try:
                             elif ap_st == "待處理":
                                 st.info("⏳ 申訴審核中，請耐心等候...")
 
-                            # [需求1] 照片與申訴整合在同一個展開區塊
-                            has_photo = str(r.get('照片路徑','')).strip() and "http" in str(r['照片路徑'])
+                            # 照片與申訴整合（合併所有照片）
+                            has_photo = len(all_photos) > 0
                             deadline = appeal_deadline_map.get(date_str, date.today())
                             can_appeal = not ap_st and date.today() <= deadline and (tot > 0 or r['手機人數'] > 0)
 
@@ -1685,7 +1718,7 @@ try:
                                 with st.expander("📋 查看詳情" + (f"　|　📣 可申訴（截止 {deadline.strftime('%m/%d')}）" if can_appeal else "")):
                                     if has_photo:
                                         st.markdown("**📷 評分照片**")
-                                        st.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=200)
+                                        st.image(all_photos, width=200)
                                     if can_appeal:
                                         st.markdown("---")
                                         st.markdown("**📣 提出申訴**")
@@ -2108,42 +2141,53 @@ try:
                 if pending_ex.empty:
                     st.success("🎉 目前沒有待審核的優良紀錄！")
                 else:
-                    st.caption(f"共 {len(pending_ex)} 筆待審核，審核後不會跳頁，可以繼續審核其他筆。")
                     if "approved_excellent_ids" not in st.session_state:
                         st.session_state.approved_excellent_ids = set()
 
-                    for _, r in pending_ex.iterrows():
-                        rid = str(r['紀錄ID'])
-                        if rid in st.session_state.approved_excellent_ids:
-                            continue
+                    # [修正] 依 班級+日期+評分項目 群組，避免多張照片變多筆審核卡
+                    pending_ex = pending_ex[~pending_ex["紀錄ID"].astype(str).isin(st.session_state.approved_excellent_ids)]
+                    groups = list(pending_ex.groupby(["班級", "日期", "評分項目"]))
+                    st.caption(f"共 {len(groups)} 筆待審核，審核後不會跳頁，可以繼續審核其他筆。")
+
+                    for (cls_name, date_val, item_val), grp in groups:
+                        r = grp.iloc[0]
+                        all_rids = grp["紀錄ID"].astype(str).tolist()
+                        all_photos = []
+                        for _, gr in grp.iterrows():
+                            if "http" in str(gr.get("照片路徑", "")):
+                                all_photos += [p for p in str(gr["照片路徑"]).split(";") if "http" in p]
+
                         with st.container(border=True):
                             c1, c2, c3 = st.columns([2, 2, 1])
-                            c1.write(f"⭐ **{r['班級']}** | {r['檢查人員']}")
-                            c1.caption(f"{r['日期']} | {r['評分項目']}")
+                            c1.write(f"⭐ **{cls_name}** | {r['檢查人員']}")
+                            c1.caption(f"{date_val} | {item_val}")
                             c1.write(f"📝 {r['備註']}")
-                            if "http" in str(r.get('照片路徑', '')):
-                                c2.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=150)
-                            if c3.button("✅ 核可優良", key=f"ex_ok_{rid}"):
+                            if grp.shape[0] > 1:
+                                c1.caption(f"（共 {grp.shape[0]} 筆紀錄合併，{len(all_photos)} 張照片）")
+                            if all_photos:
+                                c2.image(all_photos[:6], width=120)
+
+                            gid = all_rids[0]  # 用第一筆 ID 當按鈕 key
+
+                            def _approve_group(rids, eval_suffix):
                                 ws = get_worksheet(SHEET_TABS["main"])
                                 id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
-                                if rid in id_list:
-                                    ridx = id_list.index(rid) + 1
-                                    # 把評分項目從「(待審優良)」改成「(優良)」
-                                    new_item = str(r['評分項目']).replace("(待審優良)", "(優良)")
-                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, new_item)
+                                for rid in rids:
+                                    if rid in id_list:
+                                        ridx = id_list.index(rid) + 1
+                                        matched = ex_df.loc[ex_df["紀錄ID"].astype(str) == rid, "評分項目"]
+                                        if not matched.empty:
+                                            new_item = str(matched.iloc[0]).replace("(待審優良)", eval_suffix)
+                                            ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, new_item)
                                     st.session_state.approved_excellent_ids.add(rid)
-                                    load_main_data.clear()
-                                    c1.success("✅ 已核可為優良！")
-                            if c3.button("🚫 駁回(改普通)", key=f"ex_ng_{rid}"):
-                                ws = get_worksheet(SHEET_TABS["main"])
-                                id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
-                                if rid in id_list:
-                                    ridx = id_list.index(rid) + 1
-                                    new_item = str(r['評分項目']).replace("(待審優良)", "(普通)")
-                                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, new_item)
-                                    st.session_state.approved_excellent_ids.add(rid)
-                                    load_main_data.clear()
-                                    c1.info("已改為普通。")
+                                load_main_data.clear()
+
+                            if c3.button("✅ 核可優良", key=f"ex_ok_{gid}"):
+                                _approve_group(all_rids, "(優良)")
+                                c1.success("✅ 已核可為優良！")
+                            if c3.button("🚫 駁回(改普通)", key=f"ex_ng_{gid}"):
+                                _approve_group(all_rids, "(普通)")
+                                c1.info("已改為普通。")
 
                     if st.button("🔄 重新整理列表", key="refresh_excellent"):
                         st.session_state.approved_excellent_ids.clear()
