@@ -47,18 +47,17 @@ else:
 # --- 2. 核心參數與全域設定 ---
 try:
     TW_TZ = pytz.timezone('Asia/Taipei')
-    MAX_IMAGE_BYTES = 20 * 1024 * 1024  
-    UPLOAD_SEM = threading.BoundedSemaphore(4) 
-    QUEUE_DB_PATH = "task_queue_v4_wal.db"
-    IMG_DIR = "evidence_photos"
-    os.makedirs(IMG_DIR, exist_ok=True)
+    MAX_IMAGE_BYTES = 20 * 1024 * 1024
+    # [Fix #3-B] UPLOAD_SEM 與 IMG_DIR 已移除：照片改為同步上傳 Drive，不再暫存本機
+    QUEUE_DB_PATH = "local_status_v5.db"  # 只保留 service_issued dedup + system_status 監控
     
     SHEET_URL = "https://docs.google.com/spreadsheets/d/11BXtN3aevJls6Q2IR_IbT80-9XvhBkjbTCgANmsxqkg/edit"
     SHEET_TABS = {
         "main": "main_data", "settings": "settings", "roster": "roster",
         "inspectors": "inspectors", "duty": "duty",
         "appeals": "appeals", "holidays": "holidays", "service_hours": "service_hours",
-        "office_areas": "office_areas", "published_results": "published_results"
+        "office_areas": "office_areas", "published_results": "published_results",
+        "task_queue": "task_queue_v3"  # [Fix #3-B] 雲端佇列分頁，取代本機 SQLite task_queue 表
     }
 
     EXPECTED_COLUMNS = [
@@ -242,6 +241,7 @@ try:
                     if tab_name == "holidays": ws.append_row(["日期", "說明"])
                     if tab_name == "office_areas": ws.append_row(["區域名稱", "負責班級"])
                     if tab_name == "published_results": ws.append_row(["週次", "排名", "年級", "班級", "總扣分", "優良次數", "總成績", "評等", "排名模式", "發布時間"])
+                    if tab_name == "task_queue": ws.append_row(["id", "task_type", "created_ts", "payload_json", "status", "attempts", "last_error"])
                     return ws
             except Exception as e:
                 if "429" in str(e):
@@ -286,155 +286,180 @@ try:
         return s
 
     # ==========================================
-    # SQLite 背景佇列
+    # 本機 SQLite（只保留 dedup + 監控狀態，不含 task_queue）
     # ==========================================
-    def open_queue_conn():
-        conn = sqlite3.connect(QUEUE_DB_PATH, timeout=30.0, isolation_level=None)
+    def open_local_db():
+        # [Fix #3-B] task_queue 已移至 Google Sheets，這裡只保留兩張輕量表
+        conn = sqlite3.connect(QUEUE_DB_PATH, timeout=10.0, isolation_level=None)
         conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA busy_timeout=30000;")
-        conn.execute("CREATE TABLE IF NOT EXISTS task_queue (id TEXT PRIMARY KEY, task_type TEXT, created_ts TEXT, payload_json TEXT, status TEXT, attempts INTEGER, last_error TEXT)")
         conn.execute("CREATE TABLE IF NOT EXISTS service_issued (date TEXT, sid TEXT, category TEXT, PRIMARY KEY(date, sid, category))")
-        conn.execute("CREATE TABLE IF NOT EXISTS system_status (key TEXT PRIMARY KEY, val TEXT)") 
+        conn.execute("CREATE TABLE IF NOT EXISTS system_status (key TEXT PRIMARY KEY, val TEXT)")
         return conn
-
-    def get_pending_count():
-        try:
-            with closing(open_queue_conn()) as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT COUNT(*) FROM task_queue WHERE status='PENDING'")
-                return cur.fetchone()[0]
-        except: return 0
 
     def update_worker_heartbeat():
         try:
-            with closing(open_queue_conn()) as conn:
+            with closing(open_local_db()) as conn:
                 conn.execute("INSERT OR REPLACE INTO system_status VALUES ('worker_heartbeat', ?)", (str(time.time()),))
         except: pass
 
     def update_last_success_time():
         try:
-            with closing(open_queue_conn()) as conn:
+            with closing(open_local_db()) as conn:
                 conn.execute("INSERT OR REPLACE INTO system_status VALUES ('last_success_time', ?)", (str(time.time()),))
         except: pass
 
     def get_worker_heartbeat_sec():
         try:
-            with closing(open_queue_conn()) as conn:
+            with closing(open_local_db()) as conn:
                 cur = conn.cursor()
                 cur.execute("SELECT val FROM system_status WHERE key='worker_heartbeat'")
                 row = cur.fetchone()
-                if row:
-                    return time.time() - float(row[0])
+                if row: return time.time() - float(row[0])
         except: pass
         return 999999
 
     def get_last_success_sec():
         try:
-            with closing(open_queue_conn()) as conn:
+            with closing(open_local_db()) as conn:
                 cur = conn.cursor()
                 cur.execute("SELECT val FROM system_status WHERE key='last_success_time'")
                 row = cur.fetchone()
-                if row:
-                    return time.time() - float(row[0])
+                if row: return time.time() - float(row[0])
         except: pass
         return 999999
 
+    # ==========================================
+    # Google Sheets 雲端佇列（取代 SQLite task_queue）
+    # ==========================================
+    # 欄位索引（1-based）：id=1, task_type=2, created_ts=3, payload_json=4, status=5, attempts=6, last_error=7
+    _QCOL_STATUS   = 5
+    _QCOL_ATTEMPTS = 6
+    _QCOL_ERROR    = 7
+
     def enqueue_task(task_type, payload):
+        # [Fix #3-B] 寫入 Sheets task_queue 分頁，不再用 SQLite
         task_id = str(uuid.uuid4())
-        with closing(open_queue_conn()) as conn:
-            conn.execute(
-                "INSERT INTO task_queue VALUES (?, ?, ?, ?, 'PENDING', 0, NULL)",
-                (task_id, task_type, datetime.now(timezone.utc).isoformat(), json.dumps(payload, ensure_ascii=False))
-            )
+        try:
+            def _action():
+                ws = get_worksheet(SHEET_TABS["task_queue"])
+                if not ws: raise Exception("無法取得 task_queue 工作表")
+                ws.append_row([
+                    task_id, task_type,
+                    datetime.now(timezone.utc).isoformat(),
+                    json.dumps(payload, ensure_ascii=False),
+                    "PENDING", 0, ""
+                ], value_input_option="RAW")
+            execute_with_retry(_action)
+        except Exception as e:
+            print(f"[enqueue] 加入佇列失敗: {e}")
         return task_id
+
+    def get_pending_count():
+        try:
+            ws = get_worksheet(SHEET_TABS["task_queue"])
+            if not ws: return 0
+            statuses = ws.col_values(_QCOL_STATUS)[1:]  # 跳過標題列
+            return sum(1 for s in statuses if s in ("PENDING", "RETRY"))
+        except: return 0
 
     def get_queue_metrics():
         metrics = {"pending": 0, "retry": 0, "failed": 0, "oldest_pending_sec": 0, "recent_errors": []}
         try:
-            with closing(open_queue_conn()) as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT status, COUNT(*) FROM task_queue GROUP BY status")
-                for s, c in cur.fetchall():
-                    if s == 'PENDING': metrics["pending"] = c
-                    elif s == 'RETRY': metrics["retry"] = c
-                    elif s == 'FAILED': metrics["failed"] = c
-                
-                cur.execute("SELECT MIN(created_ts) FROM task_queue WHERE status IN ('PENDING', 'RETRY')")
-                oldest = cur.fetchone()[0]
-                if oldest:
-                    try: metrics["oldest_pending_sec"] = (datetime.now(pytz.utc) - datetime.fromisoformat(oldest.replace("Z", "+00:00"))).total_seconds()
-                    except: pass
-                cur.execute("SELECT last_error, created_ts FROM task_queue WHERE status='FAILED' OR status='RETRY' ORDER BY created_ts DESC LIMIT 5")
-                metrics["recent_errors"] = cur.fetchall()
+            ws = get_worksheet(SHEET_TABS["task_queue"])
+            if not ws: return metrics
+            records = ws.get_all_records()
+            for r in records:
+                s = r.get("status", "")
+                if s == "PENDING":  metrics["pending"]  += 1
+                elif s == "RETRY":  metrics["retry"]    += 1
+                elif s == "FAILED": metrics["failed"]   += 1
+            pending_recs = [r for r in records if r.get("status") in ("PENDING", "RETRY") and r.get("created_ts")]
+            if pending_recs:
+                try:
+                    oldest = min(r["created_ts"] for r in pending_recs)
+                    metrics["oldest_pending_sec"] = (datetime.now(pytz.utc) - datetime.fromisoformat(oldest.replace("Z", "+00:00"))).total_seconds()
+                except: pass
+            err_recs = sorted([r for r in records if r.get("status") in ("FAILED", "RETRY") and r.get("last_error")],
+                              key=lambda x: x.get("created_ts", ""), reverse=True)[:5]
+            metrics["recent_errors"] = [(r.get("last_error"), r.get("created_ts")) for r in err_recs]
         except: pass
         return metrics
 
     def fetch_next_task(max_attempts=6):
+        # [Fix #3-B] 從 Sheets 讀取第一筆 PENDING 任務，標記為 IN_PROGRESS
         try:
-            with closing(open_queue_conn()) as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                cur = conn.cursor()
-                cur.execute("""
-                    SELECT id, task_type, payload_json, attempts 
-                    FROM task_queue 
-                    WHERE status IN ('PENDING', 'RETRY') AND attempts < ?
-                    ORDER BY created_ts ASC LIMIT 1
-                """, (max_attempts,))
-                
-                row = cur.fetchone()
-                if not row:
-                    conn.execute("COMMIT")
-                    return None
-                    
-                task_id = row[0]
-                cur.execute("UPDATE task_queue SET status='IN_PROGRESS', attempts=attempts+1 WHERE id=?", (task_id,))
-                conn.execute("COMMIT")
-                
-                # [V5.31 Patch 2] 回傳給 Worker 的 attempts 必須 +1，與資料庫同步
-                return {"id": task_id, "task_type": row[1], "payload": json.loads(row[2] or "{}"), "attempts": row[3] + 1}
+            ws = get_worksheet(SHEET_TABS["task_queue"])
+            if not ws: return None
+            records = ws.get_all_records()
+            for i, r in enumerate(records):
+                if r.get("status") in ("PENDING", "RETRY") and int(r.get("attempts", 0)) < max_attempts:
+                    row_idx = i + 2  # +1 header, +1 因為 1-indexed
+                    attempts_new = int(r.get("attempts", 0)) + 1
+                    ws.update_cell(row_idx, _QCOL_STATUS,   "IN_PROGRESS")
+                    ws.update_cell(row_idx, _QCOL_ATTEMPTS, attempts_new)
+                    return {
+                        "id":        r["id"],
+                        "task_type": r["task_type"],
+                        "payload":   json.loads(r.get("payload_json") or "{}"),
+                        "attempts":  attempts_new,
+                        "_row_idx":  row_idx
+                    }
         except Exception as e:
-            print(f"抓取任務時發生錯誤: {e}")
-            return None
+            print(f"fetch_next_task error: {e}")
+        return None
 
-    def update_task_status(task_id, status, attempts, last_error):
-        with closing(open_queue_conn()) as conn:
-            conn.execute(
-                "UPDATE task_queue SET status=?, attempts=?, last_error=? WHERE id=?",
-                (status, attempts, last_error, task_id)
-            )
+    def update_task_status(task_id, status, attempts, last_error, _row_idx=None):
+        # [Fix #3-B] 用 _row_idx 直接定位 Sheets 行，避免重新搜尋
+        try:
+            ws = get_worksheet(SHEET_TABS["task_queue"])
+            if not ws: return
+            if _row_idx:
+                ws.update_cell(_row_idx, _QCOL_STATUS,   status)
+                ws.update_cell(_row_idx, _QCOL_ATTEMPTS, attempts)
+                if last_error:
+                    ws.update_cell(_row_idx, _QCOL_ERROR, str(last_error)[:200])
+            else:
+                ids = ws.col_values(1)[1:]
+                if task_id in ids:
+                    ridx = ids.index(task_id) + 2
+                    ws.update_cell(ridx, _QCOL_STATUS,   status)
+                    ws.update_cell(ridx, _QCOL_ATTEMPTS, attempts)
+                    if last_error:
+                        ws.update_cell(ridx, _QCOL_ERROR, str(last_error)[:200])
+        except Exception as e:
+            print(f"update_task_status error: {e}")
 
     # ==========================================
     # 背景處理邏輯
     # ==========================================
 
     def fetch_all_pending_service_tasks(max_attempts=6):
-        # [Fix #3] 一次撈出所有待處理的 service_hours_only 任務，供批次寫入使用
-        sql = (
-            "SELECT id, task_type, payload_json, attempts FROM task_queue "
-            "WHERE status IN ('PENDING', 'RETRY') AND task_type='service_hours_only' AND attempts < ? "
-            "ORDER BY created_ts ASC"
-        )
+        # [Fix #3-B] 從 Sheets 批次撈出所有 service_hours_only PENDING 任務
         try:
-            with closing(open_queue_conn()) as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                cur = conn.cursor()
-                cur.execute(sql, (max_attempts,))
-                rows = cur.fetchall()
-                if not rows:
-                    conn.execute("COMMIT")
-                    return []
-                ids = [r[0] for r in rows]
-                placeholders = ",".join(["?" for _ in ids])
-                cur.execute(
-                    f"UPDATE task_queue SET status='IN_PROGRESS', attempts=attempts+1 WHERE id IN ({placeholders})",
-                    ids
-                )
-                conn.execute("COMMIT")
-                return [
-                    {"id": r[0], "task_type": r[1],
-                     "payload": json.loads(r[2] or "{}"), "attempts": r[3] + 1}
-                    for r in rows
-                ]
+            ws = get_worksheet(SHEET_TABS["task_queue"])
+            if not ws: return []
+            records = ws.get_all_records()
+            result = []
+            batch_updates = []
+            for i, r in enumerate(records):
+                if (r.get("task_type") == "service_hours_only"
+                        and r.get("status") in ("PENDING", "RETRY")
+                        and int(r.get("attempts", 0)) < max_attempts):
+                    row_idx   = i + 2
+                    att_new   = int(r.get("attempts", 0)) + 1
+                    result.append({
+                        "id":        r["id"],
+                        "task_type": r["task_type"],
+                        "payload":   json.loads(r.get("payload_json") or "{}"),
+                        "attempts":  att_new,
+                        "_row_idx":  row_idx
+                    })
+                    # 準備 batch_update：status = IN_PROGRESS, attempts++
+                    batch_updates.append({"range": f"E{row_idx}", "values": [["IN_PROGRESS"]]})
+                    batch_updates.append({"range": f"F{row_idx}", "values": [[att_new]]})
+            if batch_updates:
+                ws.batch_update(batch_updates)
+            return result
         except Exception as e:
             print(f"[batch] 批次抓取 service_hours 任務失敗: {e}")
             return []
@@ -451,7 +476,7 @@ try:
             t_cat  = payload.get("category", "")
             for sid in payload.get("student_list", []):
                 try:
-                    with closing(open_queue_conn()) as conn:
+                    with closing(open_local_db()) as conn:
                         conn.execute(
                             "INSERT INTO service_issued VALUES (?, ?, ?)",
                             (t_date, str(sid), t_cat)
@@ -498,7 +523,7 @@ try:
         t_cat = str(entry.get("類別", ""))
         
         try:
-            with closing(open_queue_conn()) as conn:
+            with closing(open_local_db()) as conn:
                 conn.execute("INSERT INTO service_issued VALUES (?, ?, ?)", (t_date, t_sid, t_cat))
         except sqlite3.IntegrityError:
             return 
@@ -512,14 +537,14 @@ try:
 
     def update_last_error_summary(err_msg):
         try:
-            with closing(open_queue_conn()) as conn:
+            with closing(open_local_db()) as conn:
                 short_msg = str(err_msg)[:120]
                 conn.execute("INSERT OR REPLACE INTO system_status VALUES ('last_error_summary', ?)", (short_msg,))
         except: pass
 
     def get_last_error_summary():
         try:
-            with closing(open_queue_conn()) as conn:
+            with closing(open_local_db()) as conn:
                 cur = conn.cursor()
                 cur.execute("SELECT val FROM system_status WHERE key='last_error_summary'")
                 row = cur.fetchone()
@@ -540,16 +565,9 @@ try:
             return process_service_tasks_batch([task])
 
         entry = payload.get("entry", {})
+        # [Fix #3-B] 照片已在 save_entry/save_appeal 同步上傳完畢，
+        # entry["照片路徑"] 已包含 Drive 連結，Worker 直接寫 Sheets 即可
         try:
-            image_paths, filenames, drive_links = payload.get("image_paths", []), payload.get("filenames", []), []
-            for path in image_paths:
-                if path and not os.path.exists(path): return False, "FILE_NOT_FOUND: 找不到實體圖片檔案，直接放棄"
-            for path, fname in zip(image_paths, filenames):
-                if os.path.exists(path):
-                    with open(path, "rb") as f:
-                        drive_links.append(upload_image_to_drive(compress_image_bytes(f.read()), fname) or "UPLOAD_FAILED_API")
-            if drive_links: entry["照片路徑"] = ";".join(drive_links)
-
             if task_type in ["main_entry", "volunteer_report"]:
                 _append_main_entry_row(entry)
                 inspector_name = entry.get("檢查人員", "")
@@ -565,7 +583,7 @@ try:
                     t_cat  = payload.get("custom_category", "晨掃志工")
                     for sid in payload.get("student_list", []):
                         try:
-                            with closing(open_queue_conn()) as conn:
+                            with closing(open_local_db()) as conn:
                                 conn.execute("INSERT INTO service_issued VALUES (?, ?, ?)", (t_date, str(sid), t_cat))
                             svc_rows.append([
                                 t_date, str(sid), entry.get("班級", ""), t_cat,
@@ -581,11 +599,8 @@ try:
                         execute_with_retry(_svc_batch)
 
             elif task_type == "appeal_entry":
-                image_info = payload.get("image_file")
-                if image_info:
-                    if not os.path.exists(image_info["path"]): return False, "FILE_NOT_FOUND: 找不到佐證照片檔案，直接放棄"
-                    with open(image_info["path"], "rb") as f: entry["佐證照片"] = upload_image_to_drive(compress_image_bytes(f.read()), image_info["filename"])
-                execute_with_retry(lambda: get_worksheet(SHEET_TABS["appeals"]).append_row([str(entry.get(c, "")) for c in APPEAL_COLUMNS]))
+                # [Fix #3-B] 佐證照片已在 save_appeal 同步上傳，entry["佐證照片"] 已設定
+                execute_with_retry(lambda: get_worksheet(SHEET_TABS["appeals"]).append_row([str(entry.get(col, "")) for col in APPEAL_COLUMNS]))
             return True, None
         except Exception as e: return False, str(e)
 
@@ -606,7 +621,7 @@ try:
                         if err and "DRY_RUN" not in err: update_last_error_summary(err)
                     final_status = "DONE" if ok else "FAILED"
                     for t in svc_tasks:
-                        update_task_status(t["id"], final_status, t["attempts"], err)
+                        update_task_status(t["id"], final_status, t["attempts"], err, _row_idx=t.get("_row_idx"))
                     time.sleep(0.5)
                     continue  # 繼續下一輪，優先清空 service_hours 佇列
 
@@ -621,14 +636,9 @@ try:
                 else:
                     if err and "DRY_RUN" not in err: update_last_error_summary(err)
 
-                try:
-                    paths = task["payload"].get("image_paths", []) + ([task["payload"]["image_file"]["path"]] if "image_file" in task["payload"] else [])
-                    for p in paths:
-                        if p and os.path.exists(p): os.remove(p)
-                except: pass
-
+                # [Fix #3-B] 照片已在 save_entry/save_appeal 同步上傳，Worker 不再需要清理本機檔案
                 if not ok and err and "FILE_NOT_FOUND" in str(err): task["attempts"] = 999
-                update_task_status(task["id"], "DONE" if ok else ("FAILED" if task["attempts"] >= 6 else "RETRY"), task["attempts"], err)
+                update_task_status(task["id"], "DONE" if ok else ("FAILED" if task["attempts"] >= 6 else "RETRY"), task["attempts"], err, _row_idx=task.get("_row_idx"))
                 time.sleep(0.5)
             except Exception as e: time.sleep(3.0)
 
@@ -816,33 +826,32 @@ try:
             return False, str(e)
 
     def save_appeal(entry, proof_file=None):
-        pending_count = get_pending_count()
-        if pending_count > 300:
-            st.error("⚠️ 系統目前排隊任務過多 (大於 300 筆)，為保護系統，請稍等幾分鐘後再送出申訴！")
-            return False
-        elif pending_count > 150:
-            st.warning("⏳ 系統目前正在大量處理照片中，您的申訴將會安全送出，但審核進度可能會稍有延遲喔！")
-
-        image_info = None
+        # [Fix #3-B] 佐證照片改為同步上傳 Drive，不再寫本機磁碟
         if proof_file:
             try:
-                print(f"Waiting for UPLOAD slot... (Appeal: {proof_file.name})")
-                with UPLOAD_SEM:
-                    print(f"UPLOAD slot acquired (Appeal: {proof_file.name})")
-                    data = proof_file.read()
-                    if len(data) > MAX_IMAGE_BYTES: st.error("照片過大"); return False
-                    fname = f"Appeal_{entry.get('班級', '')}_{datetime.now(TW_TZ).strftime('%H%M%S')}.jpg"
-                    l_path = os.path.join(IMG_DIR, f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}_{fname}")
-                    with open(l_path, "wb") as f: f.write(data)
-                    image_info = {"path": l_path, "filename": fname}
-            except Exception as e: st.error(f"寫入失敗: {e}"); return False
+                data = proof_file.read()
+                if len(data) > MAX_IMAGE_BYTES:
+                    st.error("❌ 照片過大（上限 20MB），請壓縮後再上傳")
+                    return False
+                fname = f"Appeal_{entry.get('班級', '')}_{datetime.now(TW_TZ).strftime('%H%M%S')}.jpg"
+                with st.spinner("📤 上傳佐證照片中..."):
+                    link = execute_with_retry(
+                        lambda d=data, n=fname: upload_image_to_drive(compress_image_bytes(d), n)
+                    )
+                entry["佐證照片"] = link or ""
+            except Exception as e:
+                st.warning(f"⚠️ 佐證照片上傳失敗，將不含照片送出申訴：{e}")
+                entry["佐證照片"] = ""
 
-        entry.update({"申訴日期": entry.get("申訴日期", datetime.now(TW_TZ).strftime("%Y-%m-%d")), "處理狀態": entry.get("處理狀態", "待處理"),
-                      "登錄時間": entry.get("登錄時間", datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")), 
-                      "申訴ID": entry.get("申訴ID", datetime.now(TW_TZ).strftime("%Y%m%d%H%M%S") + "_" + uuid.uuid4().hex[:4]),
-                      "佐證照片": entry.get("佐證照片", "")})
-        enqueue_task("appeal_entry", {"entry": entry, "image_file": image_info})
-        st.success("📩 申訴已排入背景處理")
+        entry.update({
+            "申訴日期": entry.get("申訴日期", datetime.now(TW_TZ).strftime("%Y-%m-%d")),
+            "處理狀態": entry.get("處理狀態", "待處理"),
+            "登錄時間": entry.get("登錄時間", datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")),
+            "申訴ID":   entry.get("申訴ID", datetime.now(TW_TZ).strftime("%Y%m%d%H%M%S") + "_" + uuid.uuid4().hex[:4]),
+            "佐證照片": entry.get("佐證照片", "")
+        })
+        enqueue_task("appeal_entry", {"entry": entry})
+        st.success("📩 申訴已送出，請耐心等候審核")
         return True
     
     def update_appeal_status(idx, status, record_id, reply_text=""):
@@ -929,37 +938,49 @@ try:
 
     # [V5.28] 加入 award_inspector_hours 控制是否發放時數
     def save_entry(new_entry, uploaded_files=None, student_list=None, custom_hours=0.5, custom_category="晨掃志工", award_inspector_hours=True):
-        pending_count = get_pending_count()
-        if pending_count > 300:
-            st.error("⚠️ 系統目前排隊上傳的任務過多 (大於 300 筆)，為保護系統，請稍等幾分鐘後再送出！")
-            return False
-        elif pending_count > 150:
-            st.warning("⏳ 系統目前正在大量處理照片中，您的資料將會安全送出，但更新至成績表可能會稍有延遲喔！")
-
+        # [Fix #3-B] 照片改為同步上傳 Drive，不再寫本機磁碟，移除 Semaphore
         new_entry["日期"] = str(new_entry.get("日期", str(date.today())))
         new_entry["紀錄ID"] = new_entry.get("紀錄ID", f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}")
         if "登錄時間" not in new_entry or not new_entry["登錄時間"]:
             new_entry["登錄時間"] = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-        image_paths, file_names = [], []
+        # 同步上傳照片到 Drive（使用 ThreadPoolExecutor 並發，縮短等待時間）
         if uploaded_files:
+            valid_files = []
             for i, up_file in enumerate(uploaded_files):
                 if not up_file: continue
                 try:
-                    print(f"Waiting for UPLOAD slot... ({up_file.name})")
-                    with UPLOAD_SEM:
-                        print(f"UPLOAD slot acquired ({up_file.name})")
-                        data = up_file.getvalue()
-                        if len(data) > MAX_IMAGE_BYTES: st.warning(f"檔案略過 (過大): {up_file.name}"); continue
-                        fname = f"{new_entry['紀錄ID']}_{i}.jpg"
-                        local_path = os.path.join(IMG_DIR, fname)
-                        with open(local_path, "wb") as f: f.write(data)
-                        image_paths.append(local_path); file_names.append(fname)
-                except Exception as e: print(f"Save Error: {e}")
+                    data = up_file.getvalue()
+                    if len(data) > MAX_IMAGE_BYTES:
+                        st.warning(f"檔案過大略過: {up_file.name}")
+                        continue
+                    valid_files.append((i, data, f"{new_entry['紀錄ID']}_{i}.jpg"))
+                except Exception as e:
+                    print(f"讀取檔案失敗: {e}")
+
+            if valid_files:
+                drive_links = []
+                def _upload_one(args):
+                    _, data, fname = args
+                    try:
+                        return execute_with_retry(
+                            lambda d=data, n=fname: upload_image_to_drive(compress_image_bytes(d), n)
+                        )
+                    except Exception as e:
+                        print(f"Drive 上傳失敗 ({fname}): {e}")
+                        return None
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(valid_files), 4)) as pool:
+                    results = list(pool.map(_upload_one, valid_files))
+                drive_links = [r for r in results if r]
+                if drive_links:
+                    new_entry["照片路徑"] = ";".join(drive_links)
 
         payload = {
-            "entry": new_entry, "image_paths": image_paths, "filenames": file_names,
-            "student_list": student_list or [], "custom_hours": custom_hours, "custom_category": custom_category,
+            "entry": new_entry,
+            "student_list": student_list or [],
+            "custom_hours": custom_hours,
+            "custom_category": custom_category,
             "award_inspector_hours": award_inspector_hours
         }
         enqueue_task("volunteer_report" if student_list is not None else "main_entry", payload)
