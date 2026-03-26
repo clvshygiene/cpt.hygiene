@@ -2190,6 +2190,7 @@ try:
                                     ok = save_entry(
                                         {
                                             "日期": str(today_tw), 
+                                            "週次": get_week_num(today_tw),
                                             "班級": my_cls, 
                                             "評分項目": task_name, 
                                             "檢查人員": f"志工(實到:{len(all_present)})", 
@@ -2724,7 +2725,7 @@ try:
                 pending_df = df[
                     df["評分項目"].isin(["晨間打掃", "晨間打掃(當日補掃)", "晨間打掃(補掃)"]) &
                     (df["晨間打掃原始分"] == 0) &
-                    (df["修正"] != "TRUE") &
+                    (~df["修正"]) &
                     (~df["紀錄ID"].astype(str).isin(st.session_state.approved_morning_ids))
                 ]
 
