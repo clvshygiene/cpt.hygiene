@@ -2397,24 +2397,40 @@ try:
                             gid = all_rids[0]  # 用第一筆 ID 當按鈕 key
 
                             def _approve_group(rids, eval_suffix):
-                                ws = get_worksheet(SHEET_TABS["main"])
-                                id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
-                                for rid in rids:
-                                    if rid in id_list:
-                                        ridx = id_list.index(rid) + 1
-                                        matched = ex_df.loc[ex_df["紀錄ID"].astype(str) == rid, "評分項目"]
-                                        if not matched.empty:
-                                            new_item = str(matched.iloc[0]).replace("(待審優良)", eval_suffix)
-                                            ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, new_item)
-                                    st.session_state.approved_excellent_ids.add(rid)
-                                load_main_data.clear()
+                                try:
+                                    ws = get_worksheet(SHEET_TABS["main"])
+                                    if not ws:
+                                        st.error("❌ 無法連線至 Google Sheets，請稍後再試")
+                                        return False
+                                    id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
+                                    # [Fix] 將 id_list 統一轉為 str 並 strip，避免型別不一致
+                                    id_list = [str(v).strip() for v in id_list]
+                                    success_count = 0
+                                    for rid in rids:
+                                        rid = str(rid).strip()
+                                        if rid in id_list:
+                                            ridx = id_list.index(rid) + 1
+                                            matched = ex_df.loc[ex_df["紀錄ID"].astype(str).str.strip() == rid, "評分項目"]
+                                            if not matched.empty:
+                                                new_item = str(matched.iloc[0]).replace("(待審優良)", eval_suffix)
+                                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, new_item)
+                                            # [Fix] 只有成功更新 Sheet 後才標記為已處理
+                                            st.session_state.approved_excellent_ids.add(rid)
+                                            success_count += 1
+                                        else:
+                                            st.warning(f"⚠️ 紀錄 {rid[:12]}... 在 Sheet 中找不到，可能資料尚在佇列中，請稍後重新整理再試。")
+                                    load_main_data.clear()
+                                    return success_count > 0
+                                except Exception as e:
+                                    st.error(f"❌ 審核寫入失敗: {e}")
+                                    return False
 
                             if c3.button("✅ 核可優良", key=f"ex_ok_{gid}"):
-                                _approve_group(all_rids, "(優良)")
-                                c1.success("✅ 已核可為優良！")
+                                if _approve_group(all_rids, "(優良)"):
+                                    c1.success("✅ 已核可為優良！")
                             if c3.button("🚫 駁回(改普通)", key=f"ex_ng_{gid}"):
-                                _approve_group(all_rids, "(普通)")
-                                c1.info("已改為普通。")
+                                if _approve_group(all_rids, "(普通)"):
+                                    c1.info("已改為普通。")
 
                     if st.button("🔄 重新整理列表", key="refresh_excellent"):
                         st.session_state.approved_excellent_ids.clear()
@@ -2428,9 +2444,10 @@ try:
                 # ── 共用計算函式 ──────────────────────────────────────────
                 def calc_scores(df_raw):
                     """回傳含結算欄位的 DataFrame（已排除優良/普通紀錄，以及申訴核可的修正紀錄）"""
+                    # [Fix] 加括號修正運算子優先順序（& 優先於 ~，不加括號邏輯會錯）
                     df = df_raw[
-                        ~df_raw["評分項目"].astype(str).str.contains("優良|普通") &
-                        ~df_raw["修正"].astype(str).str.upper().eq("TRUE")   # [關鍵修正] 排除申訴已核可的紀錄
+                        (~df_raw["評分項目"].astype(str).str.contains("優良|普通")) &
+                        (~df_raw["修正"].astype(str).str.upper().eq("TRUE"))   # 排除申訴已核可的紀錄
                     ].copy()
                     df["內掃結算"] = df["內掃原始分"].clip(upper=2)
                     df["外掃結算"] = df["外掃原始分"].clip(upper=2)
@@ -2443,8 +2460,12 @@ try:
                 def build_ranking(scored_df, df_all, classes_struct, base_score=90):
                     """依班級彙總扣分，合併完整班級清單，加上總成績與優良次數"""
                     rep = scored_df.groupby("班級")["總扣分"].sum().reset_index()
-                    # 計算優良次數（含括號內有「優良」的評分項目）
-                    excellent_counts = df_all[df_all["評分項目"].astype(str).str.contains("優良")].groupby("班級").size().reset_index(name="優良次數")
+                    # [Fix] 計算優良次數：排除「待審優良」，只算正式核可的優良
+                    excellent_mask = (
+                        df_all["評分項目"].astype(str).str.contains("優良") &
+                        ~df_all["評分項目"].astype(str).str.contains("待審")
+                    )
+                    excellent_counts = df_all[excellent_mask].groupby("班級").size().reset_index(name="優良次數")
                     cls_df = pd.DataFrame(classes_struct).rename(columns={"grade": "年級", "name": "班級"})
                     fin = pd.merge(cls_df, rep, on="班級", how="left").fillna(0)
                     fin = pd.merge(fin, excellent_counts, on="班級", how="left").fillna(0)
@@ -2722,12 +2743,37 @@ try:
                     st.session_state.approved_morning_ids = set()
 
                 df = main_df
+                
+                # [Fix] 找出本週已經有「審核完成」紀錄的班級+日期組合
+                # 這些班級的其他重複紀錄應視為已處理，不再顯示在待審列表
+                approved_cls_dates = set()
+                for _, r in df.iterrows():
+                    item_str = str(r["評分項目"])
+                    if item_str in ["晨間打掃(學期加分)", "晨間打掃(已駁回)"]:
+                        try:
+                            r_date = pd.to_datetime(str(r["日期"])).date()
+                            if start_of_week <= r_date <= today_tw:
+                                approved_cls_dates.add((str(r["班級"]).strip(), str(r["日期"]).strip()))
+                        except Exception:
+                            pass
+                
                 pending_df = df[
                     df["評分項目"].isin(["晨間打掃", "晨間打掃(當日補掃)", "晨間打掃(補掃)"]) &
                     (df["晨間打掃原始分"] == 0) &
                     (~df["修正"]) &
                     (~df["紀錄ID"].astype(str).isin(st.session_state.approved_morning_ids))
                 ]
+                
+                # [Fix] 排除已有審核完成紀錄的重複項目
+                if approved_cls_dates and not pending_df.empty:
+                    dup_mask = pending_df.apply(
+                        lambda r: (str(r["班級"]).strip(), str(r["日期"]).strip()) in approved_cls_dates,
+                        axis=1
+                    )
+                    dup_count = dup_mask.sum()
+                    pending_df = pending_df[~dup_mask]
+                    if dup_count > 0:
+                        st.info(f"ℹ️ 已自動排除 {dup_count} 筆重複紀錄（該班級同日已有審核結果）。")
 
                 if pending_df.empty:
                     st.success("🎉 目前沒有待審核的晨掃回報！")
@@ -2739,8 +2785,11 @@ try:
                 def _do_approve(record_id, s_val, note_text, reply, col_ref, cached_main_df):
                     ws = get_worksheet(SHEET_TABS["main"])
                     id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
-                    if str(record_id) in id_list:
-                        ridx = id_list.index(str(record_id)) + 1
+                    # [Fix] 統一轉為 str 並 strip，避免型別或空白不一致
+                    id_list = [str(v).strip() for v in id_list]
+                    record_id_str = str(record_id).strip()
+                    if record_id_str in id_list:
+                        ridx = id_list.index(record_id_str) + 1
                         ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分") + 1, s_val)
                         ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, "晨間打掃(學期加分)")
                         matched = cached_main_df.loc[cached_main_df["紀錄ID"].astype(str) == str(record_id), "備註"]
@@ -2815,14 +2864,17 @@ try:
                         if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}"):
                             ws = get_worksheet(SHEET_TABS["main"])
                             id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
-                            if str(r["紀錄ID"]) in id_list:
-                                ridx = id_list.index(str(r["紀錄ID"])) + 1
+                            # [Fix] 統一轉為 str 並 strip
+                            id_list = [str(v).strip() for v in id_list]
+                            rid_str = str(r["紀錄ID"]).strip()
+                            if rid_str in id_list:
+                                ridx = id_list.index(rid_str) + 1
                                 ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, "晨間打掃(已駁回)")
                                 old_note = str(r['備註'])
                                 rej_msg  = reply_msg if reply_msg else "未達標準，請見諒"
                                 new_note = f"{old_note} \n組長駁回: {rej_msg}"
                                 ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註") + 1, new_note)
-                                st.session_state.approved_morning_ids.add(str(r["紀錄ID"]))
+                                st.session_state.approved_morning_ids.add(rid_str)
                                 load_main_data.clear()
                                 c1.error("🗑️ 已駁回")
 
