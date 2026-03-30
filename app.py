@@ -3357,17 +3357,70 @@ try:
                             with st.container(border=True):
                                 st.write(f"📌 **{_ct['title']}**")
                                 st.caption(f"📅 日期：{_ct['date']}　|　認領學生：{', '.join(_ct['claimants'])}")
-                                # 將按鈕名稱改得更符合實際動作
+
+                                # [新增] 聰明 UX：自動偵測消警告名單，直接產出專屬下載按鈕！
+                                _appeal_students = []
+                                for _clm in _ct["claimants"]:
+                                    _sid_match = re.match(r"(\d+)", _clm)
+                                    _tag_match = re.search(r"\((.*?)\)", _clm)
+                                    if _sid_match and _tag_match and _tag_match.group(1) == "消警告":
+                                        _appeal_students.append(_sid_match.group(1))
+
+                                if _appeal_students:
+                                    st.info("💡 偵測到以下學生申請「消警告」，請先點擊下載申請單，再按下驗收！")
+                                    # 動態排列下載按鈕
+                                    btn_cols = st.columns(len(_appeal_students))
+                                    for idx, _sid in enumerate(_appeal_students):
+                                        _clean_sid = clean_id(_sid)
+                                        _cls_name = ROSTER_DICT.get(_clean_sid, "")
+                                        
+                                        try:
+                                            _doc = fitz.open("愛校服務申請單.pdf")
+                                            _page = _doc[0]
+                                            _now_date = datetime.now(TW_TZ)
+                                            _roc_year = str(_now_date.year - 1911)
+                                            
+                                            # 載入我們剛剛上傳的標楷體字型檔
+                                            _font_path = "kaiu.ttf"
+                                            if not os.path.exists(_font_path):
+                                                st.error("❌ 找不到 kaiu.ttf 字型檔，請確認是否已上傳至 GitHub！")
+                                            else:
+                                                _page.insert_font(fontname="kaiu", fontfile=_font_path)
+                                                # 定義要印上去的文字與座標
+                                                _text_data = [
+                                                    (_roc_year, 400, 115),
+                                                    (str(_now_date.month), 460, 115),
+                                                    (str(_now_date.day), 510, 115),
+                                                    (_cls_name, 120, 140),
+                                                    (_clean_sid, 450, 140)
+                                                ]
+                                                for _text, _x, _y in _text_data:
+                                                    _page.insert_text(fitz.Point(_x, _y), _text, fontsize=14, fontname="kaiu", color=(0, 0, 0))
+                                                    
+                                                _pdf_bytes = _doc.write()
+                                                _doc.close()
+                                                
+                                                with btn_cols[idx]:
+                                                    st.download_button(
+                                                        label=f"📥 下載 {_clean_sid} 銷過單",
+                                                        data=_pdf_bytes,
+                                                        file_name=f"愛校申請單_{_cls_name}_{_clean_sid}.pdf",
+                                                        mime="application/pdf",
+                                                        key=f"dl_pdf_{_ct['id']}_{_clean_sid}"
+                                                    )
+                                        except Exception as e:
+                                            st.error(f"產製 PDF 發生錯誤：{e}")
+
+                                # ── 以下是原本的「依標籤自動驗收」邏輯 ──
                                 if st.button("✅ 依標籤自動驗收", key=f"verify_{_ct['id']}"):
                                     _hr_match = re.search(r"[\(\uff08]([\d.]+)\s*(?:hr|小時|h)[\)\uff09]", _ct["title"], re.IGNORECASE)
                                     _task_hours = float(_hr_match.group(1)) if _hr_match else 1.0
                                     
                                     _debt_deducted_count = 0
-                                    _issued_sids = []  # 收集要發放時數的名單（還時數專用）
-                                    _appeal_sids = []  # 收集要消警告的名單（提醒印單子專用）
+                                    _issued_sids = []  
+                                    _appeal_sids = []  
                                     
                                     for _clm in _ct["claimants"]:
-                                        # 解析學號與括號內的標籤
                                         _sid_match = re.match(r"(\d+)", _clm)
                                         _tag_match = re.search(r"\((.*?)\)", _clm)
                                         
@@ -3375,21 +3428,15 @@ try:
                                             _sid_val = _sid_match.group(1)
                                             _tag_val = _tag_match.group(1) if _tag_match else "還時數"  
                                             
-                                            # 判斷一：來還時數的 ➡️ 扣欠時 + 給時數
                                             if _tag_val == "還時數":
                                                 if update_student_debt(_sid_val, -_task_hours, f"愛校驗收：{_ct['title']}"):
                                                     _debt_deducted_count += 1
                                                 _issued_sids.append(_sid_val)
-                                                
-                                            # 判斷二：來消警告的 ➡️ 不扣欠時、不給時數！只記錄名單等一下提醒
                                             elif _tag_val == "消警告":
                                                 _appeal_sids.append(_sid_val)
-                                                
-                                            # 判斷三：被糾察隊懲罰的 ➡️ 不扣欠時、不給時數
                                             elif _tag_val == "糾察懲罰":
                                                 pass 
 
-                                    # 將「還時數」的名單送進背景佇列，自動發放實體的「服務時數」
                                     if _issued_sids:
                                         _payload = {
                                             "student_list": _issued_sids,
@@ -3402,17 +3449,14 @@ try:
                                                 
                                     update_notion_task_status(_ct["id"], "任務已驗收")  
                                     
-                                    # 動態組合給組長看的成功訊息
                                     msg_parts = ["✅ 驗收完成！Notion 狀態已更新。"]
                                     if _debt_deducted_count > 0 or _issued_sids:
                                         msg_parts.append(f"🟢 幫 {_debt_deducted_count} 人扣除欠時，並排程核發 {len(_issued_sids)} 人服務時數。")
-                                    if _appeal_sids:
-                                        msg_parts.append(f"🔔 提醒：有 {len(_appeal_sids)} 人是來消警告的，請記得去下方「🖨️ 銷過單核發」產製 PDF 給他們！")
                                         
                                     st.success("\n".join(msg_parts))
-                                    time.sleep(3.5)  # 稍微停久一點讓你把提示看清楚
+                                    time.sleep(2.5) 
                                     st.rerun()
-
+                                        
                 # ── 區塊 B：⚠️ 欠時懲處結算報表 ──
                 with st.expander("⚠️ 欠時懲處結算報表", expanded=True):
                     if st.button("🚀 結算滿 1 小時警告名單", key="debt_settle_btn"):
