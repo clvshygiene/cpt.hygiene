@@ -16,7 +16,7 @@ from contextlib import closing
 from datetime import datetime, date, timedelta
 from datetime import timezone
 import pytz
-import gspread
+import gspreadF
 from google.oauth2.service_account import Credentials as SACredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -76,7 +76,7 @@ try:
             if token: return Client(auth=token)
         return None
 
-def fetch_available_notion_tasks():
+    def fetch_available_notion_tasks():
         client = get_notion_client()
         db_id = st.secrets.get("notion_db_id") or st.secrets.get("system_config", {}).get("notion_db_id")
         if not client or not db_id: 
