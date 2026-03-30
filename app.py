@@ -164,84 +164,6 @@ try:
             return False, str(e)
 
     # ==========================================
-    # AI 廣播生成 (Anthropic API)
-    # ==========================================
-    def generate_ai_broadcast(broadcast_type, week_num, weekday_name, style, extra_hint, prev_content, violation_stats):
-        """
-        呼叫 Anthropic API 生成廣播詞。
-        broadcast_type: "hygiene"(衛生糾察) 或 "morning"(晨掃志工)
-        style: "嚴肅" / "親切" / "活潑"
-        violation_stats: dict, 本週常見違規項目統計
-        """
-        import urllib.request, urllib.error
-
-        if broadcast_type == "hygiene":
-            role_desc = "衛生糾察隊員（負責檢查各班教室內掃、外掃、垃圾分類是否符合標準）"
-            task_context = "今日糾察評分廣播"
-        else:
-            role_desc = "晨間打掃志工（負責公共區域清潔並回報）"
-            task_context = "今日晨掃任務廣播"
-
-        # 整理違規統計文字
-        stats_text = "（本週尚無違規記錄）"
-        if violation_stats:
-            top_items = sorted(violation_stats.items(), key=lambda x: x[1], reverse=True)[:5]
-            stats_text = "、".join([f"{k}({v}次)" for k, v in top_items])
-
-        style_guide = {
-            "嚴肅": "語氣正式、條理分明，像老師訓話，強調責任與標準。",
-            "親切": "溫和友善，像學姊學長說話，鼓勵多於批評，語氣輕鬆但認真。",
-            "活潑": "生動有趣，可以用一點可愛的詞彙或比喻，讓同學覺得親切好玩不無聊。"
-        }
-
-        prompt = f"""你是中壢家商衛生組的助理，負責幫組長撰寫每日廣播詞。
-
-**廣播對象**：{role_desc}
-**廣播類型**：{task_context}
-**本週週次**：第 {week_num} 週
-**今天**：{weekday_name}
-**語氣風格**：{style}（{style_guide.get(style, '')}）
-**本週常見違規統計**：{stats_text}
-**上次廣播內容（請勿重複）**：{prev_content[:200] if prev_content else '無'}
-{"**額外提示**：" + extra_hint if extra_hint else ""}
-
-請直接輸出廣播內文，不要加任何前言、說明或標題。
-廣播長度：3～6 句話為佳，不要過長。
-可以針對本週常見違規提出具體叮嚀。
-請用繁體中文。"""
-
-        try:
-            import json as _json
-            import urllib.error as _ue
-            req_body = _json.dumps({
-                "model": "claude-haiku-4-5-20251001",   # [V5.33] 使用 Haiku：最快、最便宜、確定有效
-                "max_tokens": 400,
-                "messages": [{"role": "user", "content": prompt}]
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                "https://api.anthropic.com/v1/messages",
-                data=req_body,
-                headers={
-                    "Content-Type": "application/json",
-                    "x-api-key": st.secrets.get("system_config", {}).get("anthropic_api_key", ""),
-                    "anthropic-version": "2023-06-01"
-                },
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                data = _json.loads(resp.read().decode("utf-8"))
-                return data["content"][0]["text"].strip(), None
-        except _ue.HTTPError as e:
-            # [V5.33] 讀出 HTTP 錯誤的回應 body，方便除錯
-            try:
-                err_body = e.read().decode("utf-8")
-            except Exception:
-                err_body = "(無法讀取錯誤內容)"
-            return None, f"AI 生成失敗（HTTP {e.code}）：{err_body}"
-        except Exception as e:
-            return None, f"AI 生成失敗：{str(e)}"
-
-    # ==========================================
     # SRE Utils: 重試機制
     # ==========================================
     def execute_with_retry(func, max_retries=5, base_delay=1.0, timeout=30):
@@ -1159,7 +1081,7 @@ try:
         from datetime import time as dtime
         return dtime(PEAK_START_H, PEAK_START_M) <= t <= dtime(PEAK_END_H, PEAK_END_M)
 
-    def save_entry(new_entry, uploaded_files=None, student_list=None, custom_hours=0.5, custom_category="晨掃志工", award_inspector_hours=True):
+    def save_entry(new_entry, uploaded_files=None, student_list=None, custom_hours=0.5, custom_category="晨掃志工", award_inspector_hours=True, skip_jitter=False):
         # [Fix #3-B] 照片改為同步上傳 Drive，不再寫本機磁碟，移除 Semaphore
         new_entry["日期"] = str(new_entry.get("日期", str(date.today())))
         new_entry["紀錄ID"] = new_entry.get("紀錄ID", f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}")
@@ -1167,7 +1089,8 @@ try:
             new_entry["登錄時間"] = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
         # [V5.32] 尖峰時段 jitter：分散 42 人同時提交的 API 請求
-        if _is_peak_hour(datetime.now(TW_TZ)):
+        # [V5.34] skip_jitter=True 時略過，避免批次迴圈（垃圾登記）累積成數十秒卡頓
+        if not skip_jitter and _is_peak_hour(datetime.now(TW_TZ)):
             jitter = random.uniform(0, PEAK_JITTER_MAX)
             with st.spinner(f"📶 排隊上傳中（{jitter:.1f}s）…"):
                 time.sleep(jitter)
@@ -1681,7 +1604,7 @@ try:
                                     if v_list:
                                         score = len(v_list)
                                         base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "班級": cls, "評分項目": role, "垃圾內掃原始分": 0, "垃圾外掃原始分": score}
-                                        if save_entry({**base, "備註": f"外掃({off})-{step_a}({','.join(v_list)})", "違規細項": step_a}):
+                                        if save_entry({**base, "備註": f"外掃({off})-{step_a}({','.join(v_list)})", "違規細項": step_a}, skip_jitter=True):
                                             cnt += 1
                                 if cnt: st.success(f"✅ 已登記 {cnt} 筆違規！"); time.sleep(1.5); st.rerun()
 
@@ -1720,7 +1643,7 @@ try:
                                     if v_list:
                                         score = len(v_list)
                                         base = {"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "班級": cls, "評分項目": role, "垃圾內掃原始分": score, "垃圾外掃原始分": 0}
-                                        if save_entry({**base, "備註": f"內掃-{step_a}({','.join(v_list)})", "違規細項": step_a}):
+                                        if save_entry({**base, "備註": f"內掃-{step_a}({','.join(v_list)})", "違規細項": step_a}, skip_jitter=True):
                                             cnt += 1
                                 if cnt: st.success(f"✅ 已登記 {cnt} 筆違規！"); time.sleep(1.5); st.rerun()
 
@@ -3077,38 +3000,7 @@ try:
                 st.markdown("---")
                 st.write("📢 晨掃志工每日廣播/任務")
                 current_task = SYSTEM_CONFIG.get("daily_morning_task", "今日無特殊任務，請確實完成各區打掃即可！")
-
-                # [V5.32] AI 廣播生成區塊 - 晨掃
-                with st.expander("🤖 AI 幫我生成晨掃廣播", expanded=False):
-                    ai_m_style = st.radio("廣播風格", ["親切", "嚴肅", "活潑"], horizontal=True, key="ai_m_style")
-                    ai_m_hint  = st.text_input("額外提示（選填，例如：今天重點清走廊、提醒照片要清晰）", key="ai_m_hint")
-                    if st.button("✨ 生成晨掃廣播", key="ai_m_gen"):
-                        now_week  = get_week_num(today_tw)
-                        weekday_c = ["一", "二", "三", "四", "五", "六", "日"][today_tw.weekday()]
-                        # 讀取本週違規統計（晨掃相關）
-                        _mdf = load_main_data()
-                        _m_stats = {}
-                        if not _mdf.empty:
-                            _m_week = _mdf[_mdf["週次"] == now_week]
-                            for _, _r in _m_week.iterrows():
-                                if "晨間打掃" in str(_r.get("評分項目", "")) and str(_r.get("備註", "")):
-                                    for _kw in ["人數不足", "未到", "照片不清", "逾時"]:
-                                        if _kw in str(_r.get("備註", "")):
-                                            _m_stats[_kw] = _m_stats.get(_kw, 0) + 1
-                        with st.spinner("AI 生成中，請稍候…"):
-                            ai_text, ai_err = generate_ai_broadcast(
-                                "morning", now_week, f"星期{weekday_c}",
-                                ai_m_style, ai_m_hint, current_task, _m_stats
-                            )
-                        if ai_text:
-                            st.session_state["ai_morning_draft"] = ai_text
-                            st.success("✅ 生成完成！已填入下方文字框，確認後請按「更新每日任務」儲存。")
-                        else:
-                            st.error(ai_err or "生成失敗，請稍後再試。")
-
-                # 若有 AI 草稿，使用草稿值
-                _morning_val = st.session_state.pop("ai_morning_draft", None) or current_task
-                new_task = st.text_area("請輸入想給志工看的話（例如：拍照請比 YA、今天請加強拖地等）", value=_morning_val, key="ta_morning_task")
+                new_task = st.text_area("請輸入想給志工看的話（例如：拍照請比 YA、今天請加強拖地等）", value=current_task, key="ta_morning_task")
                 if st.button("💾 更新每日任務"):
                     if save_setting("daily_morning_task", new_task):
                         st.success("✅ 每日任務已更新！學生現在起會看到最新廣播。")
@@ -3117,39 +3009,7 @@ try:
 
                 st.write("📢 衛生糾察每日廣播/提醒")
                 current_hygiene_task = SYSTEM_CONFIG.get("daily_hygiene_task", "今日無特殊任務，請確實完成各區檢查即可！")
-
-                # [V5.32] AI 廣播生成區塊 - 衛生糾察
-                with st.expander("🤖 AI 幫我生成糾察廣播", expanded=False):
-                    ai_h_style = st.radio("廣播風格", ["親切", "嚴肅", "活潑"], horizontal=True, key="ai_h_style")
-                    ai_h_hint  = st.text_input("額外提示（選填，例如：本週重點檢查黑板、窗台）", key="ai_h_hint")
-                    if st.button("✨ 生成糾察廣播", key="ai_h_gen"):
-                        now_week  = get_week_num(today_tw)
-                        weekday_c = ["一", "二", "三", "四", "五", "六", "日"][today_tw.weekday()]
-                        # 讀取本週違規統計（違規扣分相關）
-                        _hdf = load_main_data()
-                        _h_stats = {}
-                        if not _hdf.empty:
-                            _h_week = _hdf[_hdf["週次"] == now_week]
-                            for _, _r in _h_week.iterrows():
-                                vi = str(_r.get("違規細項", "")).strip()
-                                if vi:
-                                    for _kw in vi.split("、"):
-                                        _kw = _kw.strip()
-                                        if _kw:
-                                            _h_stats[_kw] = _h_stats.get(_kw, 0) + 1
-                        with st.spinner("AI 生成中，請稍候…"):
-                            ai_text, ai_err = generate_ai_broadcast(
-                                "hygiene", now_week, f"星期{weekday_c}",
-                                ai_h_style, ai_h_hint, current_hygiene_task, _h_stats
-                            )
-                        if ai_text:
-                            st.session_state["ai_hygiene_draft"] = ai_text
-                            st.success("✅ 生成完成！已填入下方文字框，確認後請按「更新糾察任務」儲存。")
-                        else:
-                            st.error(ai_err or "生成失敗，請稍後再試。")
-
-                _hygiene_val = st.session_state.pop("ai_hygiene_draft", None) or current_hygiene_task
-                new_hygiene_task = st.text_area("請輸入想給糾察隊看的話（例如：今天重點檢查黑板、窗台）", value=_hygiene_val, key="ta_hygiene_task")
+                new_hygiene_task = st.text_area("請輸入想給糾察隊看的話（例如：今天重點檢查黑板、窗台）", value=current_hygiene_task, key="ta_hygiene_task")
                 if st.button("💾 更新糾察任務"):
                     if save_setting("daily_hygiene_task", new_hygiene_task):
                         st.success("✅ 糾察任務已更新！糾察隊現在起會看到最新廣播。")
