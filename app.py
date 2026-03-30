@@ -3363,32 +3363,33 @@ try:
                                     _task_hours = float(_hr_match.group(1)) if _hr_match else 1.0
                                     
                                     _debt_deducted_count = 0
-                                    _issued_sids = []  # 收集要發放時數的名單
+                                    _issued_sids = []  # 收集要發放時數的名單（還時數專用）
+                                    _appeal_sids = []  # 收集要消警告的名單（提醒印單子專用）
                                     
                                     for _clm in _ct["claimants"]:
-                                        # 解析學號與括號內的標籤，例如 "112001(消警告)"
+                                        # 解析學號與括號內的標籤
                                         _sid_match = re.match(r"(\d+)", _clm)
                                         _tag_match = re.search(r"\((.*?)\)", _clm)
                                         
                                         if _sid_match:
                                             _sid_val = _sid_match.group(1)
-                                            _tag_val = _tag_match.group(1) if _tag_match else "還時數"  # 若舊資料沒標籤，預設為還時數
+                                            _tag_val = _tag_match.group(1) if _tag_match else "還時數"  
                                             
-                                            # 判斷一：如果是來還時數的，扣欠時 + 給服務時數
+                                            # 判斷一：來還時數的 ➡️ 扣欠時 + 給時數
                                             if _tag_val == "還時數":
                                                 if update_student_debt(_sid_val, -_task_hours, f"愛校驗收：{_ct['title']}"):
                                                     _debt_deducted_count += 1
                                                 _issued_sids.append(_sid_val)
                                                 
-                                            # 判斷二：如果是來消警告的，不扣欠時！但給服務時數證明他有掃
+                                            # 判斷二：來消警告的 ➡️ 不扣欠時、不給時數！只記錄名單等一下提醒
                                             elif _tag_val == "消警告":
-                                                _issued_sids.append(_sid_val)
+                                                _appeal_sids.append(_sid_val)
                                                 
-                                            # 判斷三：如果是被糾察隊懲罰的，不扣欠時，也不給時數
+                                            # 判斷三：被糾察隊懲罰的 ➡️ 不扣欠時、不給時數
                                             elif _tag_val == "糾察懲罰":
                                                 pass 
 
-                                    # 將名單送進背景佇列，自動發放實體的「服務時數」
+                                    # 將「還時數」的名單送進背景佇列，自動發放實體的「服務時數」
                                     if _issued_sids:
                                         _payload = {
                                             "student_list": _issued_sids,
@@ -3400,8 +3401,16 @@ try:
                                         enqueue_task("service_hours_only", _payload)
                                                 
                                     update_notion_task_status(_ct["id"], "任務已驗收")  
-                                    st.success(f"✅ 驗收完成！\n- 幫 {_debt_deducted_count} 人扣除欠時\n- 共排程核發 {len(_issued_sids)} 人服務時數")
-                                    time.sleep(2.5)
+                                    
+                                    # 動態組合給組長看的成功訊息
+                                    msg_parts = ["✅ 驗收完成！Notion 狀態已更新。"]
+                                    if _debt_deducted_count > 0 or _issued_sids:
+                                        msg_parts.append(f"🟢 幫 {_debt_deducted_count} 人扣除欠時，並排程核發 {len(_issued_sids)} 人服務時數。")
+                                    if _appeal_sids:
+                                        msg_parts.append(f"🔔 提醒：有 {len(_appeal_sids)} 人是來消警告的，請記得去下方「🖨️ 銷過單核發」產製 PDF 給他們！")
+                                        
+                                    st.success("\n".join(msg_parts))
+                                    time.sleep(3.5)  # 稍微停久一點讓你把提示看清楚
                                     st.rerun()
 
                 # ── 區塊 B：⚠️ 欠時懲處結算報表 ──
