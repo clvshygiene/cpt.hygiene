@@ -76,7 +76,7 @@ try:
             if token: return Client(auth=token)
         return None
 
-    def fetch_available_notion_tasks():
+def fetch_available_notion_tasks():
         client = get_notion_client()
         db_id = st.secrets.get("notion_db_id") or st.secrets.get("system_config", {}).get("notion_db_id")
         if not client or not db_id: 
@@ -85,7 +85,7 @@ try:
         try:
             response = client.databases.query(
                 database_id=db_id,
-                filter={"property": "任務狀態", "status": {"equals": "等待認領中😿"}}
+                filter={"property": "任務狀態", "status": {"equals": "等待認領中"}} # ⭐️ 改為無表情符號
             )
             tasks = []
             for page in response.get("results", []):
@@ -126,9 +126,8 @@ try:
         except Exception as e:
             return [], f"Notion API 讀取失敗詳細錯誤: {str(e)}"
 
-    def claim_notion_task(page_id, student_id, purpose_tag=""):  # [新增] 愛校服務 2.0：支援目的標籤
+    def claim_notion_task(page_id, student_id, purpose_tag=""):  
         client = get_notion_client()
-        # [Patch] Guard Clause：防止 client 為空時觸發 NoneType 例外
         if not client:
             return False, "Notion 服務目前未啟用或連線失敗，請通知管理員檢查系統設定。"
             
@@ -143,10 +142,10 @@ try:
             claimed_str = claimed_obj[0].get("text", {}).get("content", "") if claimed_obj else ""
             current_claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
             
-            if any(str(student_id) in c for c in current_claimants):  # [新增] 愛校服務 2.0：改用 substring 防呆
+            if any(str(student_id) in c for c in current_claimants):  
                 return False, f"學號 {student_id} 已經認領過此任務囉！"
                 
-            claim_label = f"{student_id}({purpose_tag})" if purpose_tag else str(student_id)  # [新增] 愛校服務 2.0
+            claim_label = f"{student_id}({purpose_tag})" if purpose_tag else str(student_id)  
             current_claimants.append(claim_label)
             new_claimed_str = ", ".join(current_claimants)
             
@@ -155,7 +154,7 @@ try:
                 "認領學號": {"rich_text": [{"text": {"content": new_claimed_str}}]}
             }
             if is_full:
-                update_props["任務狀態"] = {"status": {"name": "被認領走了！😼"}}
+                update_props["任務狀態"] = {"status": {"name": "被認領走了"}} # ⭐️ 改為新狀態
 
             client.pages.update(
                 page_id=page_id,
@@ -166,9 +165,8 @@ try:
         except Exception as e:
             return False, str(e)
 
-    # [新增] 愛校服務 2.0：Notion API 擴充函式 ==================
     def fetch_claimed_notion_tasks():
-        """抓取 Notion 狀態為「被認領走了！😼」的任務，回傳待驗收列表"""
+        """抓取 Notion 狀態為「被認領走了」或「任務完成囉」的任務，回傳待驗收列表"""
         client = get_notion_client()
         db_id = st.secrets.get("notion_db_id") or st.secrets.get("system_config", {}).get("notion_db_id")
         if not client or not db_id:
@@ -176,7 +174,13 @@ try:
         try:
             response = client.databases.query(
                 database_id=db_id,
-                filter={"property": "任務狀態", "status": {"equals": "被認領走了！😼"}}
+                # ⭐️ 這裡使用 OR 邏輯，不管是在進行中還是學生標記完成了，組長都看得到！
+                filter={
+                    "or": [
+                        {"property": "任務狀態", "status": {"equals": "被認領走了"}},
+                        {"property": "任務狀態", "status": {"equals": "任務完成囉"}}
+                    ]
+                }
             )
             tasks = []
             for page in response.get("results", []):
@@ -3356,15 +3360,31 @@ try:
                                     _hr_match = re.search(r"[\(\uff08]([\d.]+)\s*(?:hr|小時|h)[\)\uff09]", _ct["title"], re.IGNORECASE)
                                     _task_hours = float(_hr_match.group(1)) if _hr_match else 1.0
                                     _ok_count = 0
+                                    _issued_sids = []  # ⭐️ 收集要發放時數的學號名單
+                                    
                                     for _clm in _ct["claimants"]:
                                         _sid_match = re.match(r"(\d+)", _clm)
                                         if _sid_match:
                                             _sid_val = _sid_match.group(1)
+                                            # 1. 扣除欠時
                                             if update_student_debt(_sid_val, -_task_hours, f"愛校驗收：{_ct['title']}"):
                                                 _ok_count += 1
-                                    update_notion_task_status(_ct["id"], "已驗收✅")
-                                    st.success(f"✅ 已驗收！共扣除 {_ok_count} 位學生各 {_task_hours} 小時。")
-                                    time.sleep(1.5)
+                                                _issued_sids.append(_sid_val)  
+                                                
+                                    # 2. ⭐️ 將名單送進背景佇列，自動發放實體的「服務時數」
+                                    if _issued_sids:
+                                        _payload = {
+                                            "student_list": _issued_sids,
+                                            "date": str(today_tw),
+                                            "class_name": "愛校打掃", 
+                                            "category": "返校打掃", 
+                                            "hours": _task_hours
+                                        }
+                                        enqueue_task("service_hours_only", _payload)
+                                                
+                                    update_notion_task_status(_ct["id"], "任務已驗收")  # ⭐️ 配合新的 Notion 狀態
+                                    st.success(f"✅ 已驗收！共扣除 {_ok_count} 位學生欠時，並已自動排程發放 {_task_hours} 小時服務時數！")
+                                    time.sleep(2.0)
                                     st.rerun()
 
                 # ── 區塊 B：⚠️ 欠時懲處結算報表 ──
