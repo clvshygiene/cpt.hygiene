@@ -211,9 +211,10 @@ try:
 請用繁體中文。"""
 
         try:
-            import urllib.request, json as _json
+            import json as _json
+            import urllib.error as _ue
             req_body = _json.dumps({
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-haiku-4-5-20251001",   # [V5.33] 使用 Haiku：最快、最便宜、確定有效
                 "max_tokens": 400,
                 "messages": [{"role": "user", "content": prompt}]
             }).encode("utf-8")
@@ -230,6 +231,13 @@ try:
             with urllib.request.urlopen(req, timeout=20) as resp:
                 data = _json.loads(resp.read().decode("utf-8"))
                 return data["content"][0]["text"].strip(), None
+        except _ue.HTTPError as e:
+            # [V5.33] 讀出 HTTP 錯誤的回應 body，方便除錯
+            try:
+                err_body = e.read().decode("utf-8")
+            except Exception:
+                err_body = "(無法讀取錯誤內容)"
+            return None, f"AI 生成失敗（HTTP {e.code}）：{err_body}"
         except Exception as e:
             return None, f"AI 生成失敗：{str(e)}"
 
@@ -763,8 +771,13 @@ try:
                 try:
                     records = ws.get_all_records()
                 except Exception as e:
+                    err_str = str(e)
                     print(f"[worker] get_all_records 失敗: {e}")
-                    time.sleep(10.0)
+                    # [V5.33] 429 配額耗盡 → 等 60 秒讓配額恢復；其他錯誤等 10 秒
+                    if "429" in err_str:
+                        time.sleep(60.0)
+                    else:
+                        time.sleep(10.0)
                     continue
 
                 # [V5.32] 每 60 輪空轉或每次有資料時，檢查並回收卡住的任務
@@ -772,7 +785,8 @@ try:
                 if _idle_loops >= 60:
                     _idle_loops = 0
                     _recover_stuck_tasks(ws, records)
-                    records = ws.get_all_records()  # 回收後重讀一次
+                    # [V5.33] 移除 stuck recovery 後的重複 get_all_records，節省配額
+                    # recover 只修改 status 欄，不影響後續的 _extract 邏輯判斷
 
                 # 優先批次清空所有 service_hours_only 任務
                 svc_tasks = _extract_svc_tasks(ws, records)
@@ -785,13 +799,15 @@ try:
                     final_status = "DONE" if ok else "FAILED"
                     for t in svc_tasks:
                         update_task_status(t["id"], final_status, t["attempts"], err, _row_idx=t.get("_row_idx"))
-                    time.sleep(1.0)
+                    time.sleep(2.0)
                     continue
 
                 # 處理含照片的任務（同一批 records，不重複讀）
                 task = _extract_next_task(ws, records)
                 if not task:
-                    time.sleep(5.0)
+                    # [V5.33] 空閒時改為 20 秒輪詢，大幅降低每日 Sheets read 次數
+                    # 原本 5 秒：一天 ~17,280 次；改 20 秒：~4,320 次，降低 75%
+                    time.sleep(20.0)
                     continue
 
                 _idle_loops = 0
@@ -802,7 +818,7 @@ try:
 
                 if not ok and err and "FILE_NOT_FOUND" in str(err): task["attempts"] = 999
                 update_task_status(task["id"], "DONE" if ok else ("FAILED" if task["attempts"] >= 6 else "RETRY"), task["attempts"], err, _row_idx=task.get("_row_idx"))
-                time.sleep(1.0)
+                time.sleep(2.0)
             except Exception as e:
                 print(f"[worker] 未預期例外: {e}")
                 time.sleep(5.0)
