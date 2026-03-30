@@ -164,6 +164,76 @@ try:
             return False, str(e)
 
     # ==========================================
+    # AI 廣播生成 (Anthropic API)
+    # ==========================================
+    def generate_ai_broadcast(broadcast_type, week_num, weekday_name, style, extra_hint, prev_content, violation_stats):
+        """
+        呼叫 Anthropic API 生成廣播詞。
+        broadcast_type: "hygiene"(衛生糾察) 或 "morning"(晨掃志工)
+        style: "嚴肅" / "親切" / "活潑"
+        violation_stats: dict, 本週常見違規項目統計
+        """
+        import urllib.request, urllib.error
+
+        if broadcast_type == "hygiene":
+            role_desc = "衛生糾察隊員（負責檢查各班教室內掃、外掃、垃圾分類是否符合標準）"
+            task_context = "今日糾察評分廣播"
+        else:
+            role_desc = "晨間打掃志工（負責公共區域清潔並回報）"
+            task_context = "今日晨掃任務廣播"
+
+        # 整理違規統計文字
+        stats_text = "（本週尚無違規記錄）"
+        if violation_stats:
+            top_items = sorted(violation_stats.items(), key=lambda x: x[1], reverse=True)[:5]
+            stats_text = "、".join([f"{k}({v}次)" for k, v in top_items])
+
+        style_guide = {
+            "嚴肅": "語氣正式、條理分明，像老師訓話，強調責任與標準。",
+            "親切": "溫和友善，像學姊學長說話，鼓勵多於批評，語氣輕鬆但認真。",
+            "活潑": "生動有趣，可以用一點可愛的詞彙或比喻，讓同學覺得親切好玩不無聊。"
+        }
+
+        prompt = f"""你是中壢家商衛生組的助理，負責幫組長撰寫每日廣播詞。
+
+**廣播對象**：{role_desc}
+**廣播類型**：{task_context}
+**本週週次**：第 {week_num} 週
+**今天**：{weekday_name}
+**語氣風格**：{style}（{style_guide.get(style, '')}）
+**本週常見違規統計**：{stats_text}
+**上次廣播內容（請勿重複）**：{prev_content[:200] if prev_content else '無'}
+{"**額外提示**：" + extra_hint if extra_hint else ""}
+
+請直接輸出廣播內文，不要加任何前言、說明或標題。
+廣播長度：3～6 句話為佳，不要過長。
+可以針對本週常見違規提出具體叮嚀。
+請用繁體中文。"""
+
+        try:
+            import urllib.request, json as _json
+            req_body = _json.dumps({
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 400,
+                "messages": [{"role": "user", "content": prompt}]
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=req_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": st.secrets.get("system_config", {}).get("anthropic_api_key", ""),
+                    "anthropic-version": "2023-06-01"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = _json.loads(resp.read().decode("utf-8"))
+                return data["content"][0]["text"].strip(), None
+        except Exception as e:
+            return None, f"AI 生成失敗：{str(e)}"
+
+    # ==========================================
     # SRE Utils: 重試機制
     # ==========================================
     def execute_with_retry(func, max_retries=5, base_delay=1.0, timeout=30):
@@ -248,14 +318,16 @@ try:
                 else: return None
         return None
 
-    def compress_image_bytes(file_bytes, quality=70):
+    def compress_image_bytes(file_bytes, quality=60):
+        # [V5.32] 壓縮參數調整：1200px + quality=60，減少 Drive 上傳時間
+        # 對手機拍攝的現場照片而言畫質仍足夠辨認違規細節
         try:
             img = Image.open(io.BytesIO(file_bytes))
             img = ImageOps.exif_transpose(img)
             if img.mode != "RGB": img = img.convert("RGB")
-            if img.width > 1600:
-                ratio = 1600 / float(img.width)
-                img = img.resize((1600, int(img.height * ratio)), Image.Resampling.LANCZOS)
+            if img.width > 1200:
+                ratio = 1200 / float(img.width)
+                img = img.resize((1200, int(img.height * ratio)), Image.Resampling.LANCZOS)
             out_buffer = io.BytesIO()
             img.save(out_buffer, format="JPEG", quality=quality, optimize=True)
             out_buffer.seek(0)
@@ -644,6 +716,38 @@ try:
     def background_worker(stop_event=None):
         try: add_script_run_ctx(threading.current_thread(), get_script_run_ctx())
         except Exception: pass  # Streamlit context 在背景執行緒可能不存在，忽略
+
+        # [V5.32] Stuck task recovery：追蹤連續空轉次數，每 60 輪（約 5 分鐘）掃一次卡住任務
+        _idle_loops = 0
+        STUCK_THRESHOLD_SEC = 300  # IN_PROGRESS 超過 5 分鐘視為卡住
+
+        def _recover_stuck_tasks(ws, records):
+            """將超過 5 分鐘仍為 IN_PROGRESS 的任務重置為 RETRY"""
+            now_utc = datetime.now(pytz.utc)
+            batch_updates = []
+            recovered = 0
+            for i, r in enumerate(records):
+                if r.get("status") != "IN_PROGRESS": continue
+                ts_raw = r.get("created_ts", "")
+                if not ts_raw: continue
+                try:
+                    created = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                    if (now_utc - created).total_seconds() > STUCK_THRESHOLD_SEC:
+                        row_idx = i + 2
+                        attempts_new = int(r.get("attempts", 0))
+                        batch_updates.append({"range": f"E{row_idx}", "values": [["RETRY"]]})
+                        batch_updates.append({"range": f"F{row_idx}", "values": [[attempts_new]]})
+                        batch_updates.append({"range": f"G{row_idx}", "values": [["[AUTO_RECOVERY] IN_PROGRESS timeout"]]})
+                        recovered += 1
+                except Exception: continue
+            if batch_updates:
+                try:
+                    ws.batch_update(batch_updates)
+                    print(f"[recovery] 重置了 {recovered} 個卡住的 IN_PROGRESS 任務")
+                except Exception as e:
+                    print(f"[recovery] batch_update 失敗: {e}")
+            return recovered
+
         while True:
             if stop_event and stop_event.is_set(): break
             try: update_worker_heartbeat()
@@ -663,9 +767,17 @@ try:
                     time.sleep(10.0)
                     continue
 
+                # [V5.32] 每 60 輪空轉或每次有資料時，檢查並回收卡住的任務
+                _idle_loops += 1
+                if _idle_loops >= 60:
+                    _idle_loops = 0
+                    _recover_stuck_tasks(ws, records)
+                    records = ws.get_all_records()  # 回收後重讀一次
+
                 # 優先批次清空所有 service_hours_only 任務
                 svc_tasks = _extract_svc_tasks(ws, records)
                 if svc_tasks:
+                    _idle_loops = 0
                     ok, err = process_service_tasks_batch(svc_tasks)
                     if ok: update_last_success_time()
                     else:
@@ -682,6 +794,7 @@ try:
                     time.sleep(5.0)
                     continue
 
+                _idle_loops = 0
                 ok, err = process_task(task)
                 if ok: update_last_success_time()
                 else:
@@ -727,7 +840,7 @@ try:
             if current_date.weekday() < 5 and current_date not in holidays: workdays += 1
         return today <= current_date
 
-    @st.cache_data(ttl=600)   # [效能] 10分鐘快取，尖峰時段降低 API 請求頻率
+    @st.cache_data(ttl=300)   # [V5.32] 5分鐘快取；尖峰時段觀看者共享同一份，TTL 到期才重讀
     def load_main_data():
         # 讀取整學期 main_data，統一快取一份。
         # 需要近兩週過濾的地方在 UI 層自己用 df[df["週次"] >= now_week-2] 處理。
@@ -829,7 +942,9 @@ try:
                 cell = ws.find(key)
                 if cell: ws.update_cell(cell.row, cell.col+1, val)
                 else: ws.append_row([key, val])
-                st.cache_data.clear()
+                # [V5.32] 只清設定相關快取，不 clear() 所有快取
+                # 避免在尖峰時段管理員操作設定時引發 load_main_data 雪崩重讀
+                load_settings.clear()
                 return True
             except Exception as e:
                 print(f"[save_setting] {e}")
@@ -1016,12 +1131,30 @@ try:
             return False
 
     # [V5.28] 加入 award_inspector_hours 控制是否發放時數
+    # [V5.32] 尖峰時段 jitter 常數（秒）
+    # 15:50~16:30 為尖峰時段，42 人同時送出時加入隨機延遲分散 API 壓力
+    PEAK_START_H, PEAK_START_M = 15, 50
+    PEAK_END_H,   PEAK_END_M   = 16, 30
+    PEAK_JITTER_MAX = 8  # 最多延遲 8 秒
+
+    def _is_peak_hour(now_dt):
+        """判斷目前是否在尖峰時段"""
+        t = now_dt.time()
+        from datetime import time as dtime
+        return dtime(PEAK_START_H, PEAK_START_M) <= t <= dtime(PEAK_END_H, PEAK_END_M)
+
     def save_entry(new_entry, uploaded_files=None, student_list=None, custom_hours=0.5, custom_category="晨掃志工", award_inspector_hours=True):
         # [Fix #3-B] 照片改為同步上傳 Drive，不再寫本機磁碟，移除 Semaphore
         new_entry["日期"] = str(new_entry.get("日期", str(date.today())))
         new_entry["紀錄ID"] = new_entry.get("紀錄ID", f"{datetime.now(TW_TZ).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}")
         if "登錄時間" not in new_entry or not new_entry["登錄時間"]:
             new_entry["登錄時間"] = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+        # [V5.32] 尖峰時段 jitter：分散 42 人同時提交的 API 請求
+        if _is_peak_hour(datetime.now(TW_TZ)):
+            jitter = random.uniform(0, PEAK_JITTER_MAX)
+            with st.spinner(f"📶 排隊上傳中（{jitter:.1f}s）…"):
+                time.sleep(jitter)
 
         # 同步上傳照片到 Drive（使用 ThreadPoolExecutor 並發，縮短等待時間）
         if uploaded_files:
@@ -1038,24 +1171,40 @@ try:
                     print(f"讀取檔案失敗: {e}")
 
             if valid_files:
-                drive_links = []
-                def _upload_one(args):
-                    _, data, fname = args
+                # [V5.32] 每張照片獨立顯示進度
+                upload_status_area = st.empty()
+                completed_links = []
+                failed_count = 0
+
+                def _upload_one_with_progress(args):
+                    idx, data, fname = args
                     try:
-                        return execute_with_retry(
+                        link = execute_with_retry(
                             lambda d=data, n=fname: upload_image_to_drive(compress_image_bytes(d), n)
                         )
+                        return link
                     except Exception as e:
                         print(f"Drive 上傳失敗 ({fname}): {e}")
                         return None
 
-                with st.spinner(f"📤 照片上傳中（共 {len(valid_files)} 張），請勿關閉頁面或重複按送出..."):
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(valid_files), 4)) as pool:
-                        results = list(pool.map(_upload_one, valid_files))
-                drive_links = [r for r in results if r]
-                failed_count = len(valid_files) - len(drive_links)
-                if drive_links:
-                    new_entry["照片路徑"] = ";".join(drive_links)
+                upload_status_area.info(f"📤 準備上傳 {len(valid_files)} 張照片…")
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(valid_files), 3)) as pool:
+                    futures = {pool.submit(_upload_one_with_progress, args): i for i, args in enumerate(valid_files)}
+                    for done_count, future in enumerate(concurrent.futures.as_completed(futures), 1):
+                        result = future.result()
+                        if result:
+                            completed_links.append(result)
+                            upload_status_area.info(f"📤 上傳中… {done_count}/{len(valid_files)} 張完成")
+                        else:
+                            failed_count += 1
+                            upload_status_area.warning(f"⚠️ 第 {done_count} 張上傳失敗，繼續處理其餘照片…")
+
+                if completed_links:
+                    new_entry["照片路徑"] = ";".join(completed_links)
+                    upload_status_area.success(f"✅ {len(completed_links)} 張照片上傳完成！正在寫入紀錄…")
+                else:
+                    upload_status_area.empty()
+
                 if failed_count > 0:
                     st.warning(f"⚠️ {failed_count} 張照片上傳失敗，資料已送出但不含這些照片。請截圖後告知組長補傳。")
 
@@ -1488,12 +1637,11 @@ try:
                             is_dump_bad = any(f"外掃({off_name})" in str(r["備註"]) and "未倒垃圾" in str(r["備註"]) for _, r in today_records.iterrows()) if not today_records.empty else False
                             is_sort_bad = any(f"外掃({off_name})" in str(r["備註"]) and "未做好分類" in str(r["備註"]) for _, r in today_records.iterrows()) if not today_records.empty else False
                             
-                            row_data = {"處室/區域": off_name, "負責班級": cls_name, "未做好分類": is_sort_bad}
-                            if step_a != "一般垃圾": row_data["未倒垃圾"] = is_dump_bad
+                            row_data = {"處室/區域": off_name, "負責班級": cls_name, "未倒垃圾": is_dump_bad, "未做好分類": is_sort_bad}
                             rows.append(row_data)
                             
                         col_config = {"處室/區域": st.column_config.TextColumn(disabled=True), "負責班級": st.column_config.TextColumn(disabled=True)}
-                        if step_a != "一般垃圾": col_config["未倒垃圾"] = st.column_config.CheckboxColumn("🗑️ 未倒垃圾", help="扣1分")
+                        col_config["未倒垃圾"] = st.column_config.CheckboxColumn("🗑️ 未倒垃圾", help="扣1分")
                         col_config["未做好分類"] = st.column_config.CheckboxColumn("♻️ 未做好分類", help="扣1分")
                         
                         edited_df = st.data_editor(pd.DataFrame(rows), column_config=col_config, hide_index=True, width="stretch", key="ed_offices")
@@ -1528,12 +1676,11 @@ try:
                             is_dump_bad = any("內掃" in str(r["備註"]) and "未倒垃圾" in str(r["備註"]) for _, r in cls_rec.iterrows()) if not cls_rec.empty else False
                             is_sort_bad = any("內掃" in str(r["備註"]) and "未做好分類" in str(r["備註"]) for _, r in cls_rec.iterrows()) if not cls_rec.empty else False
                             
-                            row_data = {"班級": cls_name, "未做好分類": is_sort_bad}
-                            if step_a != "一般垃圾": row_data["未倒垃圾"] = is_dump_bad
+                            row_data = {"班級": cls_name, "未倒垃圾": is_dump_bad, "未做好分類": is_sort_bad}
                             rows.append(row_data)
                             
                         col_config = {"班級": st.column_config.TextColumn(disabled=True)}
-                        if step_a != "一般垃圾": col_config["未倒垃圾"] = st.column_config.CheckboxColumn("🗑️ 未倒垃圾", help="扣1分")
+                        col_config["未倒垃圾"] = st.column_config.CheckboxColumn("🗑️ 未倒垃圾", help="扣1分")
                         col_config["未做好分類"] = st.column_config.CheckboxColumn("♻️ 未做好分類", help="扣1分")
                             
                         edited_df = st.data_editor(pd.DataFrame(rows), column_config=col_config, hide_index=True, width="stretch", key=f"ed_{sel_filter}")
@@ -1631,6 +1778,9 @@ try:
                             # [需求2] 優良備註欄 - 放在 form 外顯示說明
                             st.caption("⏳ 優良紀錄將送交組長審核，審核通過前學生端顯示為「普通」。")
 
+                        elif check_result == "✅ 普通":
+                            st.caption("✅ 無扣分，表現普通。如有需要可在下方填寫備註（選填）。")
+
                         elif check_result == "❌ 違規(需扣分)":
                             if role == "內掃檢查":
                                 in_s = st.number_input("內掃扣分", min_value=0, step=1, key="m1_in_s")
@@ -1680,12 +1830,17 @@ try:
 
                         # form 只負責：修正單勾選 + 照片上傳 + 送出按鈕
                         excellent_note_form = ""  # 預設值，避免未定義
+                        normal_note_form = ""     # 普通備註預設值
                         with st.form("score_form", clear_on_submit=True):
                             is_fix = st.checkbox("🚩 這是修正單")
                             # 優良備註在 form 內，避免 session_state key 問題
                             if check_result == "⭐ 優良":
                                 st.markdown("**📝 優良原因（選填）**")
                                 excellent_note_form = st.text_input("請簡單描述優良原因，例如：地板乾淨、掃具整齊", key="m1_excellent_note_form")
+                            # 普通備註在 form 內
+                            elif check_result == "✅ 普通":
+                                st.markdown("**📝 備註（選填）**")
+                                normal_note_form = st.text_input("可填寫備註，例如：掃得不夠乾淨但未達扣分標準，下次請加強", key="m1_normal_note_form")
                             # [照片強制上傳] 三種結果都需附照，防止隨意亂評
                             st.info("📸 請先用手機相機拍好照片存到相簿，再從下方選取上傳。（優良/普通/違規均需附照）")
                             files = st.file_uploader("選取照片", accept_multiple_files=True, type=['jpg','png','jpeg'])
@@ -1710,14 +1865,18 @@ try:
                                             st.session_state.submitted_inspections.add(_submit_key)
                                             st.success("⭐ 優良紀錄已送出！等待組長審核中..."); time.sleep(1.5); st.rerun()
                                     elif check_result == "✅ 普通":
-                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(普通)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": "本次檢查無扣分，表現普通"}, uploaded_files=files, award_inspector_hours=is_last_task):
+                                        try:
+                                            _norm_note = normal_note_form.strip() if normal_note_form else ""
+                                        except Exception:
+                                            _norm_note = ""
+                                        _norm_note_text = _norm_note if _norm_note else "本次檢查無扣分，表現普通"
+                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(普通)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": _norm_note_text}, uploaded_files=files, award_inspector_hours=is_last_task):
                                             st.session_state.submitted_inspections.add(_submit_key)
                                             st.success("✅ 普通紀錄已登記！"); time.sleep(1.5); st.rerun()
                                     elif check_result == "❌ 違規(需扣分)":
-                                        if (in_s + out_s) == 0:
-                                            st.error("❌ 選擇違規但扣分為 0，請填入扣分數值！")
-                                        else:
-                                            if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": note, "違規細項": "、".join(sel_violations) if sel_violations else ""}, uploaded_files=files, award_inspector_hours=is_last_task):
+                                        # [需求1] 允許扣0分：備註自動加【警告】標記，計分面板顯示紅色但不計入成績
+                                        _deduct_note = (f"【警告，扣0分】{note}".strip()) if (in_s + out_s) == 0 else note
+                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": _deduct_note, "違規細項": "、".join(sel_violations) if sel_violations else ""}, uploaded_files=files, award_inspector_hours=is_last_task):
                                                 st.session_state.submitted_inspections.add(_submit_key)
                                                 if assigned_classes:
                                                     if is_last_task:
@@ -2902,17 +3061,80 @@ try:
                 st.markdown("---")
                 st.write("📢 晨掃志工每日廣播/任務")
                 current_task = SYSTEM_CONFIG.get("daily_morning_task", "今日無特殊任務，請確實完成各區打掃即可！")
-                new_task = st.text_area("請輸入想給志工看的話（例如：拍照請比 YA、今天請加強拖地等）", value=current_task)
-                if st.button("💾 更新每日任務"): 
+
+                # [V5.32] AI 廣播生成區塊 - 晨掃
+                with st.expander("🤖 AI 幫我生成晨掃廣播", expanded=False):
+                    ai_m_style = st.radio("廣播風格", ["親切", "嚴肅", "活潑"], horizontal=True, key="ai_m_style")
+                    ai_m_hint  = st.text_input("額外提示（選填，例如：今天重點清走廊、提醒照片要清晰）", key="ai_m_hint")
+                    if st.button("✨ 生成晨掃廣播", key="ai_m_gen"):
+                        now_week  = get_week_num(today_tw)
+                        weekday_c = ["一", "二", "三", "四", "五", "六", "日"][today_tw.weekday()]
+                        # 讀取本週違規統計（晨掃相關）
+                        _mdf = load_main_data()
+                        _m_stats = {}
+                        if not _mdf.empty:
+                            _m_week = _mdf[_mdf["週次"] == now_week]
+                            for _, _r in _m_week.iterrows():
+                                if "晨間打掃" in str(_r.get("評分項目", "")) and str(_r.get("備註", "")):
+                                    for _kw in ["人數不足", "未到", "照片不清", "逾時"]:
+                                        if _kw in str(_r.get("備註", "")):
+                                            _m_stats[_kw] = _m_stats.get(_kw, 0) + 1
+                        with st.spinner("AI 生成中，請稍候…"):
+                            ai_text, ai_err = generate_ai_broadcast(
+                                "morning", now_week, f"星期{weekday_c}",
+                                ai_m_style, ai_m_hint, current_task, _m_stats
+                            )
+                        if ai_text:
+                            st.session_state["ai_morning_draft"] = ai_text
+                            st.success("✅ 生成完成！已填入下方文字框，確認後請按「更新每日任務」儲存。")
+                        else:
+                            st.error(ai_err or "生成失敗，請稍後再試。")
+
+                # 若有 AI 草稿，使用草稿值
+                _morning_val = st.session_state.pop("ai_morning_draft", None) or current_task
+                new_task = st.text_area("請輸入想給志工看的話（例如：拍照請比 YA、今天請加強拖地等）", value=_morning_val, key="ta_morning_task")
+                if st.button("💾 更新每日任務"):
                     if save_setting("daily_morning_task", new_task):
                         st.success("✅ 每日任務已更新！學生現在起會看到最新廣播。")
-                
+
                 st.markdown("---")
-                
+
                 st.write("📢 衛生糾察每日廣播/提醒")
                 current_hygiene_task = SYSTEM_CONFIG.get("daily_hygiene_task", "今日無特殊任務，請確實完成各區檢查即可！")
-                new_hygiene_task = st.text_area("請輸入想給糾察隊看的話（例如：今天重點檢查黑板、窗台）", value=current_hygiene_task)
-                if st.button("💾 更新糾察任務"): 
+
+                # [V5.32] AI 廣播生成區塊 - 衛生糾察
+                with st.expander("🤖 AI 幫我生成糾察廣播", expanded=False):
+                    ai_h_style = st.radio("廣播風格", ["親切", "嚴肅", "活潑"], horizontal=True, key="ai_h_style")
+                    ai_h_hint  = st.text_input("額外提示（選填，例如：本週重點檢查黑板、窗台）", key="ai_h_hint")
+                    if st.button("✨ 生成糾察廣播", key="ai_h_gen"):
+                        now_week  = get_week_num(today_tw)
+                        weekday_c = ["一", "二", "三", "四", "五", "六", "日"][today_tw.weekday()]
+                        # 讀取本週違規統計（違規扣分相關）
+                        _hdf = load_main_data()
+                        _h_stats = {}
+                        if not _hdf.empty:
+                            _h_week = _hdf[_hdf["週次"] == now_week]
+                            for _, _r in _h_week.iterrows():
+                                vi = str(_r.get("違規細項", "")).strip()
+                                if vi:
+                                    for _kw in vi.split("、"):
+                                        _kw = _kw.strip()
+                                        if _kw:
+                                            _h_stats[_kw] = _h_stats.get(_kw, 0) + 1
+                        with st.spinner("AI 生成中，請稍候…"):
+                            ai_text, ai_err = generate_ai_broadcast(
+                                "hygiene", now_week, f"星期{weekday_c}",
+                                ai_h_style, ai_h_hint, current_hygiene_task, _h_stats
+                            )
+                        if ai_text:
+                            st.session_state["ai_hygiene_draft"] = ai_text
+                            st.success("✅ 生成完成！已填入下方文字框，確認後請按「更新糾察任務」儲存。")
+                        else:
+                            st.error(ai_err or "生成失敗，請稍後再試。")
+
+                _hygiene_val = st.session_state.pop("ai_hygiene_draft", None) or current_hygiene_task
+                new_hygiene_task = st.text_area("請輸入想給糾察隊看的話（例如：今天重點檢查黑板、窗台）", value=_hygiene_val, key="ta_hygiene_task")
+                if st.button("💾 更新糾察任務"):
                     if save_setting("daily_hygiene_task", new_hygiene_task):
                         st.success("✅ 糾察任務已更新！糾察隊現在起會看到最新廣播。")
 
