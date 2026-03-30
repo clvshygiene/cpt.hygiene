@@ -3357,22 +3357,38 @@ try:
                             with st.container(border=True):
                                 st.write(f"📌 **{_ct['title']}**")
                                 st.caption(f"📅 日期：{_ct['date']}　|　認領學生：{', '.join(_ct['claimants'])}")
-                                if st.button("✅ 驗收通過並扣除時數", key=f"verify_{_ct['id']}"):
+                                # 將按鈕名稱改得更符合實際動作
+                                if st.button("✅ 依標籤自動驗收", key=f"verify_{_ct['id']}"):
                                     _hr_match = re.search(r"[\(\uff08]([\d.]+)\s*(?:hr|小時|h)[\)\uff09]", _ct["title"], re.IGNORECASE)
                                     _task_hours = float(_hr_match.group(1)) if _hr_match else 1.0
-                                    _ok_count = 0
-                                    _issued_sids = []  # ⭐️ 收集要發放時數的學號名單
+                                    
+                                    _debt_deducted_count = 0
+                                    _issued_sids = []  # 收集要發放時數的名單
                                     
                                     for _clm in _ct["claimants"]:
+                                        # 解析學號與括號內的標籤，例如 "112001(消警告)"
                                         _sid_match = re.match(r"(\d+)", _clm)
+                                        _tag_match = re.search(r"\((.*?)\)", _clm)
+                                        
                                         if _sid_match:
                                             _sid_val = _sid_match.group(1)
-                                            # 1. 扣除欠時
-                                            if update_student_debt(_sid_val, -_task_hours, f"愛校驗收：{_ct['title']}"):
-                                                _ok_count += 1
-                                                _issued_sids.append(_sid_val)  
+                                            _tag_val = _tag_match.group(1) if _tag_match else "還時數"  # 若舊資料沒標籤，預設為還時數
+                                            
+                                            # 判斷一：如果是來還時數的，扣欠時 + 給服務時數
+                                            if _tag_val == "還時數":
+                                                if update_student_debt(_sid_val, -_task_hours, f"愛校驗收：{_ct['title']}"):
+                                                    _debt_deducted_count += 1
+                                                _issued_sids.append(_sid_val)
                                                 
-                                    # 2. ⭐️ 將名單送進背景佇列，自動發放實體的「服務時數」
+                                            # 判斷二：如果是來消警告的，不扣欠時！但給服務時數證明他有掃
+                                            elif _tag_val == "消警告":
+                                                _issued_sids.append(_sid_val)
+                                                
+                                            # 判斷三：如果是被糾察隊懲罰的，不扣欠時，也不給時數
+                                            elif _tag_val == "糾察懲罰":
+                                                pass 
+
+                                    # 將名單送進背景佇列，自動發放實體的「服務時數」
                                     if _issued_sids:
                                         _payload = {
                                             "student_list": _issued_sids,
@@ -3383,9 +3399,9 @@ try:
                                         }
                                         enqueue_task("service_hours_only", _payload)
                                                 
-                                    update_notion_task_status(_ct["id"], "任務已驗收")  # ⭐️ 配合新的 Notion 狀態
-                                    st.success(f"✅ 已驗收！共扣除 {_ok_count} 位學生欠時，並已自動排程發放 {_task_hours} 小時服務時數！")
-                                    time.sleep(2.0)
+                                    update_notion_task_status(_ct["id"], "任務已驗收")  
+                                    st.success(f"✅ 驗收完成！\n- 幫 {_debt_deducted_count} 人扣除欠時\n- 共排程核發 {len(_issued_sids)} 人服務時數")
+                                    time.sleep(2.5)
                                     st.rerun()
 
                 # ── 區塊 B：⚠️ 欠時懲處結算報表 ──
