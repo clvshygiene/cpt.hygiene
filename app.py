@@ -16,7 +16,7 @@ from contextlib import closing
 from datetime import datetime, date, timedelta
 from datetime import timezone
 import pytz
-import gspreadF
+import gspread
 from google.oauth2.service_account import Credentials as SACredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
