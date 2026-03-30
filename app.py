@@ -3380,7 +3380,7 @@ try:
                                             _now_date = datetime.now(TW_TZ)
                                             _roc_year = str(_now_date.year - 1911)
                                             
-_font_path = "kaiu.ttf"
+                                            _font_path = "kaiu.ttf"
                                             if not os.path.exists(_font_path):
                                                 st.error("❌ 找不到 kaiu.ttf 字型檔，請確認是否已上傳至 GitHub！")
                                             else:
