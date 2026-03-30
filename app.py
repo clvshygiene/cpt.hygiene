@@ -17,6 +17,7 @@ from datetime import datetime, date, timedelta
 from datetime import timezone
 import pytz
 import gspread
+import fitz  # [新增] PyMuPDF 套件，用來處理消警告單
 from google.oauth2.service_account import Credentials as SACredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -3426,6 +3427,72 @@ try:
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                 key="debt_excel_dl"
                             )
+
+                # ── 區塊 C：🖨️ 銷過單核發 (PDF 自動生成) ──
+                with st.expander("🖨️ 銷過單核發 (消警告單)", expanded=True):
+                    st.info("💡 輸入學號，系統將自動套印《愛校服務申請單.pdf》供下載。確認格式無誤後，未來將升級為自動寄信給學生。")
+                    
+                    _pdf_sid = st.text_input("請輸入要申請銷過的【學號】", placeholder="例如：112001", key="pdf_gen_sid")
+                    
+                    if st.button("🪄 一鍵生成 PDF 申請單", key="btn_gen_pdf"):
+                        if not _pdf_sid:
+                            st.error("請先輸入學號！")
+                        else:
+                            _clean_sid = clean_id(_pdf_sid)
+                            _cls_name = ROSTER_DICT.get(_clean_sid, "")
+                            
+                            # 尋找學生姓名 (從 main_data 中找，若找不到則留白)
+                            _student_name = ""
+                            _all_records = load_main_data()
+                            if not _all_records.empty:
+                                # 這裡利用一個小技巧：從過去的扣分紀錄中抓取姓名(如果有存的話)，或者依賴你的系統是否有其他對照表
+                                # 若系統目前沒有儲存姓名對照表，我們請學生自己手寫，或暫時留白
+                                pass 
+                            
+                            if not _cls_name:
+                                st.error(f"❌ 在名單中找不到學號 {_clean_sid} 的班級資料！")
+                            else:
+                                try:
+                                    # 1. 讀取空白底稿
+                                    _doc = fitz.open("愛校服務申請單.pdf")
+                                    _page = _doc[0]  # 取第一頁
+                                    
+                                    # 2. 設定今日日期 (民國年)
+                                    _now_date = datetime.now(TW_TZ)
+                                    _roc_year = _now_date.year - 1911
+                                    _month = _now_date.month
+                                    _day = _now_date.day
+                                    
+                                    # 3. 定義要印上去的文字與座標 (x, y)
+                                    # ⚠️ 這裡的座標是預估值，稍後下載後若有偏差，只需微調這裡的數字即可
+                                    _text_data = [
+                                        (str(_roc_year), 400, 115),  # 年
+                                        (str(_month), 460, 115),     # 月
+                                        (str(_day), 510, 115),       # 日
+                                        (_cls_name, 120, 140),       # 班級
+                                        (_clean_sid, 450, 140)       # 學號
+                                    ]
+                                    
+                                    # 4. 將文字精準壓印到 PDF 上
+                                    for _text, _x, _y in _text_data:
+                                        # 使用 PyMuPDF 內建的 cjk (中日韓) 字體以支援中文顯示
+                                        _page.insert_text(fitz.Point(_x, _y), _text, fontsize=14, fontname="cjk", color=(0, 0, 0))
+                                    
+                                    # 5. 輸出成位元組 (Bytes) 供下載
+                                    _pdf_bytes = _doc.write()
+                                    _doc.close()
+                                    
+                                    st.success("✅ PDF 產生成功！請點擊下方按鈕下載檢查：")
+                                    st.download_button(
+                                        label="📥 下載專屬愛校服務申請單 (PDF)",
+                                        data=_pdf_bytes,
+                                        file_name=f"愛校申請單_{_cls_name}_{_clean_sid}.pdf",
+                                        mime="application/pdf"
+                                    )
+                                    
+                                except Exception as e:
+                                    st.error(f"❌ 產生 PDF 時發生錯誤：{e}")
+                                    st.caption("請確認 `愛校服務申請單.pdf` 是否已正確上傳至 GitHub。")
 
         elif pwd_input != "":
             st.error("密碼錯誤")
