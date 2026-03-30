@@ -3380,22 +3380,49 @@ try:
                                             _now_date = datetime.now(TW_TZ)
                                             _roc_year = str(_now_date.year - 1911)
                                             
-                                            # 載入我們剛剛上傳的標楷體字型檔
-                                            _font_path = "kaiu.ttf"
+_font_path = "kaiu.ttf"
                                             if not os.path.exists(_font_path):
                                                 st.error("❌ 找不到 kaiu.ttf 字型檔，請確認是否已上傳至 GitHub！")
                                             else:
                                                 _page.insert_font(fontname="kaiu", fontfile=_font_path)
-                                                # 定義要印上去的文字與座標
-                                                _text_data = [
-                                                    (_roc_year, 400, 115),
-                                                    (str(_now_date.month), 460, 115),
-                                                    (str(_now_date.day), 510, 115),
-                                                    (_cls_name, 120, 140),
-                                                    (_clean_sid, 450, 140)
+                                                
+                                                # --- 1. 印表頭基本資料 ---
+                                                _header_data = [
+                                                    (_cls_name, 120, 150),   # 班級 X, Y
+                                                    (_clean_sid, 300, 150),  # 學號 X, Y
                                                 ]
-                                                for _text, _x, _y in _text_data:
+                                                for _text, _x, _y in _header_data:
                                                     _page.insert_text(fitz.Point(_x, _y), _text, fontsize=14, fontname="kaiu", color=(0, 0, 0))
+                                                    
+                                                # --- 2. 撈取資料庫中的「消警告」明細 ---
+                                                ws_svc = get_worksheet(SHEET_TABS["service_hours"])
+                                                _total_hours = 0.0
+                                                if ws_svc:
+                                                    _df_svc = pd.DataFrame(ws_svc.get_all_records())
+                                                    if not _df_svc.empty and "學號" in _df_svc.columns:
+                                                        # 找出這個學號，且類別是消警告的紀錄
+                                                        _my_appeals = _df_svc[(_df_svc["學號"].astype(str) == _clean_sid) & (_df_svc["類別"] == "愛校服務(消警告)")].copy()
+                                                        
+                                                        # --- 3. 迴圈印出明細表格 ---
+                                                        _start_y = 250  # 第一列的 Y 座標 (請依照 PDF 實際高度微調)
+                                                        _line_gap = 35  # 每一列的間隔高度
+                                                        
+                                                        for r_idx, row in enumerate(_my_appeals.itertuples()):
+                                                            if r_idx >= 8: break  # 假設表格最多印 8 列，超過就不印了
+                                                            
+                                                            _curr_y = _start_y + (r_idx * _line_gap)
+                                                            _date_str = str(row.日期)
+                                                            _task_name = str(row.班級) # 我們剛把標題借存在這裡
+                                                            _hrs = float(row.時數)
+                                                            _total_hours += _hrs
+                                                            
+                                                            # 分別印在三個欄位的 X 座標 (請依照 PDF 實際寬度微調)
+                                                            _page.insert_text(fitz.Point(100, _curr_y), _date_str, fontsize=12, fontname="kaiu", color=(0,0,0))
+                                                            _page.insert_text(fitz.Point(250, _curr_y), _task_name[:15], fontsize=12, fontname="kaiu", color=(0,0,0))
+                                                            _page.insert_text(fitz.Point(450, _curr_y), str(_hrs), fontsize=12, fontname="kaiu", color=(0,0,0))
+                                                            
+                                                # --- 4. 印出總計時數 ---
+                                                _page.insert_text(fitz.Point(450, 520), str(_total_hours), fontsize=14, fontname="kaiu", color=(0,0,0))
                                                     
                                                 _pdf_bytes = _doc.write()
                                                 _doc.close()
@@ -3411,14 +3438,14 @@ try:
                                         except Exception as e:
                                             st.error(f"產製 PDF 發生錯誤：{e}")
 
-                                # ── 以下是原本的「依標籤自動驗收」邏輯 ──
+                                # 將按鈕名稱改得更符合實際動作
                                 if st.button("✅ 依標籤自動驗收", key=f"verify_{_ct['id']}"):
                                     _hr_match = re.search(r"[\(\uff08]([\d.]+)\s*(?:hr|小時|h)[\)\uff09]", _ct["title"], re.IGNORECASE)
                                     _task_hours = float(_hr_match.group(1)) if _hr_match else 1.0
                                     
                                     _debt_deducted_count = 0
-                                    _issued_sids = []  
-                                    _appeal_sids = []  
+                                    _issued_sids = []  # 收集還時數名單
+                                    _appeal_sids = []  # 收集消警告名單
                                     
                                     for _clm in _ct["claimants"]:
                                         _sid_match = re.match(r"(\d+)", _clm)
@@ -3432,29 +3459,45 @@ try:
                                                 if update_student_debt(_sid_val, -_task_hours, f"愛校驗收：{_ct['title']}"):
                                                     _debt_deducted_count += 1
                                                 _issued_sids.append(_sid_val)
+                                                
                                             elif _tag_val == "消警告":
                                                 _appeal_sids.append(_sid_val)
+                                                
                                             elif _tag_val == "糾察懲罰":
                                                 pass 
 
+                                    # 1. 正常發放「還時數」的服務時數
                                     if _issued_sids:
-                                        _payload = {
+                                        _payload_normal = {
                                             "student_list": _issued_sids,
                                             "date": str(today_tw),
                                             "class_name": "愛校打掃", 
                                             "category": "返校打掃", 
                                             "hours": _task_hours
                                         }
-                                        enqueue_task("service_hours_only", _payload)
+                                        enqueue_task("service_hours_only", _payload_normal)
+                                        
+                                    # 2. [新增] 將「消警告」的明細存入資料庫，類別標記為專屬標籤，方便 PDF 撈取
+                                    if _appeal_sids:
+                                        _payload_appeal = {
+                                            "student_list": _appeal_sids,
+                                            "date": str(today_tw),
+                                            "class_name": _ct['title'],  # 巧妙地把「打掃內容」存在班級欄位紀錄下來
+                                            "category": "愛校服務(消警告)", 
+                                            "hours": _task_hours
+                                        }
+                                        enqueue_task("service_hours_only", _payload_appeal)
                                                 
                                     update_notion_task_status(_ct["id"], "任務已驗收")  
                                     
                                     msg_parts = ["✅ 驗收完成！Notion 狀態已更新。"]
                                     if _debt_deducted_count > 0 or _issued_sids:
-                                        msg_parts.append(f"🟢 幫 {_debt_deducted_count} 人扣除欠時，並排程核發 {len(_issued_sids)} 人服務時數。")
+                                        msg_parts.append(f"🟢 幫 {_debt_deducted_count} 人扣除欠時，並排程核發 {len(_issued_sids)} 人一般服務時數。")
+                                    if _appeal_sids:
+                                        msg_parts.append(f"🔔 紀錄已儲存！請點擊上方按鈕為 {len(_appeal_sids)} 位學生產製《消警告申請單》。")
                                         
                                     st.success("\n".join(msg_parts))
-                                    time.sleep(2.5) 
+                                    time.sleep(3.5)
                                     st.rerun()
                                         
                 # ── 區塊 B：⚠️ 欠時懲處結算報表 ──
