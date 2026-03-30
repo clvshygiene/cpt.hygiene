@@ -3374,11 +3374,10 @@ try:
                                         _clean_sid = clean_id(_sid)
                                         _cls_name = ROSTER_DICT.get(_clean_sid, "")
                                         
+                                        # --- 這是要替換的完整 PDF 產製區塊 ---
                                         try:
                                             _doc = fitz.open("愛校服務申請單.pdf")
                                             _page = _doc[0]
-                                            _now_date = datetime.now(TW_TZ)
-                                            _roc_year = str(_now_date.year - 1911)
                                             
                                             _font_path = "kaiu.ttf"
                                             if not os.path.exists(_font_path):
@@ -3386,43 +3385,39 @@ try:
                                             else:
                                                 _page.insert_font(fontname="kaiu", fontfile=_font_path)
                                                 
-                                                # --- 1. 印表頭基本資料 ---
+                                                # 1. 印表頭基本資料
                                                 _header_data = [
-                                                    (_cls_name, 120, 150),   # 班級 X, Y
-                                                    (_clean_sid, 300, 150),  # 學號 X, Y
+                                                    (_cls_name, 120, 150),   # 班級
+                                                    (_clean_sid, 300, 150),  # 學號
                                                 ]
                                                 for _text, _x, _y in _header_data:
                                                     _page.insert_text(fitz.Point(_x, _y), _text, fontsize=14, fontname="kaiu", color=(0, 0, 0))
                                                     
-                                                # --- 2. 撈取資料庫中的「消警告」明細 ---
+                                                # 2. 撈取並印出「消警告」明細
                                                 ws_svc = get_worksheet(SHEET_TABS["service_hours"])
                                                 _total_hours = 0.0
                                                 if ws_svc:
-                                                    _df_svc = pd.DataFrame(ws_svc.get_all_records())
-                                                    if not _df_svc.empty and "學號" in _df_svc.columns:
+                                                    _svc_data = ws_svc.get_all_records()
+                                                    _df_svc = pd.DataFrame(_svc_data)
+                                                    
+                                                    if not _df_svc.empty and "學號" in _df_svc.columns and "類別" in _df_svc.columns:
                                                         # 找出這個學號，且類別是消警告的紀錄
                                                         _my_appeals = _df_svc[(_df_svc["學號"].astype(str) == _clean_sid) & (_df_svc["類別"] == "愛校服務(消警告)")].copy()
                                                         
-                                                        # --- 3. 迴圈印出明細表格 ---
-                                                        _start_y = 250  # 第一列的 Y 座標 (請依照 PDF 實際高度微調)
-                                                        _line_gap = 35  # 每一列的間隔高度
+                                                        _start_y = 230  # 表格第一列起始高度
+                                                        _line_gap = 25  # 行距
                                                         
                                                         for r_idx, row in enumerate(_my_appeals.itertuples()):
-                                                            if r_idx >= 8: break  # 假設表格最多印 8 列，超過就不印了
-                                                            
+                                                            if r_idx >= 10: break  # 表格上限10筆
                                                             _curr_y = _start_y + (r_idx * _line_gap)
-                                                            _date_str = str(row.日期)
-                                                            _task_name = str(row.班級) # 我們剛把標題借存在這裡
-                                                            _hrs = float(row.時數)
-                                                            _total_hours += _hrs
                                                             
-                                                            # 分別印在三個欄位的 X 座標 (請依照 PDF 實際寬度微調)
-                                                            _page.insert_text(fitz.Point(100, _curr_y), _date_str, fontsize=12, fontname="kaiu", color=(0,0,0))
-                                                            _page.insert_text(fitz.Point(250, _curr_y), _task_name[:15], fontsize=12, fontname="kaiu", color=(0,0,0))
-                                                            _page.insert_text(fitz.Point(450, _curr_y), str(_hrs), fontsize=12, fontname="kaiu", color=(0,0,0))
+                                                            _page.insert_text(fitz.Point(90, _curr_y), str(row.日期), fontsize=11, fontname="kaiu")
+                                                            _page.insert_text(fitz.Point(210, _curr_y), str(row.班級)[:18], fontsize=10, fontname="kaiu")
+                                                            _page.insert_text(fitz.Point(490, _curr_y), str(row.時數), fontsize=11, fontname="kaiu")
+                                                            _total_hours += float(row.時數)
                                                             
-                                                # --- 4. 印出總計時數 ---
-                                                _page.insert_text(fitz.Point(450, 520), str(_total_hours), fontsize=14, fontname="kaiu", color=(0,0,0))
+                                                # 3. 印出總計時數
+                                                _page.insert_text(fitz.Point(490, 515), f"{_total_hours:g}", fontsize=13, fontname="kaiu")
                                                     
                                                 _pdf_bytes = _doc.write()
                                                 _doc.close()
@@ -3437,6 +3432,7 @@ try:
                                                     )
                                         except Exception as e:
                                             st.error(f"產製 PDF 發生錯誤：{e}")
+                                        # --- 替換區塊結束 ---
 
                                 # 將按鈕名稱改得更符合實際動作
                                 if st.button("✅ 依標籤自動驗收", key=f"verify_{_ct['id']}"):
