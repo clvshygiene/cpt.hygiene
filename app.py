@@ -3381,7 +3381,7 @@ try:
                                             _roc_year = str(_now_date.year - 1911)
                                             
                                             # 載入我們剛剛上傳的標楷體字型檔
-                                            _font_path = "LINESEEDTW_TTF.ttf"
+                                            _font_path = "kaiu.ttf"
                                             if not os.path.exists(_font_path):
                                                 st.error("❌ 找不到 kaiu.ttf 字型檔，請確認是否已上傳至 GitHub！")
                                             else:
