@@ -3017,7 +3017,7 @@ try:
                     (df["晨間打掃原始分"] == 0) &
                     (~df["修正"]) &
                     (~df["紀錄ID"].astype(str).isin(st.session_state.approved_morning_ids))
-                ]
+                ].drop_duplicates(subset=["紀錄ID"])
                 
                 # [Fix] 排除已有審核完成紀錄的重複項目
                 if approved_cls_dates and not pending_df.empty:
