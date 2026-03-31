@@ -31,6 +31,11 @@ try:
 except ImportError:
     NOTION_INSTALLED = False
 
+# --- [DIAG v3] Module-level Worker log（不依賴 Sheets、SQLite、print）---
+# 背景執行緒直接 append 到這個 list，組長後台頁面直接讀取顯示
+import collections
+_WORKER_LOG = collections.deque(maxlen=50)  # 最多保留 50 筆，自動丟棄最舊的
+
 # --- 1. 網頁設定 ---
 # 透過 Streamlit Secrets 判斷目前是測試區還是正式區 (預設為正式區)
 sys_env = st.secrets.get("ENV", "PROD")
@@ -42,7 +47,7 @@ if sys_env == "DEV":
     st.warning("🚧 **目前位於 DEV 測試環境！** 在這裡送出的資料僅供測試，不會影響正式成績。")
 else:
     st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
-    st.sidebar.caption("🔧 app version: v_DIAG_2")  # [DIAG] 確認部署版本用，修好後可刪除
+    st.sidebar.caption("🔧 app version: v_DIAG_3")  # [DIAG] 確認部署版本用，修好後可刪除
 
 
 # --- 2. 核心參數與全域設定 ---
@@ -1197,6 +1202,7 @@ try:
                     print(f"[recovery] batch_update 失敗: {e}")
             return recovered
 
+        _WORKER_LOG.append(f"[BW] Worker 執行緒啟動")
         while True:
             if stop_event and stop_event.is_set(): break
             try: update_worker_heartbeat()
@@ -1237,8 +1243,11 @@ try:
 
                 try:
                     records = ws.get_all_records()
+                    _pending_count_log = sum(1 for r in records if r.get("status") in ("PENDING","RETRY"))
+                    _WORKER_LOG.append(f"[{datetime.now(TW_TZ).strftime('%H:%M:%S')}] POLL ok, records={len(records)}, pending/retry={_pending_count_log}")
                 except Exception as e:
                     err_str = str(e)
+                    _WORKER_LOG.append(f"[{datetime.now(TW_TZ).strftime('%H:%M:%S')}] get_all_records FAILED: {str(e)[:80]}")
                     print(f"[worker] get_all_records 失敗: {e}")
                     # [配額修復 v2] 429 → 等 180 秒（3 分鐘），確保配額完全恢復後再試
                     # Google 配額是以「每分鐘」為單位重置，等 3 分鐘有足夠緩衝
@@ -1279,19 +1288,15 @@ try:
                     continue
 
                 _idle_loops = 0
-                # [DIAG] 用已持有的 ws 直接寫入，不另外呼叫 API，確認 Worker 確實執行到這裡
-                try:
-                    _bw_diag_id = f"DIAG_{str(task.get('id',''))[:8]}_BEFORE_PROCESS"
-                    _bw_payload_preview = str(task.get('payload', {}))[:200]
-                    ws.append_row(
-                        [_bw_diag_id, task.get("task_type","?"),
-                         datetime.now(TW_TZ).strftime("%H:%M:%S"),
-                         _bw_payload_preview, "DIAG", task.get("attempts",0), "BW_BEFORE_PROCESS"],
-                        value_input_option="RAW"
-                    )
-                except Exception as _bw_de:
-                    pass  # 診斷失敗不影響主流程
+                # [DIAG v3] 寫入 module-level log，確保不依賴任何 API
+                _now_str = datetime.now(TW_TZ).strftime("%H:%M:%S")
+                _tid_short = str(task.get('id',''))[:8]
+                _task_type_log = task.get("task_type","?")
+                _payload_log = str(task.get('payload', {}))[:200]
+                _WORKER_LOG.append(f"[{_now_str}] BEFORE_PROCESS task_id={_tid_short} type={_task_type_log}")
+                _WORKER_LOG.append(f"[{_now_str}] PAYLOAD={_payload_log}")
                 ok, err = process_task(task)
+                _WORKER_LOG.append(f"[{datetime.now(TW_TZ).strftime('%H:%M:%S')}] AFTER_PROCESS ok={ok} err={str(err)[:100]}")
                 if ok: update_last_success_time()
                 else:
                     if err and "DRY_RUN" not in err: update_last_error_summary(err)
@@ -3366,6 +3371,15 @@ try:
             
         col4.metric("背景 Worker", f"{hb_status}", f"心跳: {int(hb_sec)}秒前 | 成功: {ls_text}")
         
+        # [DIAG v3] 顯示 module-level Worker log
+        st.subheader("🔍 Worker 即時診斷 Log（v_DIAG_3）")
+        if _WORKER_LOG:
+            log_text = "\n".join(reversed(list(_WORKER_LOG)))  # 最新的在最上面
+            st.code(log_text, language=None)
+        else:
+            st.warning("⚠️ _WORKER_LOG 是空的，代表 Worker 執行緒從未寫入任何 log。可能 Worker 根本沒有啟動，或啟動後立刻崩潰。")
+        st.divider()
+
         last_err = get_last_error_summary()
         if last_err != "無紀錄":
             st.error(f"🚨 **最後錯誤紀錄:** {last_err}")
