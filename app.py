@@ -2948,7 +2948,7 @@ try:
 
                         # ── 審核按鈕：給分 or 駁回 ──
                         if score_val is not None:
-                            if c3.button(f"✅ 給分 ({suggested:g}分)", key=f"approve_{r['紀錄ID']}"_{i}):
+                            if c3.button(f"✅ 給分 ({suggested:g}分)", key=f"approve_{r['紀錄ID']}_{i}"):
                                 _do_approve(r["紀錄ID"], score_val,
                                             f"給分{suggested:g}分（{score_label.split('→')[0].strip()}）",
                                             reply_msg, c1, main_df)
