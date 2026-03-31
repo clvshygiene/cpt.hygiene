@@ -51,7 +51,6 @@ if sys_env == "DEV":
     st.warning("🚧 **目前位於 DEV 測試環境！** 在這裡送出的資料僅供測試，不會影響正式成績。")
 else:
     st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
-    st.sidebar.caption("🔧 app version: v_DIAG_9")  # [DIAG] 確認部署版本用，修好後可刪除
 
 
 # --- 2. 核心參數與全域設定 ---
@@ -1306,8 +1305,7 @@ try:
                 # 處理含照片的任務（同一批 records，不重複讀）
                 task = _extract_next_task(ws, records)
                 if not task:
-                    # [DIAG] 改為 15 秒，避免配額耗盡
-                    time.sleep(15.0)
+                    time.sleep(30.0)
                     continue
 
                 _idle_loops = 0
@@ -3414,22 +3412,17 @@ try:
             
         col4.metric("背景 Worker", f"{hb_status}", f"心跳: {int(hb_sec)}秒前 | 成功: {ls_text}")
         
-        # [DIAG v8] Worker 重啟按鈕 + 診斷 Log
-        st.subheader("🔍 Worker 即時診斷 Log（v_DIAG_8）")
+        # Worker 狀態與重啟按鈕
         _ws = _get_worker_state()
         _t = _ws.get("thread")
         _alive = _t.is_alive() if _t else False
         _started = _ws.get("started_at", "未知")
-        st.caption(f"Worker 狀態：{'🟢 alive' if _alive else '🔴 dead / 未啟動'}　啟動時間：{_started}")
-        if st.button("🔄 強制重啟 Worker（殺舊換新）", type="primary"):
-            _start_fresh_worker()
-            st.success("✅ 新 Worker 已啟動！請稍後重新整理此頁確認 log 有在更新。")
-            st.rerun()
-        if _WORKER_LOG:
-            log_text = "\n".join(reversed(list(_WORKER_LOG)))
-            st.code(log_text, language=None)
-        else:
-            st.warning("⚠️ _WORKER_LOG 是空的")
+        if not _alive:
+            st.warning(f"⚠️ Worker 執行緒未存活（啟動時間：{_started}）")
+            if st.button("🔄 重啟 Worker", type="primary"):
+                _start_fresh_worker()
+                st.success("✅ 新 Worker 已啟動！")
+                st.rerun()
         st.divider()
 
         last_err = get_last_error_summary()
