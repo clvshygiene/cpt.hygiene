@@ -1147,9 +1147,10 @@ try:
                 except Exception as e:
                     err_str = str(e)
                     print(f"[worker] get_all_records 失敗: {e}")
-                    # [配額修復] 429 → 等 90 秒（原 60 秒太短，配額未恢復就馬上再試）
+                    # [配額修復 v2] 429 → 等 180 秒（3 分鐘），確保配額完全恢復後再試
+                    # Google 配額是以「每分鐘」為單位重置，等 3 分鐘有足夠緩衝
                     if "429" in err_str:
-                        time.sleep(90.0)
+                        time.sleep(180.0)
                     else:
                         time.sleep(10.0)
                     continue
@@ -1179,10 +1180,9 @@ try:
                 # 處理含照片的任務（同一批 records，不重複讀）
                 task = _extract_next_task(ws, records)
                 if not task:
-                    # [配額修復] 空閒輪詢從 20 秒改為 60 秒
-                    # 20s = 每分鐘 3 次讀取，加上其他操作容易超過免費配額（60次/分）
-                    # 60s = 每分鐘 1 次讀取，為 UI 操作保留足夠配額空間
-                    time.sleep(60.0)
+                    # [配額修復 v2] 空閒輪詢拉長至 120 秒（2 分鐘）
+                    # 每天讀取次數：86400 / 120 = 720 次，為 UI 操作保留足夠配額
+                    time.sleep(120.0)
                     continue
 
                 _idle_loops = 0
