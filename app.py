@@ -605,30 +605,38 @@ try:
 
     def process_service_tasks_batch(tasks):
         # [Fix #3] 把多個 service_hours_only 任務的所有學生合併，一次 append_rows 寫入
+        # [Fix] 先用 SELECT 檢查 dedup，但 INSERT 移到 Sheets 寫入成功之後
+        #       避免 Sheets 失敗 + SQLite 已標記 → 重試時被跳過的致命 bug
         is_dry_run = str(st.secrets.get("system_config", {}).get("dry_run", "false")).lower() in ["true", "1"]
         if is_dry_run:
             return True, "DRY_RUN_SUCCESS"
         rows_to_write = []
+        dedup_keys = []  # [Fix] 收集 dedup keys，Sheets 成功後才寫 SQLite
         for task in tasks:
             payload = task["payload"]
             t_date     = payload.get("date", str(date.today()))
             t_cat      = payload.get("category", "")
-            t_cls_name = payload.get("class_name", "")  # [Fix] 加入 class_name 作為去重 key 的一部分
+            t_cls_name = payload.get("class_name", "")
             for sid in payload.get("student_list", []):
+                # [Fix] 先 SELECT 檢查是否已發放，不做 INSERT
+                is_dup = False
                 try:
                     with closing(open_local_db()) as conn:
-                        conn.execute(
-                            "INSERT INTO service_issued VALUES (?, ?, ?, ?)",
+                        cur = conn.execute(
+                            "SELECT 1 FROM service_issued WHERE date=? AND sid=? AND category=? AND class_name=?",
                             (t_date, str(sid), t_cat, t_cls_name)
                         )
+                        is_dup = cur.fetchone() is not None
+                except Exception:
+                    pass  # 查詢失敗不阻擋寫入
+                if not is_dup:
                     rows_to_write.append([
                         t_date, str(sid),
                         t_cls_name, t_cat,
                         str(payload.get("hours", 0.5)),
                         uuid.uuid4().hex[:8]
                     ])
-                except sqlite3.IntegrityError:
-                    pass  # 已發放過，跳過
+                    dedup_keys.append((t_date, str(sid), t_cat, t_cls_name))
         if not rows_to_write:
             return True, None  # 全部都是重複，視為成功
         try:
@@ -637,6 +645,13 @@ try:
                 if not ws: raise Exception("無法取得 service_hours 工作表")
                 ws.append_rows(rows_to_write, value_input_option="RAW")
             execute_with_retry(_batch_action)
+            # [Fix] Sheets 寫入成功後，才寫 SQLite dedup 記錄
+            for key in dedup_keys:
+                try:
+                    with closing(open_local_db()) as conn:
+                        conn.execute("INSERT OR IGNORE INTO service_issued VALUES (?, ?, ?, ?)", key)
+                except Exception as e:
+                    print(f"[dedup] SQLite dedup 寫入失敗（可忽略）: {e}")
             return True, None
         except Exception as e:
             return False, str(e)
@@ -676,6 +691,63 @@ try:
             new_row = [t_date, t_sid, str(entry.get("班級", "")), t_cat, str(entry.get("時數", "")), str(entry.get("紀錄ID", ""))]
             ws.append_row(new_row)
         execute_with_retry(_action)
+
+    # =========================================================================
+    # [Fix] 統一 tag 解析函式（全域定義，Worker 與 Admin UI 共用）
+    # =========================================================================
+    def _strip_notion_invisible(s):
+        """剝除 Notion rich_text 可能夾帶的所有 Unicode 格式/控制字元。"""
+        cleaned = ''.join(
+            c for c in str(s)
+            if unicodedata.category(c) not in ('Cf', 'Cc', 'Cs')
+        )
+        cleaned = re.sub(r'[\s\u3000\u2000-\u200a\u202f\u205f]+', ' ', cleaned)
+        return cleaned.strip()
+
+    def _parse_claimant_tag(claimant_str):
+        """從認領學號字串解析出 (學號, 標籤)，支援半形/全形括號"""
+        claimant_str = _strip_notion_invisible(claimant_str)
+        sid_match = re.match(r"(\d+)", claimant_str)
+        sid = sid_match.group(1) if sid_match else None
+        tag_match = re.search(r"[\(\uff08](.*?)[\)\uff09]", claimant_str)
+        if tag_match:
+            tag = _strip_notion_invisible(tag_match.group(1))
+        else:
+            tag = "還時數"
+        return sid, tag
+
+    def _write_service_hours_direct(class_name, category, hours, student_list, svc_date):
+        """直接寫入 service_hours 工作表（Worker 用，不經由佇列），含 dedup。"""
+        rows = []
+        dedup_keys = []
+        for sid in student_list:
+            is_dup = False
+            try:
+                with closing(open_local_db()) as conn:
+                    cur = conn.execute(
+                        "SELECT 1 FROM service_issued WHERE date=? AND sid=? AND category=? AND class_name=?",
+                        (svc_date, str(sid), category, class_name)
+                    )
+                    is_dup = cur.fetchone() is not None
+            except Exception:
+                pass
+            if not is_dup:
+                rows.append([svc_date, str(sid), class_name, category, str(hours), uuid.uuid4().hex[:8]])
+                dedup_keys.append((svc_date, str(sid), category, class_name))
+        if not rows:
+            return
+        def _action():
+            ws = get_worksheet(SHEET_TABS["service_hours"])
+            if not ws: raise Exception("無法取得 service_hours 工作表")
+            ws.append_rows(rows, value_input_option="RAW")
+        execute_with_retry(_action)
+        for key in dedup_keys:
+            try:
+                with closing(open_local_db()) as conn:
+                    conn.execute("INSERT OR IGNORE INTO service_issued VALUES (?, ?, ?, ?)", key)
+            except Exception:
+                pass
+
 
     def update_last_error_summary(err_msg):
         try:
@@ -747,6 +819,122 @@ try:
             elif task_type == "appeal_entry":
                 # [Fix #3-B] 佐證照片已在 save_appeal 同步上傳，entry["佐證照片"] 已設定
                 execute_with_retry(lambda: get_worksheet(SHEET_TABS["appeals"]).append_row([str(entry.get(col, "")) for col in APPEAL_COLUMNS]))
+
+            # ── [愛校2.0 Async] 背景驗收愛校任務 ──────────────────────
+            elif task_type == "campus_service_verify":
+                claimants     = payload.get("claimants", [])
+                task_title    = payload.get("task_title", "")
+                task_hours    = payload.get("task_hours", 1.0)
+                task_date_str = payload.get("task_date", str(date.today()))
+                notion_page_id = payload.get("notion_page_id", "")
+                task_area     = payload.get("task_area", "")
+                time_start_v  = payload.get("time_start", "")
+
+                svc_debt_sids   = []  # 還時數
+                svc_appeal_sids = []  # 消警告
+
+                for clm in claimants:
+                    _sid_w, _tag_w = _parse_claimant_tag(clm)
+                    if not _sid_w:
+                        continue
+                    _tag_n = _strip_notion_invisible(_tag_w)
+
+                    if _tag_n == "還時數":
+                        update_student_debt(_sid_w, -task_hours, f"愛校驗收：{task_title}")
+                        svc_debt_sids.append(_sid_w)
+                        time.sleep(0.3)
+                    elif _tag_n == "消警告":
+                        svc_appeal_sids.append(_sid_w)
+                    elif _tag_n == "糾察懲罰":
+                        pass  # 不發時數、不消警告
+                    else:
+                        # 未知 tag → 視為還時數
+                        print(f"[worker verify] 未知 tag '{_tag_w}' for {_sid_w}，視為還時數")
+                        update_student_debt(_sid_w, -task_hours, f"愛校驗收：{task_title}")
+                        svc_debt_sids.append(_sid_w)
+                        time.sleep(0.3)
+
+                # 寫入 service_hours：還時數
+                if svc_debt_sids:
+                    _write_service_hours_direct(
+                        "愛校打掃", "返校打掃", task_hours, svc_debt_sids,
+                        task_date_str if task_date_str != "未定" else str(date.today())
+                    )
+                # 寫入 service_hours：消警告
+                if svc_appeal_sids:
+                    _cf = f"{task_area}|{time_start_v}" if time_start_v else task_area
+                    _ad = task_date_str if task_date_str != "未定" else str(date.today())
+                    _write_service_hours_direct(_cf, "愛校服務(消警告)", task_hours, svc_appeal_sids, _ad)
+
+                # 更新 Notion 狀態
+                if notion_page_id:
+                    update_notion_task_status(notion_page_id, "任務已驗收")
+                print(f"[worker] campus_service_verify 完成：debt={svc_debt_sids} appeal={svc_appeal_sids}")
+
+            # ── [愛校2.0 Async] 背景晨掃審核 ──────────────────────────
+            elif task_type == "morning_sweep_approve":
+                _ms_rid      = payload.get("record_id", "")
+                _ms_action   = payload.get("action", "approve")  # approve / reject
+                _ms_score    = payload.get("score_val", 0)
+                _ms_new_item = payload.get("new_item", "晨間打掃(學期加分)")
+                _ms_new_note = payload.get("new_note", "")
+
+                def _do_ms():
+                    ws = get_worksheet(SHEET_TABS["main"])
+                    if not ws: raise Exception("無法取得 main 工作表")
+                    id_list = [str(v).strip() for v in ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)]
+                    rid_str = str(_ms_rid).strip()
+                    if rid_str not in id_list:
+                        print(f"[worker morning] record {rid_str} not found, skip")
+                        return
+                    ridx = id_list.index(rid_str) + 1
+                    # 檢查是否已被審核（避免重複處理）
+                    current_item = ws.cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1).value
+                    if current_item and ("學期加分" in str(current_item) or "已駁回" in str(current_item)):
+                        print(f"[worker morning] record {rid_str} 已審核 ({current_item}), skip")
+                        return
+                    if _ms_action == "approve":
+                        ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分") + 1, _ms_score)
+                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, _ms_new_item)
+                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註") + 1, _ms_new_note)
+                execute_with_retry(_do_ms)
+                try: load_main_data.clear()
+                except Exception: pass
+                print(f"[worker] morning_sweep_{_ms_action} 完成：{_ms_rid}")
+
+            # ── [愛校2.0 Async] 背景申訴審核 ──────────────────────────
+            elif task_type == "appeal_review":
+                _ar_record_id = payload.get("record_id", "")
+                _ar_status    = payload.get("status", "")
+                _ar_reply     = payload.get("reply_text", "")
+
+                def _do_ar():
+                    ws_appeals = get_worksheet(SHEET_TABS["appeals"])
+                    ws_main    = get_worksheet(SHEET_TABS["main"])
+                    if not ws_appeals: raise Exception("無法取得 appeals 工作表")
+                    data = ws_appeals.get_all_records()
+                    t_row = next((i + 2 for i, r in enumerate(data)
+                                  if str(r.get("對應紀錄ID")) == str(_ar_record_id)
+                                  and str(r.get("處理狀態")) == "待處理"), None)
+                    if not t_row:
+                        print(f"[worker appeal] 找不到 record {_ar_record_id} 或已處理")
+                        return
+                    ws_appeals.update_cell(t_row, APPEAL_COLUMNS.index("處理狀態") + 1, _ar_status)
+                    if "審核回覆" in APPEAL_COLUMNS:
+                        ws_appeals.update_cell(t_row, APPEAL_COLUMNS.index("審核回覆") + 1, _ar_reply)
+                    if _ar_status == "已核可" and ws_main:
+                        m_data = ws_main.get_all_records()
+                        m_row = next((j + 2 for j, mr in enumerate(m_data)
+                                      if str(mr.get("紀錄ID")) == str(_ar_record_id)), None)
+                        if m_row:
+                            ws_main.update_cell(m_row, EXPECTED_COLUMNS.index("修正") + 1, "TRUE")
+                execute_with_retry(_do_ar)
+                try:
+                    load_main_data.clear()
+                    load_appeals.clear()
+                except Exception: pass
+                print(f"[worker] appeal_review 完成：{_ar_record_id} → {_ar_status}")
+
             return True, None
         except Exception as e: return False, str(e)
 
@@ -1076,10 +1264,12 @@ try:
 
     def update_student_debt(sid, change_hours, reason):
         """寫入 debt_history 一筆紀錄並同步更新 student_debts 中的未完成時數。
-        若同一學號在 student_debts 有多列，自動加總後合併為一列（刪除重複列）。"""
+        [Fix] 不再合併多列！每列欠時保留各自的備註。
+        正數 = 新增欠時（append 新列）。
+        負數 = 扣減欠時（FIFO，從最舊的列開始扣，扣完的列才刪除）。"""
         sid = str(sid).strip()
         try:
-            debts = load_student_debts()  # [Fix] 已加總所有同學號列
+            debts = load_student_debts()
             current = debts.get(sid, 0.0)
             new_remaining = round(current + change_hours, 2)
             now_str = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -1094,25 +1284,51 @@ try:
                 ws_d = get_worksheet(SHEET_TABS["student_debts"])
                 if not ws_d:
                     raise Exception("無法取得 student_debts 工作表")
-                all_vals = ws_d.get_all_values()
-                # [Fix] 收集所有匹配列的行號（1-indexed，跳過標頭）
-                matching_rows = [
-                    i + 1
-                    for i, row in enumerate(all_vals)
-                    if i > 0 and clean_id(str(row[0]).strip()) == sid
-                ]
-                if not matching_rows:
-                    # 完全找不到 → 新增一列
-                    ws_d.append_row([sid, new_remaining], value_input_option="RAW")
+
+                if change_hours >= 0:
+                    # [Fix] 新增欠時 → 直接 append 新列，保留既有列不動
+                    ws_d.append_row([sid, change_hours], value_input_option="RAW")
                 else:
-                    # 更新第一列為加總後的新值
-                    ws_d.update_cell(matching_rows[0], 2, new_remaining)
-                    if len(matching_rows) > 1:
-                        # [Fix] 從後往前刪除多餘的重複列，避免刪除時行號偏移
-                        print(f"[update_debt] 偵測到 {sid} 有 {len(matching_rows)} 列，合併中...")
-                        for row_idx in sorted(matching_rows[1:], reverse=True):
-                            ws_d.delete_rows(row_idx)
-                        print(f"[update_debt] 已合併 {len(matching_rows)-1} 列重複資料 → 剩餘時數 {new_remaining}h")
+                    # [Fix] FIFO 扣減：從最舊（最上面）的列開始扣
+                    all_vals = ws_d.get_all_values()
+                    remaining_deduction = abs(change_hours)
+                    updates = []   # [(row_idx_1based, new_hours)]
+                    deletes = []   # [row_idx_1based]
+
+                    for i, row in enumerate(all_vals):
+                        if i == 0:  # skip header
+                            continue
+                        if clean_id(str(row[0]).strip()) != sid:
+                            continue
+                        if remaining_deduction <= 0:
+                            break
+                        try:
+                            row_hours = float(row[1])
+                        except (ValueError, TypeError, IndexError):
+                            row_hours = 0.0
+                        if row_hours <= 0:
+                            continue
+
+                        row_idx = i + 1  # 1-based for Sheets API
+                        if remaining_deduction >= row_hours:
+                            # 此列完全扣完 → 標記刪除
+                            remaining_deduction = round(remaining_deduction - row_hours, 2)
+                            deletes.append(row_idx)
+                        else:
+                            # 此列部分扣減 → 更新剩餘時數
+                            new_val = round(row_hours - remaining_deduction, 2)
+                            remaining_deduction = 0
+                            updates.append((row_idx, new_val))
+
+                    # 先更新部分扣減的列
+                    for row_idx, new_val in updates:
+                        ws_d.update_cell(row_idx, 2, new_val)
+
+                    # 從後往前刪除完全扣完的列（避免行號偏移）
+                    for row_idx in sorted(deletes, reverse=True):
+                        ws_d.delete_rows(row_idx)
+                        print(f"[update_debt] FIFO 刪除 row {row_idx}（{sid} 該列欠時已歸零）")
+
             execute_with_retry(_update_debts)
             return True
         except Exception as e:
@@ -2939,12 +3155,21 @@ try:
 
             with t_appeal:
                 st.subheader("📣 申訴審核")
+
+                # [Fix] 用 session_state 紀錄本地已排入佇列的申訴 ID，避免重複顯示
+                if "queued_appeal_ids" not in st.session_state:
+                    st.session_state.queued_appeal_ids = set()
+
                 ap_df = load_appeals()
                 pending_aps = ap_df[ap_df["處理狀態"]=="待處理"]
+                # 過濾掉已排入佇列的
+                if not pending_aps.empty and st.session_state.queued_appeal_ids:
+                    pending_aps = pending_aps[~pending_aps["對應紀錄ID"].astype(str).isin(st.session_state.queued_appeal_ids)]
                 
                 if pending_aps.empty: 
                     st.success("目前無待審核的申訴案件。")
                 else:
+                    st.caption(f"共 {len(pending_aps)} 筆待審核，審核後系統將背景處理，不需等待。")
                     for i, r in pending_aps.iterrows():
                         with st.container(border=True):
                             c1, c2 = st.columns([3,2])
@@ -2962,11 +3187,27 @@ try:
                             
                             col_btn1, col_btn2 = c1.columns(2)
                             if col_btn1.button("✅ 核可並撤銷扣分", key=f"ok_{i}"): 
-                                update_appeal_status(i, "已核可", r["對應紀錄ID"], reply_text)
-                                st.rerun()
+                                enqueue_task("appeal_review", {
+                                    "record_id": str(r["對應紀錄ID"]),
+                                    "status": "已核可",
+                                    "reply_text": reply_text
+                                })
+                                st.session_state.queued_appeal_ids.add(str(r["對應紀錄ID"]))
+                                c1.success("✅ 已排入佇列，系統將背景處理核可與撤銷扣分。")
                             if col_btn2.button("🚫 駁回維持原判", key=f"ng_{i}"): 
-                                update_appeal_status(i, "已駁回", r["對應紀錄ID"], reply_text)
-                                st.rerun()
+                                enqueue_task("appeal_review", {
+                                    "record_id": str(r["對應紀錄ID"]),
+                                    "status": "已駁回",
+                                    "reply_text": reply_text
+                                })
+                                st.session_state.queued_appeal_ids.add(str(r["對應紀錄ID"]))
+                                c1.info("已排入佇列，系統將背景處理駁回。")
+
+                    if st.button("🔄 重新整理申訴列表", key="refresh_appeals"):
+                        st.session_state.queued_appeal_ids.clear()
+                        load_appeals.clear()
+                        load_main_data.clear()
+                        st.rerun()
 
             with t_excellent:
                 st.subheader("⭐ 優良審核")
@@ -3388,25 +3629,21 @@ try:
                 else:
                     st.caption(f"共 {len(pending_df)} 筆待審核，審核後不會立刻跳頁，可以繼續審核其他筆。")
 
-                # [Fix #5] _do_approve 移至迴圈外，所有依賴都透過參數明確傳入，
-                # 避免 Python closure 在迴圈中捕捉到最後一次的 r 變數
-                def _do_approve(record_id, s_val, note_text, reply, col_ref, cached_main_df):
-                    ws = get_worksheet(SHEET_TABS["main"])
-                    id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
-                    # [Fix] 統一轉為 str 並 strip，避免型別或空白不一致
-                    id_list = [str(v).strip() for v in id_list]
-                    record_id_str = str(record_id).strip()
-                    if record_id_str in id_list:
-                        ridx = id_list.index(record_id_str) + 1
-                        ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分") + 1, s_val)
-                        ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, "晨間打掃(學期加分)")
-                        matched = cached_main_df.loc[cached_main_df["紀錄ID"].astype(str) == str(record_id), "備註"]
-                        old_note = str(matched.iloc[0]) if not matched.empty else ""
-                        new_note = f"{old_note} \n組長回覆: {reply}" if reply else f"{old_note} \n組長核可: {note_text}"
-                        ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註") + 1, new_note)
-                        st.session_state.approved_morning_ids.add(str(record_id))
-                        load_main_data.clear()
-                        col_ref.success(f"✅ 已核可，學期加 {abs(s_val):g} 分")
+                # [Fix Async] _do_approve_async：改為 enqueue，前台立即回應
+                def _do_approve_async(record_id, s_val, note_text, reply, col_ref, cached_main_df):
+                    """將晨掃審核排入佇列，前台立即回應，Worker 背景處理"""
+                    matched = cached_main_df.loc[cached_main_df["紀錄ID"].astype(str) == str(record_id), "備註"]
+                    old_note = str(matched.iloc[0]) if not matched.empty else ""
+                    new_note = f"{old_note} \n組長回覆: {reply}" if reply else f"{old_note} \n組長核可: {note_text}"
+                    enqueue_task("morning_sweep_approve", {
+                        "record_id": str(record_id),
+                        "action": "approve",
+                        "score_val": s_val,
+                        "new_item": "晨間打掃(學期加分)",
+                        "new_note": new_note
+                    })
+                    st.session_state.approved_morning_ids.add(str(record_id))
+                    col_ref.success(f"✅ 已排入佇列！學期加 {abs(s_val):g} 分（背景處理中）")
 
                 for i, r in pending_df.iterrows():
                     with st.container(border=True):
@@ -3456,35 +3693,33 @@ try:
 
                         reply_msg = c1.text_input("💬 給予回應 (可留白)", key=f"rm_{r['紀錄ID']}_{i}")
 
-                        # ── 審核按鈕：給分 or 駁回 ──
+                        # ── 審核按鈕：給分 or 駁回（全部改為 async） ──
                         if score_val is not None:
                             if c3.button(f"✅ 給分 ({suggested:g}分)", key=f"approve_{r['紀錄ID']}_{i}"):
-                                _do_approve(r["紀錄ID"], score_val,
+                                _do_approve_async(r["紀錄ID"], score_val,
                                             f"給分{suggested:g}分（{score_label.split('→')[0].strip()}）",
                                             reply_msg, c1, main_df)
                         else:
                             # 無法自動計算時，提供手動選項
                             manual_score = c3.selectbox("給分", [2, 1, 0.5, 0.25], key=f"manual_{r['紀錄ID']}_{i}")
                             if c3.button("✅ 給分", key=f"approve_{r['紀錄ID']}_{i}"):
-                                _do_approve(r["紀錄ID"], -manual_score, f"手動給分 {manual_score} 分",
+                                _do_approve_async(r["紀錄ID"], -manual_score, f"手動給分 {manual_score} 分",
                                             reply_msg, c1, main_df)
 
                         if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}_{i}"):
-                            ws = get_worksheet(SHEET_TABS["main"])
-                            id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
-                            # [Fix] 統一轉為 str 並 strip
-                            id_list = [str(v).strip() for v in id_list]
-                            rid_str = str(r["紀錄ID"]).strip()
-                            if rid_str in id_list:
-                                ridx = id_list.index(rid_str) + 1
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, "晨間打掃(已駁回)")
-                                old_note = str(r['備註'])
-                                rej_msg  = reply_msg if reply_msg else "未達標準，請見諒"
-                                new_note = f"{old_note} \n組長駁回: {rej_msg}"
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註") + 1, new_note)
-                                st.session_state.approved_morning_ids.add(rid_str)
-                                load_main_data.clear()
-                                c1.error("🗑️ 已駁回")
+                            # [Fix Async] 駁回也改為佇列處理
+                            old_note = str(r['備註'])
+                            rej_msg  = reply_msg if reply_msg else "未達標準，請見諒"
+                            new_note = f"{old_note} \n組長駁回: {rej_msg}"
+                            enqueue_task("morning_sweep_approve", {
+                                "record_id": str(r["紀錄ID"]),
+                                "action": "reject",
+                                "score_val": 0,
+                                "new_item": "晨間打掃(已駁回)",
+                                "new_note": new_note
+                            })
+                            st.session_state.approved_morning_ids.add(str(r["紀錄ID"]))
+                            c1.error("🗑️ 已排入佇列（駁回處理中）")
 
                 if not pending_df.empty or st.session_state.approved_morning_ids:
                     if st.button("🔄 審核完畢，重新整理列表"):
@@ -3691,36 +3926,8 @@ try:
                                     time.sleep(1.5)
                                     st.rerun()
 
-            # [Fix] 統一 tag 解析函式，同時支援半形 () 和全形（）括號
-            def _strip_notion_invisible(s):
-                """剝除 Notion rich_text 可能夾帶的所有 Unicode 格式/控制字元。
-                涵蓋 Cf（零寬空格、BOM、Word Joiner、ZWNJ、ZWJ 等所有格式字元）、
-                Cc（控制字元）、Cs（代理字元），並將各種 Unicode 空白統一壓縮為一般半形空格後 strip。
-                不針對特定 code point，一次清除到底。"""
-                # Step 1: 剝除所有格式/控制/代理字元
-                cleaned = ''.join(
-                    c for c in str(s)
-                    if unicodedata.category(c) not in ('Cf', 'Cc', 'Cs')
-                )
-                # Step 2: 將所有 Unicode 空白類（含全形空格 U+3000、各種空白分隔符）壓縮為半形空格
-                cleaned = re.sub(r'[\s\u3000\u2000-\u200a\u202f\u205f]+', ' ', cleaned)
-                return cleaned.strip()
-
-            def _parse_claimant_tag(claimant_str):
-                """從認領學號字串解析出 (學號, 標籤)，支援半形/全形括號"""
-                claimant_str = _strip_notion_invisible(claimant_str)
-                sid_match = re.match(r"(\d+)", claimant_str)
-                sid = sid_match.group(1) if sid_match else None
-                # 同時匹配半形 () 和全形（）
-                tag_match = re.search(r"[\(\uff08](.*?)[\)\uff09]", claimant_str)
-                if tag_match:
-                    # [Fix] 用 unicodedata 核彈版正規化，剝除 Notion 可能夾帶的任意隱藏字元
-                    tag = _strip_notion_invisible(tag_match.group(1))
-                else:
-                    tag = "還時數"
-                # [Debug] 加 repr() 方便確認清除後的結果
-                print(f"[parse_tag] raw='{claimant_str}' → sid={sid}, tag='{tag}' repr={repr(tag)}")
-                return sid, tag
+            # [Fix] _strip_notion_invisible / _parse_claimant_tag 已移至全域定義（約 line 674），
+            # Worker 與 Admin UI 共用，不再重複定義。
 
             # [新增] 愛校服務 2.0：愛校與欠時管理 Tab
             with t_debt:
@@ -3775,87 +3982,30 @@ try:
                                 if st.button("✅ 依標籤自動驗收", key=f"verify_{_ct['id']}"):
                                     _hr_match = re.search(r"[\(\uff08]([\d.]+)\s*(?:hr|小時|h)[\)\uff09]", _ct["title"], re.IGNORECASE)
                                     _task_hours = float(_hr_match.group(1)) if _hr_match else 1.0
-                                    
-                                    _debt_deducted_count = 0
-                                    _issued_sids = []  # 收集還時數名單
-                                    _appeal_sids = []  # 收集消警告名單
-                                    _punish_sids_verify = []  # [Fix] 收集糾察懲罰名單
-                                    _verify_log = []  # [Fix] 驗收明細日誌
-                                    
-                                    # [Fix] 使用統一解析函式，確保顯示邏輯與驗收邏輯完全一致
-                                    for _clm in _ct["claimants"]:
-                                        _sid_val, _tag_val = _parse_claimant_tag(_clm)
-                                        
-                                        if _sid_val:
-                                            _verify_log.append(f"{_sid_val}({_tag_val})")
-                                            
-                                            # [Fix] unicodedata 核彈版正規化，與 _parse_claimant_tag 一致
-                                            _tag_norm = _strip_notion_invisible(_tag_val)
 
-                                            if _tag_norm == "還時數":
-                                                if update_student_debt(_sid_val, -_task_hours, f"愛校驗收：{_ct['title']}"):
-                                                    _debt_deducted_count += 1
-                                                _issued_sids.append(_sid_val)
-                                                time.sleep(0.3)  # [防429] 每人之間加小延遲
-                                                
-                                            elif _tag_norm == "消警告":
-                                                _appeal_sids.append(_sid_val)
-                                                
-                                            elif _tag_norm == "糾察懲罰":
-                                                _punish_sids_verify.append(_sid_val)
-                                            
-                                            else:
-                                                # [Fix] else 分支：輸出 repr 供排查剩餘未知字元
-                                                print(f"[verify] ⚠️ 未知 tag '{_tag_val}' repr={repr(_tag_val)} norm='{_tag_norm}' repr_norm={repr(_tag_norm)} for {_sid_val}，視為還時數")
-                                                if update_student_debt(_sid_val, -_task_hours, f"愛校驗收：{_ct['title']}"):
-                                                    _debt_deducted_count += 1
-                                                _issued_sids.append(_sid_val)
-                                                time.sleep(0.3)
+                                    # [Fix Async] 改為一次 enqueue，Worker 背景處理所有操作
+                                    _verify_payload = {
+                                        "notion_page_id": _ct["id"],
+                                        "task_title": _ct["title"],
+                                        "task_date": _ct.get("date", str(today_tw)),
+                                        "task_area": _ct.get("area", _ct["title"]),
+                                        "time_start": _ct.get("time_start", ""),
+                                        "task_hours": _task_hours,
+                                        "claimants": _ct["claimants"]  # Worker 會自行解析 tag
+                                    }
+                                    enqueue_task("campus_service_verify", _verify_payload)
 
-                                    # [Fix] 在 console 輸出完整驗收日誌
-                                    print(f"[verify] 任務={_ct['title']} | 驗收明細: {', '.join(_verify_log)}")
-                                    print(f"[verify] 還時數={_issued_sids} | 消警告={_appeal_sids} | 糾察懲罰={_punish_sids_verify}")
-
-                                    # 1. 正常發放「還時數」的服務時數
-                                    if _issued_sids:
-                                        _payload_normal = {
-                                            "student_list": _issued_sids,
-                                            "date": str(today_tw),
-                                            "class_name": "愛校打掃", 
-                                            "category": "返校打掃", 
-                                            "hours": _task_hours
-                                        }
-                                        enqueue_task("service_hours_only", _payload_normal)
-                                        
-                                    # 2. [愛校2.0] 將「消警告」的明細存入 service_hours，含工作內容與起始時間
-                                    if _appeal_sids:
-                                        _work_content = _ct.get('area', _ct['title'])
-                                        _time_start = _ct.get('time_start', '')
-                                        _class_field = f"{_work_content}|{_time_start}" if _time_start else _work_content
-                                        _task_date = _ct.get('date', str(today_tw))
-                                        _payload_appeal = {
-                                            "student_list": _appeal_sids,
-                                            "date": _task_date if _task_date != "未定" else str(today_tw),
-                                            "class_name": _class_field,  # 格式：「工作內容|起始時間」供銷過單撈取
-                                            "category": "愛校服務(消警告)", 
-                                            "hours": _task_hours
-                                        }
-                                        enqueue_task("service_hours_only", _payload_appeal)
-                                                
-                                    update_notion_task_status(_ct["id"], "任務已驗收")  
-                                    
-                                    # [Fix] 詳細的驗收結果訊息，含每位學生的分類結果
-                                    msg_parts = ["✅ 驗收完成！Notion 狀態已更新。"]
-                                    msg_parts.append(f"📋 驗收明細：{', '.join(_verify_log)}")
-                                    if _debt_deducted_count > 0 or _issued_sids:
-                                        msg_parts.append(f"🟢 幫 {_debt_deducted_count} 人扣除欠時，並排程核發 {len(_issued_sids)} 人一般服務時數（{', '.join(_issued_sids)}）。")
-                                    if _appeal_sids:
-                                        msg_parts.append(f"🔔 消警告紀錄已儲存（{', '.join(_appeal_sids)}）！請至下方「🖨️ 銷過單核發」區塊產製表單。")
-                                    if _punish_sids_verify:
-                                        msg_parts.append(f"⚫ {len(_punish_sids_verify)} 位糾察懲罰學生已標記完成（{', '.join(_punish_sids_verify)}，不發時數、不消警告）。")
-                                        
+                                    # 前台立即回應（用之前已解析的分類結果顯示摘要）
+                                    msg_parts = ["✅ 已排入佇列！系統將背景完成以下操作："]
+                                    if _debt_students:
+                                        msg_parts.append(f"🟢 還時數 {len(_debt_students)} 人（扣欠時 + 發服務時數）")
+                                    if _appeal_students:
+                                        msg_parts.append(f"🔔 消警告 {len(_appeal_students)} 人（寫入 service_hours，稍後可產製銷過單）")
+                                    if _punish_students:
+                                        msg_parts.append(f"⚫ 糾察懲罰 {len(_punish_students)} 人（不發時數）")
+                                    msg_parts.append("📡 Notion 狀態將自動更新為「任務已驗收」")
                                     st.success("\n".join(msg_parts))
-                                    time.sleep(3.5)
+                                    time.sleep(2)
                                     st.rerun()
                                         
                 # ── 區塊 B：⚠️ 欠時懲處結算報表 ──
@@ -4054,6 +4204,59 @@ try:
                                 )
 
                         st.caption("💡 下載後請用 Excel 開啟，確認格式無誤後列印 A4 紙張，再持表單至學務處完成後續流程。")
+
+                # ── 區塊 D：🛠️ 消警告資料補寫工具 ──
+                with st.expander("🛠️ 消警告資料補寫（修復遺失紀錄）", expanded=False):
+                    st.warning("⚠️ 此工具用於手動補寫因系統異常而遺失的消警告 service_hours 紀錄。請確認資料正確後再送出。")
+
+                    _rc1, _rc2 = st.columns(2)
+                    _rc_date = _rc1.date_input("服務日期", today_tw, key="rc_fix_date")
+                    _rc_hours = _rc2.number_input("服務時數", value=1.0, step=0.5, min_value=0.5, key="rc_fix_hours")
+                    _rc_work = st.text_input("工作內容", key="rc_fix_work", placeholder="例如：校園清潔、廁所打掃")
+                    _rc_time_start = st.text_input("起始時間（選填，格式 HH:MM）", key="rc_fix_time", placeholder="例如: 15:50")
+                    _rc_sids_raw = st.text_area(
+                        "學號清單（每行一個或逗號分隔）",
+                        key="rc_fix_sids",
+                        placeholder="例如：\n112001\n112002, 112003",
+                        height=100
+                    )
+
+                    # 即時解析
+                    _rc_valid_sids = []
+                    _rc_invalid_sids = []
+                    if _rc_sids_raw.strip():
+                        _rc_raw_list = [s.strip() for s in re.split(r'[\n,、，\s]+', _rc_sids_raw) if s.strip()]
+                        for _sid_r in _rc_raw_list:
+                            _csid = clean_id(_sid_r)
+                            if _csid in ROSTER_DICT:
+                                if _csid not in _rc_valid_sids:
+                                    _rc_valid_sids.append(_csid)
+                            else:
+                                if _sid_r not in _rc_invalid_sids:
+                                    _rc_invalid_sids.append(_sid_r)
+                    if _rc_valid_sids:
+                        st.success(f"✅ 有效學號 {len(_rc_valid_sids)} 人")
+                    if _rc_invalid_sids:
+                        st.error(f"❌ 無效學號：{', '.join(_rc_invalid_sids)}")
+
+                    if st.button("📝 補寫消警告紀錄", key="btn_fix_appeal"):
+                        if not _rc_valid_sids:
+                            st.error("❌ 請輸入至少一個有效學號！")
+                        elif not _rc_work.strip():
+                            st.error("❌ 請填寫工作內容！")
+                        elif _rc_invalid_sids:
+                            st.error("❌ 請先修正無效學號！")
+                        else:
+                            _class_field = f"{_rc_work.strip()}|{_rc_time_start.strip()}" if _rc_time_start.strip() else _rc_work.strip()
+                            _write_service_hours_direct(
+                                _class_field,
+                                "愛校服務(消警告)",
+                                _rc_hours,
+                                _rc_valid_sids,
+                                str(_rc_date)
+                            )
+                            st.success(f"✅ 已補寫 {len(_rc_valid_sids)} 位學生的消警告紀錄至 service_hours！")
+                            st.info("💡 補寫完成後，請到上方「🖨️ 銷過單核發」區塊查詢並產製銷過單。")
 
         elif pwd_input != "":
             st.error("密碼錯誤")
