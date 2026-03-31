@@ -47,7 +47,7 @@ if sys_env == "DEV":
     st.warning("🚧 **目前位於 DEV 測試環境！** 在這裡送出的資料僅供測試，不會影響正式成績。")
 else:
     st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
-    st.sidebar.caption("🔧 app version: v_DIAG_3")  # [DIAG] 確認部署版本用，修好後可刪除
+    st.sidebar.caption("🔧 app version: v_DIAG_4")  # [DIAG] 確認部署版本用，修好後可刪除
 
 
 # --- 2. 核心參數與全域設定 ---
@@ -1321,19 +1321,30 @@ try:
 
     @st.cache_resource
     def ensure_worker_started():
-        # [配額修復] DEV 環境停用 Worker：DEV 和 PROD 共用同一個 Google Service Account，
-        # 兩個 Worker 同時跑會讓 API 讀取配額加倍消耗，導致持續 429 錯誤。
-        # DEV 僅用於 UI 測試，不需要 Worker；組長功能請在 PROD 環境驗收。
+        # [DIAG v4] 寫入 _WORKER_LOG，確認此函式有被呼叫
+        _WORKER_LOG.append(f"[{datetime.now(TW_TZ).strftime('%H:%M:%S')}] ensure_worker_started 被呼叫，sys_env={sys_env}")
+
         if sys_env == "DEV":
-            print("[worker] DEV 環境，Worker 已停用（避免與 PROD 共搶 API 配額）")
-            return threading.Event()  # 回傳空的 stop_event，不啟動執行緒
+            _WORKER_LOG.append("[ensure] DEV 環境，Worker 停用，直接回傳")
+            return threading.Event()
+
+        _WORKER_LOG.append("[ensure] PROD 環境，開始建立執行緒...")
         stop_event = threading.Event()
-        t = threading.Thread(target=background_worker, args=(stop_event,), daemon=True)
         try:
-            add_script_run_ctx(t)
+            t = threading.Thread(target=background_worker, args=(stop_event,), daemon=True)
+            _WORKER_LOG.append(f"[ensure] Thread 物件建立成功: {t}")
+            try:
+                add_script_run_ctx(t)
+                _WORKER_LOG.append("[ensure] add_script_run_ctx 成功")
+            except Exception as e:
+                _WORKER_LOG.append(f"[ensure] add_script_run_ctx 失敗（繼續）: {e}")
+            t.start()
+            _WORKER_LOG.append(f"[ensure] t.start() 完成，is_alive={t.is_alive()}")
         except Exception as e:
-            print(f"[worker_start] add_script_run_ctx 失敗（忽略）: {e}")
-        t.start()
+            _WORKER_LOG.append(f"[ensure] ❌ 建立/啟動執行緒時發生例外: {e}")
+            import traceback as _tb
+            _WORKER_LOG.append(_tb.format_exc()[:300])
+
         return stop_event
     _ = ensure_worker_started()
 
