@@ -10,12 +10,15 @@ import re
 import sqlite3
 import json
 import random
+import math  # [新增] 愛校服務 2.0
+import unicodedata  # [Fix] 剝除 Notion rich_text 夾帶的隱藏格式字元
 import concurrent.futures
 from contextlib import closing
 from datetime import datetime, date, timedelta
 from datetime import timezone
 import pytz
 import gspread
+# import fitz  # [移除] 消警告單已改用 Excel 產製，不再需要 PyMuPDF
 from google.oauth2.service_account import Credentials as SACredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -54,7 +57,8 @@ try:
         "inspectors": "inspectors", "duty": "duty",
         "appeals": "appeals", "holidays": "holidays", "service_hours": "service_hours",
         "office_areas": "office_areas", "published_results": "published_results",
-        "task_queue": "task_queue_v3"  # [Fix #3-B] 雲端佇列分頁，取代本機 SQLite task_queue 表
+        "task_queue": "task_queue_v3",  # [Fix #3-B] 雲端佇列分頁，取代本機 SQLite task_queue 表
+        "student_debts": "student_debts", "debt_history": "debt_history"  # [新增] 愛校服務 2.0
     }
 
     EXPECTED_COLUMNS = [
@@ -83,7 +87,7 @@ try:
         try:
             response = client.databases.query(
                 database_id=db_id,
-                filter={"property": "任務狀態", "status": {"equals": "等待認領中😿"}}
+                filter={"property": "任務狀態", "status": {"equals": "等待認領中"}} # ⭐️ 改為無表情符號
             )
             tasks = []
             for page in response.get("results", []):
@@ -112,7 +116,8 @@ try:
                 req_num = req_num_obj if req_num_obj else 1  
                 
                 claimed_obj = props.get("認領學號", {}).get("rich_text", [])
-                claimed_str = claimed_obj[0].get("text", {}).get("content", "") if claimed_obj else ""
+                # [Fix] 合併所有 rich_text blocks，Notion 超過一定長度會自動拆成多個 block
+                claimed_str = "".join(b.get("text", {}).get("content", "") for b in claimed_obj)
                 current_claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
                 current_count = len(current_claimants)
                 
@@ -124,9 +129,8 @@ try:
         except Exception as e:
             return [], f"Notion API 讀取失敗詳細錯誤: {str(e)}"
 
-    def claim_notion_task(page_id, student_id):
+    def claim_notion_task(page_id, student_id, purpose_tag=""):  
         client = get_notion_client()
-        # [Patch] Guard Clause：防止 client 為空時觸發 NoneType 例外
         if not client:
             return False, "Notion 服務目前未啟用或連線失敗，請通知管理員檢查系統設定。"
             
@@ -138,13 +142,15 @@ try:
             req_num = req_num_obj if req_num_obj else 1
             
             claimed_obj = props.get("認領學號", {}).get("rich_text", [])
-            claimed_str = claimed_obj[0].get("text", {}).get("content", "") if claimed_obj else ""
+            # [Fix] 合併所有 rich_text blocks，Notion 超過一定長度會自動拆成多個 block
+            claimed_str = "".join(b.get("text", {}).get("content", "") for b in claimed_obj)
             current_claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
             
-            if str(student_id) in current_claimants:
+            if any(str(student_id) in c for c in current_claimants):  
                 return False, f"學號 {student_id} 已經認領過此任務囉！"
                 
-            current_claimants.append(str(student_id))
+            claim_label = f"{student_id}({purpose_tag})" if purpose_tag else str(student_id)  
+            current_claimants.append(claim_label)
             new_claimed_str = ", ".join(current_claimants)
             
             is_full = len(current_claimants) >= req_num
@@ -152,7 +158,7 @@ try:
                 "認領學號": {"rich_text": [{"text": {"content": new_claimed_str}}]}
             }
             if is_full:
-                update_props["任務狀態"] = {"status": {"name": "被認領走了！😼"}}
+                update_props["任務狀態"] = {"status": {"name": "被認領走了"}} # ⭐️ 改為新狀態
 
             client.pages.update(
                 page_id=page_id,
@@ -162,6 +168,74 @@ try:
             
         except Exception as e:
             return False, str(e)
+
+    def fetch_claimed_notion_tasks():
+        """抓取 Notion 狀態為「被認領走了」或「任務完成囉」的任務，回傳待驗收列表"""
+        client = get_notion_client()
+        db_id = st.secrets.get("notion_db_id") or st.secrets.get("system_config", {}).get("notion_db_id")
+        if not client or not db_id:
+            return []
+        try:
+            response = client.databases.query(
+                database_id=db_id,
+                # ⭐️ 這裡使用 OR 邏輯，不管是在進行中還是學生標記完成了，組長都看得到！
+                filter={
+                    "or": [
+                        {"property": "任務狀態", "status": {"equals": "被認領走了"}},
+                        {"property": "任務狀態", "status": {"equals": "任務完成囉"}}
+                    ]
+                }
+            )
+            tasks = []
+            for page in response.get("results", []):
+                props = page.get("properties", {})
+                title = props.get("任務名稱", {}).get("title", [{}])
+                title_text = title[0].get("text", {}).get("content", "未命名任務") if title else "未命名任務"
+                # [愛校2.0] 任務內容
+                area = props.get("任務內容", {}).get("rich_text", [{}])
+                area_text = area[0].get("text", {}).get("content", "未填寫") if area else "未填寫"
+                date_obj = props.get("任務日期", {}).get("date", {})
+                raw_date = date_obj.get("start", "未定") if date_obj else "未定"
+                time_start = ""
+                if raw_date != "未定":
+                    try:
+                        parsed_date = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                        date_val = parsed_date.strftime("%Y-%m-%d")
+                        # [愛校2.0] 若有時間資訊，保存起始時間供銷過單使用
+                        if len(raw_date) > 10:
+                            time_start = parsed_date.strftime("%H:%M")
+                    except Exception:
+                        date_val = raw_date
+                else:
+                    date_val = "未定"
+                claimed_obj = props.get("認領學號", {}).get("rich_text", [])
+                # [Fix] 合併所有 rich_text blocks，Notion 超過一定長度會自動拆成多個 block
+                claimed_str = "".join(b.get("text", {}).get("content", "") for b in claimed_obj)
+                claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
+                tasks.append({
+                    "id": page["id"], "title": title_text, "area": area_text,
+                    "date": date_val, "time_start": time_start,
+                    "claimants": claimants
+                })
+            return tasks
+        except Exception as e:
+            print(f"[fetch_claimed_notion_tasks] {e}")
+            return []
+
+    def update_notion_task_status(page_id, new_status):
+        """將 Notion 任務的「任務狀態」改為指定值"""
+        client = get_notion_client()
+        if not client:
+            return False
+        try:
+            client.pages.update(
+                page_id=page_id,
+                properties={"任務狀態": {"status": {"name": new_status}}}
+            )
+            return True
+        except Exception as e:
+            print(f"[update_notion_task_status] {e}")
+            return False
 
     # ==========================================
     # SRE Utils: 重試機制
@@ -240,6 +314,8 @@ try:
                     if tab_name == "office_areas": ws.append_row(["區域名稱", "負責班級"])
                     if tab_name == "published_results": ws.append_row(["週次", "排名", "年級", "班級", "總扣分", "優良次數", "總成績", "評等", "排名模式", "發布時間"])
                     if tab_name == "task_queue": ws.append_row(["id", "task_type", "created_ts", "payload_json", "status", "attempts", "last_error"])
+                    if tab_name == "student_debts": ws.append_row(["學號", "未完成時數", "備註"])  # [Fix 3] 補上備註欄
+                    if tab_name == "debt_history": ws.append_row(["時間", "學號", "異動時數", "剩餘時數", "事由"])  # [新增] 愛校服務 2.0
                     return ws
             except Exception as e:
                 if "429" in str(e):
@@ -294,8 +370,48 @@ try:
         # [Fix #3-B] task_queue 已移至 Google Sheets，這裡只保留兩張輕量表
         conn = sqlite3.connect(QUEUE_DB_PATH, timeout=10.0, isolation_level=None)
         conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("CREATE TABLE IF NOT EXISTS service_issued (date TEXT, sid TEXT, category TEXT, PRIMARY KEY(date, sid, category))")
+        # [Fix] 去重 key 加入 class_name，允許同學同日不同任務各別寫入
+        # 先檢查舊 schema（3欄）是否存在，若是則遷移至新 schema（4欄）
+        try:
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(service_issued)").fetchall()]
+            if cols and "class_name" not in cols:
+                # 舊 schema → 備份後重建
+                conn.execute("ALTER TABLE service_issued RENAME TO service_issued_old")
+                conn.execute("""CREATE TABLE service_issued (
+                    date TEXT, sid TEXT, category TEXT, class_name TEXT,
+                    PRIMARY KEY(date, sid, category, class_name))""")
+                conn.execute("""INSERT OR IGNORE INTO service_issued
+                    SELECT date, sid, category, '' FROM service_issued_old""")
+                conn.execute("DROP TABLE service_issued_old")
+                print("[db_migrate] service_issued 已從 3欄 key 遷移至 4欄 key")
+            elif not cols:
+                conn.execute("""CREATE TABLE IF NOT EXISTS service_issued (
+                    date TEXT, sid TEXT, category TEXT, class_name TEXT,
+                    PRIMARY KEY(date, sid, category, class_name))""")
+        except Exception as e:
+            print(f"[db_migrate] schema 遷移時發生錯誤，嘗試重建: {e}")
+            try:
+                conn.execute("DROP TABLE IF EXISTS service_issued")
+                conn.execute("""CREATE TABLE service_issued (
+                    date TEXT, sid TEXT, category TEXT, class_name TEXT,
+                    PRIMARY KEY(date, sid, category, class_name))""")
+            except Exception as e2:
+                print(f"[db_migrate] 重建失敗: {e2}")
         conn.execute("CREATE TABLE IF NOT EXISTS system_status (key TEXT PRIMARY KEY, val TEXT)")
+        # [Fix 1] 防止 campus_service_verify 重試時重複扣時：以 (task_id, sid) 為主鍵記錄已完成的 debt 操作
+        conn.execute("""CREATE TABLE IF NOT EXISTS debt_processed (
+            task_id TEXT, sid TEXT, PRIMARY KEY(task_id, sid))""")
+        # [Patch C] 防止 update_student_debt 在 _write_history 成功、_update_debts 失敗時的重試重複寫入 debt_history
+        #           _write_history 成功後立即寫入此表，重試時偵測到已寫則跳過 _write_history，直接重試 _update_debts
+        conn.execute("""CREATE TABLE IF NOT EXISTS debt_history_written (
+            task_id TEXT, sid TEXT, PRIMARY KEY(task_id, sid))""")
+        # [Fix 4] enqueue_task_nb 的備援緩衝：當 Sheets append_row 在背景執行緒失敗時，
+        #         暫存至此，Worker 下一輪會自動排空推入 Sheets
+        conn.execute("""CREATE TABLE IF NOT EXISTS fallback_queue (
+            task_id   TEXT PRIMARY KEY,
+            task_type TEXT,
+            payload_json TEXT,
+            created_ts   TEXT)""")
         return conn
 
     def update_worker_heartbeat():
@@ -339,12 +455,21 @@ try:
     _QCOL_ERROR    = 7
 
     def enqueue_task(task_type, payload):
-        # [Fix #3-B] 寫入 Sheets task_queue 分頁，不再用 SQLite
+        # [Fix #3-B] 寫入 Sheets task_queue 分頁，同步等待確認後返回
+        # 成功：回傳 task_id（字串）
+        # 失敗：回傳 None，呼叫端必須檢查並顯示錯誤，不可靜默假設成功
         task_id = str(uuid.uuid4())
         try:
+            target_sheet_url = None
             def _action():
+                nonlocal target_sheet_url
                 ws = get_worksheet(SHEET_TABS["task_queue"])
                 if not ws: raise Exception("無法取得 task_queue 工作表")
+                # [DEBUG] 記錄實際寫入的試算表 URL，供診斷用
+                try:
+                    target_sheet_url = ws.spreadsheet.url
+                except Exception:
+                    target_sheet_url = "unknown"
                 ws.append_row([
                     task_id, task_type,
                     datetime.now(timezone.utc).isoformat(),
@@ -352,9 +477,11 @@ try:
                     "PENDING", 0, ""
                 ], value_input_option="RAW")
             execute_with_retry(_action)
+            print(f"[enqueue] 成功寫入 task_id={task_id[:8]} type={task_type} sheet={target_sheet_url}")
+            return task_id  # 確認寫入成功才回傳
         except Exception as e:
             print(f"[enqueue] 加入佇列失敗: {e}")
-        return task_id
+            return None  # 失敗明確回傳 None，讓 UI 顯示錯誤
 
     def get_pending_count():
         try:
@@ -405,6 +532,8 @@ try:
 
     def update_task_status(task_id, status, attempts, last_error, _row_idx=None):
         # DONE → 直接刪行，讓 task_queue 不積累；失敗/重試才保留並更新
+        # [Debug Fix] delete_rows / batch_update 加上 execute_with_retry，
+        # 避免單次 429/timeout 靜默失敗後任務永遠卡在 IN_PROGRESS
         try:
             ws = get_worksheet(SHEET_TABS["task_queue"])
             if not ws: return
@@ -420,18 +549,20 @@ try:
             if status == "DONE":
                 # 成功完成 → 直接刪除這行，task_queue 永遠不會積累歷史紀錄
                 try:
-                    ws.delete_rows(ridx)
+                    execute_with_retry(lambda: ws.delete_rows(ridx))
                 except Exception as e:
-                    print(f"[task_queue] 刪行失敗（忽略）: {e}")
+                    print(f"[task_queue] 刪行失敗（{task_id[:8]}，row={ridx}）: {e}")
             else:
                 # FAILED 或 RETRY → 更新狀態保留供查閱
-                ws.batch_update([
-                    {"range": f"E{ridx}", "values": [[status]]},
-                    {"range": f"F{ridx}", "values": [[attempts]]},
-                    {"range": f"G{ridx}", "values": [[str(last_error)[:200] if last_error else ""]]}
-                ])
+                def _status_update():
+                    ws.batch_update([
+                        {"range": f"E{ridx}", "values": [[status]]},
+                        {"range": f"F{ridx}", "values": [[attempts]]},
+                        {"range": f"G{ridx}", "values": [[str(last_error)[:200] if last_error else ""]]}
+                    ])
+                execute_with_retry(_status_update)
         except Exception as e:
-            print(f"update_task_status error: {e}")
+            print(f"update_task_status error (task={task_id[:8] if task_id else '?'}, status={status}): {e}")
 
     # ==========================================
     # 背景處理邏輯
@@ -503,29 +634,38 @@ try:
 
     def process_service_tasks_batch(tasks):
         # [Fix #3] 把多個 service_hours_only 任務的所有學生合併，一次 append_rows 寫入
+        # [Fix] 先用 SELECT 檢查 dedup，但 INSERT 移到 Sheets 寫入成功之後
+        #       避免 Sheets 失敗 + SQLite 已標記 → 重試時被跳過的致命 bug
         is_dry_run = str(st.secrets.get("system_config", {}).get("dry_run", "false")).lower() in ["true", "1"]
         if is_dry_run:
             return True, "DRY_RUN_SUCCESS"
         rows_to_write = []
+        dedup_keys = []  # [Fix] 收集 dedup keys，Sheets 成功後才寫 SQLite
         for task in tasks:
             payload = task["payload"]
-            t_date = payload.get("date", str(date.today()))
-            t_cat  = payload.get("category", "")
+            t_date     = payload.get("date", str(date.today()))
+            t_cat      = payload.get("category", "")
+            t_cls_name = payload.get("class_name", "")
             for sid in payload.get("student_list", []):
+                # [Fix] 先 SELECT 檢查是否已發放，不做 INSERT
+                is_dup = False
                 try:
                     with closing(open_local_db()) as conn:
-                        conn.execute(
-                            "INSERT INTO service_issued VALUES (?, ?, ?)",
-                            (t_date, str(sid), t_cat)
+                        cur = conn.execute(
+                            "SELECT 1 FROM service_issued WHERE date=? AND sid=? AND category=? AND class_name=?",
+                            (t_date, str(sid), t_cat, t_cls_name)
                         )
+                        is_dup = cur.fetchone() is not None
+                except Exception:
+                    pass  # 查詢失敗不阻擋寫入
+                if not is_dup:
                     rows_to_write.append([
                         t_date, str(sid),
-                        payload.get("class_name", ""), t_cat,
+                        t_cls_name, t_cat,
                         str(payload.get("hours", 0.5)),
                         uuid.uuid4().hex[:8]
                     ])
-                except sqlite3.IntegrityError:
-                    pass  # 已發放過，跳過
+                    dedup_keys.append((t_date, str(sid), t_cat, t_cls_name))
         if not rows_to_write:
             return True, None  # 全部都是重複，視為成功
         try:
@@ -534,6 +674,13 @@ try:
                 if not ws: raise Exception("無法取得 service_hours 工作表")
                 ws.append_rows(rows_to_write, value_input_option="RAW")
             execute_with_retry(_batch_action)
+            # [Fix] Sheets 寫入成功後，才寫 SQLite dedup 記錄
+            for key in dedup_keys:
+                try:
+                    with closing(open_local_db()) as conn:
+                        conn.execute("INSERT OR IGNORE INTO service_issued VALUES (?, ?, ?, ?)", key)
+                except Exception as e:
+                    print(f"[dedup] SQLite dedup 寫入失敗（可忽略）: {e}")
             return True, None
         except Exception as e:
             return False, str(e)
@@ -555,15 +702,17 @@ try:
         execute_with_retry(_action)
     
     def _append_service_row_unique(entry):
-        t_date = str(entry.get("日期", ""))
-        t_sid = str(entry.get("學號", ""))
-        t_cat = str(entry.get("類別", ""))
+        t_date     = str(entry.get("日期", ""))
+        t_sid      = str(entry.get("學號", ""))
+        t_cat      = str(entry.get("類別", ""))
+        t_cls_name = str(entry.get("班級", ""))  # [Fix] 加入 class_name 至去重 key
         
         try:
             with closing(open_local_db()) as conn:
-                conn.execute("INSERT INTO service_issued VALUES (?, ?, ?)", (t_date, t_sid, t_cat))
+                conn.execute("INSERT INTO service_issued VALUES (?, ?, ?, ?)",
+                             (t_date, t_sid, t_cat, t_cls_name))
         except sqlite3.IntegrityError:
-            return 
+            return
             
         def _action():
             ws = get_worksheet(SHEET_TABS["service_hours"])
@@ -571,6 +720,63 @@ try:
             new_row = [t_date, t_sid, str(entry.get("班級", "")), t_cat, str(entry.get("時數", "")), str(entry.get("紀錄ID", ""))]
             ws.append_row(new_row)
         execute_with_retry(_action)
+
+    # =========================================================================
+    # [Fix] 統一 tag 解析函式（全域定義，Worker 與 Admin UI 共用）
+    # =========================================================================
+    def _strip_notion_invisible(s):
+        """剝除 Notion rich_text 可能夾帶的所有 Unicode 格式/控制字元。"""
+        cleaned = ''.join(
+            c for c in str(s)
+            if unicodedata.category(c) not in ('Cf', 'Cc', 'Cs')
+        )
+        cleaned = re.sub(r'[\s\u3000\u2000-\u200a\u202f\u205f]+', ' ', cleaned)
+        return cleaned.strip()
+
+    def _parse_claimant_tag(claimant_str):
+        """從認領學號字串解析出 (學號, 標籤)，支援半形/全形括號"""
+        claimant_str = _strip_notion_invisible(claimant_str)
+        sid_match = re.match(r"(\d+)", claimant_str)
+        sid = sid_match.group(1) if sid_match else None
+        tag_match = re.search(r"[\(\uff08](.*?)[\)\uff09]", claimant_str)
+        if tag_match:
+            tag = _strip_notion_invisible(tag_match.group(1))
+        else:
+            tag = "還時數"
+        return sid, tag
+
+    def _write_service_hours_direct(class_name, category, hours, student_list, svc_date):
+        """直接寫入 service_hours 工作表（Worker 用，不經由佇列），含 dedup。"""
+        rows = []
+        dedup_keys = []
+        for sid in student_list:
+            is_dup = False
+            try:
+                with closing(open_local_db()) as conn:
+                    cur = conn.execute(
+                        "SELECT 1 FROM service_issued WHERE date=? AND sid=? AND category=? AND class_name=?",
+                        (svc_date, str(sid), category, class_name)
+                    )
+                    is_dup = cur.fetchone() is not None
+            except Exception:
+                pass
+            if not is_dup:
+                rows.append([svc_date, str(sid), class_name, category, str(hours), uuid.uuid4().hex[:8]])
+                dedup_keys.append((svc_date, str(sid), category, class_name))
+        if not rows:
+            return
+        def _action():
+            ws = get_worksheet(SHEET_TABS["service_hours"])
+            if not ws: raise Exception("無法取得 service_hours 工作表")
+            ws.append_rows(rows, value_input_option="RAW")
+        execute_with_retry(_action)
+        for key in dedup_keys:
+            try:
+                with closing(open_local_db()) as conn:
+                    conn.execute("INSERT OR IGNORE INTO service_issued VALUES (?, ?, ?, ?)", key)
+            except Exception:
+                pass
+
 
     def update_last_error_summary(err_msg):
         try:
@@ -618,14 +824,16 @@ try:
                 if task_type == "volunteer_report":
                     # [Fix #3] volunteer_report 多名學生的時數改為批次寫入（1 次 append_rows）
                     svc_rows = []
-                    t_date = entry.get("日期", str(date.today()))
-                    t_cat  = payload.get("custom_category", "晨掃志工")
+                    t_date    = entry.get("日期", str(date.today()))
+                    t_cat     = payload.get("custom_category", "晨掃志工")
+                    t_cls_vol = entry.get("班級", "")  # [Fix] 加入 class_name 至去重 key
                     for sid in payload.get("student_list", []):
                         try:
                             with closing(open_local_db()) as conn:
-                                conn.execute("INSERT INTO service_issued VALUES (?, ?, ?)", (t_date, str(sid), t_cat))
+                                conn.execute("INSERT INTO service_issued VALUES (?, ?, ?, ?)",
+                                             (t_date, str(sid), t_cat, t_cls_vol))
                             svc_rows.append([
-                                t_date, str(sid), entry.get("班級", ""), t_cat,
+                                t_date, str(sid), t_cls_vol, t_cat,
                                 str(payload.get("custom_hours", 0.5)), uuid.uuid4().hex[:8]
                             ])
                         except sqlite3.IntegrityError:
@@ -640,6 +848,187 @@ try:
             elif task_type == "appeal_entry":
                 # [Fix #3-B] 佐證照片已在 save_appeal 同步上傳，entry["佐證照片"] 已設定
                 execute_with_retry(lambda: get_worksheet(SHEET_TABS["appeals"]).append_row([str(entry.get(col, "")) for col in APPEAL_COLUMNS]))
+
+            # ── [愛校2.0 Async] 背景驗收愛校任務 ──────────────────────
+            elif task_type == "campus_service_verify":
+                claimants      = payload.get("claimants", [])
+                task_title     = payload.get("task_title", "")
+                task_hours     = payload.get("task_hours", 1.0)
+                task_date_str  = payload.get("task_date", str(date.today()))
+                notion_page_id = payload.get("notion_page_id", "")
+                task_area      = payload.get("task_area", "")
+                time_start_v   = payload.get("time_start", "")
+                # [Fix 1] 用 task_id 作為 debt_processed 的去重 key，
+                #         確保重試時不會對同一學生重複扣時。
+                _task_id_for_dedup = str(task.get("id", "")).strip()
+                # [Patch B] task_id 為空時停用 dedup 保護（不應發生，但防禦極端情況）
+                _dedup_enabled = bool(_task_id_for_dedup)
+
+                svc_debt_sids   = []  # 還時數
+                svc_appeal_sids = []  # 消警告
+
+                for clm in claimants:
+                    _sid_w, _tag_w = _parse_claimant_tag(clm)
+                    if not _sid_w:
+                        continue
+                    _tag_n = _strip_notion_invisible(_tag_w)
+
+                    if _tag_n in ("還時數", ""):
+                        # [Fix 1] 先查 debt_processed，避免重試時重複扣時
+                        _already_debted = False
+                        if _dedup_enabled:
+                            try:
+                                with closing(open_local_db()) as _conn:
+                                    _already_debted = _conn.execute(
+                                        "SELECT 1 FROM debt_processed WHERE task_id=? AND sid=?",
+                                        (_task_id_for_dedup, _sid_w)
+                                    ).fetchone() is not None
+                            except Exception as _de:
+                                print(f"[verify] debt_processed 查詢失敗（將繼續執行）: {_de}")
+
+                        if not _already_debted:
+                            _debt_ok = update_student_debt(_sid_w, -task_hours, f"愛校驗收：{task_title}", _task_id=_task_id_for_dedup)
+                            if _debt_ok and _dedup_enabled:
+                                try:
+                                    with closing(open_local_db()) as _conn:
+                                        _conn.execute(
+                                            "INSERT OR IGNORE INTO debt_processed VALUES (?, ?)",
+                                            (_task_id_for_dedup, _sid_w)
+                                        )
+                                except Exception as _we:
+                                    print(f"[verify] debt_processed 寫入失敗（可忽略）: {_we}")
+                        else:
+                            print(f"[verify] {_sid_w} 已在前次嘗試中完成扣時，略過（dedup）")
+
+                        svc_debt_sids.append(_sid_w)
+                        time.sleep(0.3)
+
+                    elif _tag_n == "消警告":
+                        svc_appeal_sids.append(_sid_w)
+
+                    elif _tag_n == "糾察懲罰":
+                        pass  # 不發時數、不消警告
+
+                    else:
+                        # 未知 tag → 視為還時數（同樣套用 dedup 保護）
+                        print(f"[worker verify] 未知 tag '{_tag_w}' for {_sid_w}，視為還時數")
+                        _already_debted = False
+                        if _dedup_enabled:
+                            try:
+                                with closing(open_local_db()) as _conn:
+                                    _already_debted = _conn.execute(
+                                        "SELECT 1 FROM debt_processed WHERE task_id=? AND sid=?",
+                                        (_task_id_for_dedup, _sid_w)
+                                    ).fetchone() is not None
+                            except Exception:
+                                pass
+
+                        if not _already_debted:
+                            _debt_ok = update_student_debt(_sid_w, -task_hours, f"愛校驗收：{task_title}", _task_id=_task_id_for_dedup)
+                            if _debt_ok and _dedup_enabled:
+                                try:
+                                    with closing(open_local_db()) as _conn:
+                                        _conn.execute(
+                                            "INSERT OR IGNORE INTO debt_processed VALUES (?, ?)",
+                                            (_task_id_for_dedup, _sid_w)
+                                        )
+                                except Exception:
+                                    pass
+                        else:
+                            print(f"[verify] {_sid_w}（未知tag）已在前次嘗試中完成扣時，略過")
+
+                        svc_debt_sids.append(_sid_w)
+                        time.sleep(0.3)
+
+                # 寫入 service_hours：還時數（直接寫，已有 SQLite dedup 保護）
+                if svc_debt_sids:
+                    _write_service_hours_direct(
+                        "愛校打掃", "返校打掃", task_hours, svc_debt_sids,
+                        task_date_str if task_date_str != "未定" else str(date.today())
+                    )
+
+                # [Fix 2] 消警告：直接呼叫 _write_service_hours_direct（有 execute_with_retry + SQLite dedup）
+                # ※ Worker 背景執行緒內同步寫入是安全的，不影響 UI
+                # ※ 之前改寫 SQLite fallback_queue 的做法在 Streamlit Cloud 不可靠（ephemeral storage）
+                if svc_appeal_sids:
+                    _cf = f"{task_area}|{time_start_v}" if time_start_v else task_area
+                    _ad = task_date_str if task_date_str != "未定" else str(date.today())
+                    print(f"[worker] 消警告 service_hours 直接寫入，共 {len(svc_appeal_sids)} 人：{svc_appeal_sids}")
+                    _write_service_hours_direct(_cf, "愛校服務(消警告)", task_hours, svc_appeal_sids, _ad)
+
+                # 更新 Notion 狀態
+                if notion_page_id:
+                    _notion_ok = update_notion_task_status(notion_page_id, "任務已驗收")
+                    print(f"[worker] Notion 狀態更新：{'成功' if _notion_ok else '失敗（已記錄，不影響任務完成）'} "
+                          f"page_id={notion_page_id[:8] if notion_page_id else 'None'}")
+                else:
+                    print("[worker] notion_page_id 為空，跳過 Notion 更新")
+                print(f"[worker] campus_service_verify 完成：debt={svc_debt_sids} appeal={svc_appeal_sids}")
+
+            # ── [愛校2.0 Async] 背景晨掃審核 ──────────────────────────
+            elif task_type == "morning_sweep_approve":
+                _ms_rid      = payload.get("record_id", "")
+                _ms_action   = payload.get("action", "approve")  # approve / reject
+                _ms_score    = payload.get("score_val", 0)
+                _ms_new_item = payload.get("new_item", "晨間打掃(學期加分)")
+                _ms_new_note = payload.get("new_note", "")
+
+                def _do_ms():
+                    ws = get_worksheet(SHEET_TABS["main"])
+                    if not ws: raise Exception("無法取得 main 工作表")
+                    id_list = [str(v).strip() for v in ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)]
+                    rid_str = str(_ms_rid).strip()
+                    if rid_str not in id_list:
+                        print(f"[worker morning] record {rid_str} not found, skip")
+                        return
+                    ridx = id_list.index(rid_str) + 1
+                    # 檢查是否已被審核（避免重複處理）
+                    current_item = ws.cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1).value
+                    if current_item and ("學期加分" in str(current_item) or "已駁回" in str(current_item)):
+                        print(f"[worker morning] record {rid_str} 已審核 ({current_item}), skip")
+                        return
+                    if _ms_action == "approve":
+                        ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分") + 1, _ms_score)
+                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, _ms_new_item)
+                    ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註") + 1, _ms_new_note)
+                execute_with_retry(_do_ms)
+                try: load_main_data.clear()
+                except Exception: pass
+                print(f"[worker] morning_sweep_{_ms_action} 完成：{_ms_rid}")
+
+            # ── [愛校2.0 Async] 背景申訴審核 ──────────────────────────
+            elif task_type == "appeal_review":
+                _ar_record_id = payload.get("record_id", "")
+                _ar_status    = payload.get("status", "")
+                _ar_reply     = payload.get("reply_text", "")
+
+                def _do_ar():
+                    ws_appeals = get_worksheet(SHEET_TABS["appeals"])
+                    ws_main    = get_worksheet(SHEET_TABS["main"])
+                    if not ws_appeals: raise Exception("無法取得 appeals 工作表")
+                    data = ws_appeals.get_all_records()
+                    t_row = next((i + 2 for i, r in enumerate(data)
+                                  if str(r.get("對應紀錄ID")) == str(_ar_record_id)
+                                  and str(r.get("處理狀態")) == "待處理"), None)
+                    if not t_row:
+                        print(f"[worker appeal] 找不到 record {_ar_record_id} 或已處理")
+                        return
+                    ws_appeals.update_cell(t_row, APPEAL_COLUMNS.index("處理狀態") + 1, _ar_status)
+                    if "審核回覆" in APPEAL_COLUMNS:
+                        ws_appeals.update_cell(t_row, APPEAL_COLUMNS.index("審核回覆") + 1, _ar_reply)
+                    if _ar_status == "已核可" and ws_main:
+                        m_data = ws_main.get_all_records()
+                        m_row = next((j + 2 for j, mr in enumerate(m_data)
+                                      if str(mr.get("紀錄ID")) == str(_ar_record_id)), None)
+                        if m_row:
+                            ws_main.update_cell(m_row, EXPECTED_COLUMNS.index("修正") + 1, "TRUE")
+                execute_with_retry(_do_ar)
+                try:
+                    load_main_data.clear()
+                    load_appeals.clear()
+                except Exception: pass
+                print(f"[worker] appeal_review 完成：{_ar_record_id} → {_ar_status}")
+
             return True, None
         except Exception as e: return False, str(e)
 
@@ -690,14 +1079,40 @@ try:
                     time.sleep(5.0)
                     continue
 
+                # [Fix 4 / Patch A] 排空 fallback_queue：將 enqueue_task_nb 背景寫入失敗的任務推入 Sheets
+                # [Patch A] 改用 append_rows 一次批次寫入，避免逐筆 append_row 造成 429
+                try:
+                    with closing(open_local_db()) as _fb_conn:
+                        _fb_rows = _fb_conn.execute(
+                            "SELECT task_id, task_type, payload_json, created_ts FROM fallback_queue LIMIT 20"
+                        ).fetchall()
+                    if _fb_rows:
+                        _batch_rows = [
+                            [r[0], r[1], r[3], r[2], "PENDING", 0, ""]
+                            for r in _fb_rows
+                        ]
+                        try:
+                            ws.append_rows(_batch_rows, value_input_option="RAW")
+                            # 成功後才從 SQLite 刪除
+                            with closing(open_local_db()) as _fb_conn:
+                                _fb_conn.executemany(
+                                    "DELETE FROM fallback_queue WHERE task_id=?",
+                                    [(r[0],) for r in _fb_rows]
+                                )
+                            print(f"[drain_fallback] 已批次推送 {len(_fb_rows)} 筆 fallback 任務至 Sheets")
+                        except Exception as _fe:
+                            print(f"[drain_fallback] append_rows 失敗，下輪再試: {_fe}")
+                except Exception as _drain_e:
+                    print(f"[drain_fallback] 排空 fallback_queue 失敗（忽略）: {_drain_e}")
+
                 try:
                     records = ws.get_all_records()
                 except Exception as e:
                     err_str = str(e)
                     print(f"[worker] get_all_records 失敗: {e}")
-                    # [V5.33] 429 配額耗盡 → 等 60 秒讓配額恢復；其他錯誤等 10 秒
+                    # [配額修復] 429 → 等 90 秒（原 60 秒太短，配額未恢復就馬上再試）
                     if "429" in err_str:
-                        time.sleep(60.0)
+                        time.sleep(90.0)
                     else:
                         time.sleep(10.0)
                     continue
@@ -727,9 +1142,10 @@ try:
                 # 處理含照片的任務（同一批 records，不重複讀）
                 task = _extract_next_task(ws, records)
                 if not task:
-                    # [V5.33] 空閒時改為 20 秒輪詢，大幅降低每日 Sheets read 次數
-                    # 原本 5 秒：一天 ~17,280 次；改 20 秒：~4,320 次，降低 75%
-                    time.sleep(20.0)
+                    # [配額修復] 空閒輪詢從 20 秒改為 60 秒
+                    # 20s = 每分鐘 3 次讀取，加上其他操作容易超過免費配額（60次/分）
+                    # 60s = 每分鐘 1 次讀取，為 UI 操作保留足夠配額空間
+                    time.sleep(60.0)
                     continue
 
                 _idle_loops = 0
@@ -747,6 +1163,12 @@ try:
 
     @st.cache_resource
     def ensure_worker_started():
+        # [配額修復] DEV 環境停用 Worker：DEV 和 PROD 共用同一個 Google Service Account，
+        # 兩個 Worker 同時跑會讓 API 讀取配額加倍消耗，導致持續 429 錯誤。
+        # DEV 僅用於 UI 測試，不需要 Worker；組長功能請在 PROD 環境驗收。
+        if sys_env == "DEV":
+            print("[worker] DEV 環境，Worker 已停用（避免與 PROD 共搶 API 配額）")
+            return threading.Event()  # 回傳空的 stop_event，不啟動執行緒
         stop_event = threading.Event()
         t = threading.Thread(target=background_worker, args=(stop_event,), daemon=True)
         try:
@@ -901,6 +1323,433 @@ try:
         except Exception as e:
             print(f"[load_appeals] {e}")
             return pd.DataFrame(columns=APPEAL_COLUMNS)
+
+    # [新增] 愛校服務 2.0：欠時資料存取函式 =====================
+    def load_student_debts():
+        """讀取 student_debts 工作表，回傳 {學號: 未完成時數} 字典。
+        同一學號若有多列（例如多次欠時分批登錄），時數自動加總，不會被後列覆蓋。"""
+        ws = get_worksheet(SHEET_TABS["student_debts"])
+        if not ws:
+            return {}
+        try:
+            records = ws.get_all_records()
+            if not records:
+                return {}
+            result = {}
+            for r in records:
+                sid = clean_id(str(r.get("學號", "")).strip())
+                if not sid:
+                    continue
+                try:
+                    hours = float(r.get("未完成時數", 0))
+                except (ValueError, TypeError):
+                    hours = 0.0
+                # [Fix] 加總，避免重複學號後列覆蓋前列
+                result[sid] = round(result.get(sid, 0.0) + hours, 2)
+            return result
+        except Exception as e:
+            print(f"[load_student_debts] {e}")
+            return {}
+
+    def load_debt_history(sid):
+        """讀取 debt_history 工作表，回傳該學號的歷史異動 DataFrame"""
+        ws = get_worksheet(SHEET_TABS["debt_history"])
+        cols = ["時間", "學號", "異動時數", "剩餘時數", "事由"]
+        if not ws:
+            return pd.DataFrame(columns=cols)
+        try:
+            df = pd.DataFrame(ws.get_all_records())
+            if df.empty:
+                return pd.DataFrame(columns=cols)
+            for c in cols:
+                if c not in df.columns:
+                    df[c] = ""
+            return df[df["學號"].astype(str).str.strip() == str(sid).strip()][cols].reset_index(drop=True)
+        except Exception as e:
+            print(f"[load_debt_history] {e}")
+            return pd.DataFrame(columns=cols)
+
+    def load_student_debt_note(sid):
+        """讀取 student_debts 工作表的備註欄位。
+        同一學號若有多列，將所有備註合併顯示（以 ；分隔，去重）。"""
+        ws = get_worksheet(SHEET_TABS["student_debts"])
+        if not ws:
+            return ""
+        try:
+            records = ws.get_all_records()
+            notes = []
+            for r in records:
+                if clean_id(str(r.get("學號", ""))) == clean_id(str(sid)):
+                    note = str(r.get("備註", "")).strip()
+                    # [Fix] 收集全部備註並去重，不只抓第一筆
+                    if note and note not in notes:
+                        notes.append(note)
+            return "；".join(notes) if notes else ""
+        except Exception as e:
+            print(f"[load_student_debt_note] {e}")
+            return ""
+
+    def update_student_debt(sid, change_hours, reason, _task_id=""):
+        """寫入 debt_history 一筆紀錄並同步更新 student_debts 中的未完成時數。
+        [Fix] 不再合併多列！每列欠時保留各自的備註。
+        正數 = 新增欠時（append 新列）。
+        負數 = 扣減欠時（FIFO，從最舊的列開始扣，扣完的列才刪除）。
+        [Patch C] _task_id：傳入 campus_service_verify 的 task id，用於 debt_history_written dedup，
+                  防止 _write_history 成功但 _update_debts 失敗重試時重複寫入 debt_history。"""
+        sid = str(sid).strip()
+        _dedup_id = str(_task_id).strip()  # 空字串代表停用 history dedup（不由 task 驅動的直接呼叫）
+        try:
+            debts = load_student_debts()
+            current = debts.get(sid, 0.0)
+            new_remaining = round(current + change_hours, 2)
+            now_str = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+            # [Patch C] 檢查 _write_history 是否已在前次嘗試中完成，避免重試時重複寫入 debt_history
+            _history_already_written = False
+            if _dedup_id:
+                try:
+                    with closing(open_local_db()) as _dc:
+                        _history_already_written = _dc.execute(
+                            "SELECT 1 FROM debt_history_written WHERE task_id=? AND sid=?",
+                            (_dedup_id, sid)
+                        ).fetchone() is not None
+                except Exception as _dce:
+                    print(f"[debt_history dedup] 查詢失敗（繼續執行）: {_dce}")
+
+            def _write_history():
+                ws_h = get_worksheet(SHEET_TABS["debt_history"])
+                if not ws_h:
+                    raise Exception("無法取得 debt_history 工作表")
+                ws_h.append_row([now_str, sid, change_hours, new_remaining, reason],
+                                value_input_option="RAW")
+
+            if not _history_already_written:
+                execute_with_retry(_write_history)
+                # [Patch C] _write_history 成功後立即寫入 dedup 標記
+                if _dedup_id:
+                    try:
+                        with closing(open_local_db()) as _dc:
+                            _dc.execute(
+                                "INSERT OR IGNORE INTO debt_history_written VALUES (?, ?)",
+                                (_dedup_id, sid)
+                            )
+                    except Exception as _dwe:
+                        print(f"[debt_history dedup] 標記寫入失敗（可忽略）: {_dwe}")
+            else:
+                print(f"[debt_history dedup] {sid} 已寫入 debt_history（task={_dedup_id[:8]}），略過重複寫入")
+            def _update_debts():
+                ws_d = get_worksheet(SHEET_TABS["student_debts"])
+                if not ws_d:
+                    raise Exception("無法取得 student_debts 工作表")
+
+                if change_hours >= 0:
+                    # [Fix 3] 新增欠時 → append 新列，第三欄寫入 reason 作為備註，保留既有列不動
+                    ws_d.append_row([sid, change_hours, reason], value_input_option="RAW")
+                else:
+                    # [Fix] FIFO 扣減：從最舊（最上面）的列開始扣
+                    all_vals = ws_d.get_all_values()
+                    remaining_deduction = abs(change_hours)
+                    updates = []   # [(row_idx_1based, new_hours)]
+                    deletes = []   # [row_idx_1based]
+
+                    for i, row in enumerate(all_vals):
+                        if i == 0:  # skip header
+                            continue
+                        if clean_id(str(row[0]).strip()) != sid:
+                            continue
+                        if remaining_deduction <= 0:
+                            break
+                        try:
+                            row_hours = float(row[1])
+                        except (ValueError, TypeError, IndexError):
+                            row_hours = 0.0
+                        if row_hours <= 0:
+                            continue
+
+                        row_idx = i + 1  # 1-based for Sheets API
+                        if remaining_deduction >= row_hours:
+                            # 此列完全扣完 → 標記刪除
+                            remaining_deduction = round(remaining_deduction - row_hours, 2)
+                            deletes.append(row_idx)
+                        else:
+                            # 此列部分扣減 → 更新剩餘時數
+                            new_val = round(row_hours - remaining_deduction, 2)
+                            remaining_deduction = 0
+                            updates.append((row_idx, new_val))
+
+                    # 先更新部分扣減的列
+                    for row_idx, new_val in updates:
+                        ws_d.update_cell(row_idx, 2, new_val)
+
+                    # 從後往前刪除完全扣完的列（避免行號偏移）
+                    for row_idx in sorted(deletes, reverse=True):
+                        ws_d.delete_rows(row_idx)
+                        print(f"[update_debt] FIFO 刪除 row {row_idx}（{sid} 該列欠時已歸零）")
+
+            execute_with_retry(_update_debts)
+            return True
+        except Exception as e:
+            print(f"[update_student_debt] {e}")
+            return False
+
+    # ── 愛校服務申請單 Excel 模板（base64 嵌入，避免外部檔案依賴）──
+    _APPEAL_FORM_TEMPLATE_B64 = (
+        "UEsDBBQABgAIAAAAIQBBN4LPbgEAAAQFAAATAAgCW0NvbnRlbnRfVHlwZXNdLnhtbCCiBAIooAACAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACsVMluwjAQvVfqP0S+Vomhh6qqCBy6HFsk6AeYeJJY"
+        "JLblGSj8fSdmUVWxCMElUWzPWybzPBit2iZZQkDjbC76WU8kYAunja1y8T39SJ9FgqSsVo2zkIs1oBgN"
+        "7+8G07UHTLjaYi5qIv8iJRY1tAoz58HyTulCq4g/QyW9KuaqAvnY6z3JwlkCSyl1GGI4eINSLRpK3le8"
+        "vFEyM1Ykr5tzHVUulPeNKRSxULm0+h9J6srSFKBdsWgZOkMfQGmsAahtMh8MM4YJELExFPIgZ4AGLyPd"
+        "usq4MgrD2nh8YOtHGLqd4662dV/8O4LRkIxVoE/Vsne5auSPC/OZc/PsNMilrYktylpl7E73Cf54GGV8"
+        "9W8spPMXgc/oIJ4xkPF5vYQIc4YQad0A3rrtEfQcc60C6Anx9FY3F/AX+5QOjtQ4OI+c2gCXd2EXka46"
+        "9QwEgQzsQ3Jo2PaMHPmr2w7dnaJBH+CW8Q4b/gIAAP//AwBQSwMEFAAGAAgAAAAhALVVMCP0AAAATAIA"
+        "AAsACAJfcmVscy8ucmVscyCiBAIooAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACskk1P"
+        "wzAMhu9I/IfI99XdkBBCS3dBSLshVH6ASdwPtY2jJBvdvyccEFQagwNHf71+/Mrb3TyN6sgh9uI0rIsS"
+        "FDsjtnethpf6cXUHKiZylkZxrOHEEXbV9dX2mUdKeSh2vY8qq7iooUvJ3yNG0/FEsRDPLlcaCROlHIYW"
+        "PZmBWsZNWd5i+K4B1UJT7a2GsLc3oOqTz5t/15am6Q0/iDlM7NKZFchzYmfZrnzIbCH1+RpVU2g5abBi"
+        "nnI6InlfZGzA80SbvxP9fC1OnMhSIjQS+DLPR8cloPV/WrQ08cudecQ3CcOryPDJgosfqN4BAAD//wMA"
+        "UEsDBBQABgAIAAAAIQBvQjIgSQMAAAgHAAAPAAAAeGwvd29ya2Jvb2sueG1spFVdb9s2FH0fsP9A8F0W"
+        "aX3YEeIUthxjAdoh2Nb2caAlOiIiiRpJfwRF3wpsQFFgA9oCRQdsfenLsL503/s7s9P9i11KtpPUL1kq"
+        "2KSoax+ee8+51P6tRZGjGVdayLKHaYtgxMtEpqI86eG7X4ycLkbasDJluSx5D59xjW8dfPzR/lyq07GU"
+        "pwgASt3DmTFV5Lo6yXjBdEtWvITIRKqCGViqE1dXirNUZ5ybInfbhIRuwUSJG4RIXQdDTiYi4UOZTAte"
+        "mgZE8ZwZoK8zUekNWpFcB65g6nRaOYksKoAYi1yYsxoUoyKJjk5Kqdg4h7QXNEALBZ8QvpTA0N7sBKGd"
+        "rQqRKKnlxLQA2m1I7+RPiUvplRIsdmtwPSTfVXwmrIZbViq8IatwixVegFHywWgUrFV7JYLi3RAt2HJr"
+        "44P9icj5vca6iFXVp6ywSuUY5Uybw1QYnvZwB5Zyzq88UNNqMBU5RNudPa+N3YOtnY8VLED7fm64Kpnh"
+        "sSwNWG1N/UNtVWPHmQQTo8/4V1OhOPQOWAjSgZElERvrY2YyNFV5UyQNXZW2UpnoVi5mvFVy4wZhm/iE"
+        "8m4w5gkJqLt6/vU/f/8GfvKXP/+x/POX5V+v3dU337179fL86Q/nvz7699nvy2evXdpdPXq5+vHV8tsn"
+        "y+dv3EsWZrv98j9MzBJbQxfq1uTW3L9fQ0hRRRujHhuF4P5oeBvE+pzNQDowCKRZd/YRaNP98sHIi/f6"
+        "oTdwBv2YOj4Zxs5g2N1zuqNu4NGR1+n344eQhQqjRLKpydZ2sJg97IP2O6E7bLGJUBJNRXqx/wOyvhw7"
+        "vzdsYg9tpvbguyf4XF8Yxy7R4r4oUznvYYeSAKOzzRIym9eR+yI1GZyzfmjboXn2CRcnGdClQdCFP0F3"
+        "WFo9fIXOsKEzgsuxwxU67iU+9fkKvOoZlXVPNKKvvn+yfPzi/Onbdz89BvXhXLdHsa00xUhFdkt1lNJa"
+        "yQ1KwvLkWCE72R8SG+QLc1ubegaXCiA6pP4e8Q77jufFvuN3Rh1QiASO53f8OPAHh5R0rEz2TREt8nky"
+        "u1n/t31389qJLx/Za9VtD1nwaP0+Q5qbdcjmaB0K3JuxzmCLdvAfAAAA//8DAFBLAwQUAAYACAAAACEA"
+        "gT6Ul/MAAAC6AgAAGgAIAXhsL19yZWxzL3dvcmtib29rLnhtbC5yZWxzIKIEASigAAEAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAArFJNS8QwEL0L/ocwd5t2FRHZdC8i7FXrDwjJtCnbJiEzfvTfGyq6XVjWSy8Db4Z5783Hdvc1"
+        "DuIDE/XBK6iKEgR6E2zvOwVvzfPNAwhi7a0egkcFExLs6uur7QsOmnMTuT6SyCyeFDjm+CglGYejpiJE"
+        "9LnShjRqzjB1Mmpz0B3KTVney7TkgPqEU+ytgrS3tyCaKWbl/7lD2/YGn4J5H9HzGQlJPA15ANHo1CEr"
+        "+MFF9gjyvPxmTXnOa8Gj+gzlHKtLHqo1PXyGdCCHyEcffymSc+WimbtV7+F0QvvKKb/b8izL9O9m5MnH"
+        "1d8AAAD//wMAUEsDBBQABgAIAAAAIQDo3dDimgYAAOkZAAAYAAAAeGwvd29ya3NoZWV0cy9zaGVldDEu"
+        "eG1snJTbbtswDIbvB+wdDN3Hp5yNOMWwImtvhmJpt2tFpmMhluVJymnD3n2UYjsFMgxug0SUZerTT4rM"
+        "4u4kSu8ASnNZpSTyQ+JBxWTGq21KXp5XgxnxtKFVRktZQUrOoMnd8uOHxVGqnS4AjIeESqekMKZOgkCz"
+        "AgTVvqyhwje5VIIafFTbQNcKaOY2iTKIw3ASCMorciEkqg9D5jlncC/ZXkBlLhAFJTWoXxe81i1NsD44"
+        "QdVuXw+YFDUiNrzk5uygxBMsedxWUtFNiXGfohFl3knhN8bfsD3Grd+cJDhTUsvc+EgOLppvw58H84Cy"
+        "jnQbfy9MNAoUHLi9wCsqfp+kaNyx4its+E7YpIPZdKlkz7OU/A6bzwBtZIfwOrTv/pDlwtXJk1ouarqF"
+        "NZiX+kl5OTfP8gkXsFZJsFwEnVfGsSBsEjwFeUo+RcmXOLQuzuM7h6N+NfcM3ayhBGYANUXE+yWlWDNq"
+        "r3qKPdA9frX1W14WbclvpNxZ2CNuC61KB7HHUmb4AT5Did4PY+yan04ITjuddmOr+bWilWsSDC+DnO5L"
+        "800eH4BvC4PSxv4UYa7Mkux8D5ph3ePZfuzATJYYF46e4LaBsW7pydkjz0yBs5k/isfTWYT+2MlnGyF6"
+        "sb02UvxofKzEjoE37xhoW0bkT6NwPrRKeiHwvh0CbYOY/4uwAW1W3Eb5X0Gjhoa2ocXDtwaFyp0itC0j"
+        "9uPZOBpPeidm0jDQtomJ/WgU9idMGwLaa2rfqAL/kC9XPBnOrhmZ3wqxZefK4y8AAAD//wAAAP//rJjt"
+        "btowFIZvBeUCCg7hqwKkJXa820AMrf2xdmpYt939jjmOfT4sTUH0T6unxwce27Ff2A8vl8vVnq6n4/7j"
+        "/ffs41CZajb8PL0N8Nfzppq9XA/Vcve0Wy3Iz7KanX8N1/cfXy+v30MFDPpjmtP5+dtfexnOlzdgi6d6"
+        "VR3359D0S+gKZatqBv8ZAH8eF/v553E/P8eSNpXMI+kUsYo4RXpFPCVz0EyudcF1slpocqiaanzbrQSd"
+        "BFYCJ0EvgSeAKcBSyOWq109gPHGBQh9YIHiZtEBmJVYo1pik2pVGNXyUVaMcEroXzJIP6rEkT6ongPk3"
+        "2n9123lTJyA0OlQ74r8T+lhhFnSKDK/pYg282zyNYj5SybhhXCTwKw8ST0dfqlnzzr5UU6caNm0w+XLb"
+        "wLRN3zahT5i1tPkl6BCsU4WVwCFYpooeQZ2AJ4BZrB9kEfowCwk6BMRCAoeAWCAgFgQwCzhlH7IWoQ+z"
+        "QJDfQYeAWEjgEBAL2cMTwCy2D7IIfZgFAmKBgFhI4BAQC9nDE8As4Pl/yFqEPswCAbFAQCwkcAiIhezh"
+        "CWAW4Yx6iMatEfOIhIhEQkwUcZEQF9XHU8JtCpHkrsPKYBAgp1Uk1AZrqI0kLo6iNlhDHnbamdsUQsd9"
+        "NhgJqA0SaoOE2kjiwp0Pe5XayD4+1tw6c5tS/thAXJyeEPGGh+MlXYL57rqFyNaMJTkhSmJVjVOkj2Sb"
+        "LxhKuF8pX4RgOzkA4+VMYqKRpFPEKuIU6RXxlHCbwrVfm7tWC6/kMG9puUSGa0PaD5ky76xOI6uR06jX"
+        "yDPENQu54E5NvLMNXBdJU+Tb1sQaGh1Fcu5yzbh17YhoaxHoXKlmI5Jy6eW3Ihiyl+dTVQgfTXNHEDQy"
+        "ObSR5B3fKWLVKKdIr0Z5SrhNIYRsJ8jA4oyfgkUQ+M+nW7yIwzTnBC8WoTWpKB9fClld5TTqNfIMsVmp"
+        "C2nA3LPGt0bwQNMz2oj92OaipKmR1chp1GvkGULNef4S4x8AAAD//wAAAP//bJJRbsIwDIavEuUAoym0"
+        "pRFFYulgPEyaxC5QwG2jlSRKzabt9DMItof5Lc4X+/9tZ3GC2IGBYRjFwZ8dVjJN5XLxey0itJVcqVJv"
+        "VCkn/0ma6E2aMORR5dqonCUFkYIha8rZsDlrVRDhcoxKda1Szpua6ic1ZXWmVI0jK0WArZURyNgJ0AA4"
+        "DZLgFWZUacZkmELXbIdzXc+596WuuZ0YldBEuJ0YpYhw/ZmZrllPma65rk2u6+tuJ38/aLkIvXeA9vAa"
+        "Resdbo+VzKXArwCVdN549wFxtN5dmglNBy9N7KwbxQAt/bzkoZAi2q6/n9GHyy2V2HtEf7oFPTRHiJcg"
+        "k6Tj8R7cqu4Az0GEJkDc2W+SLqUYD81ApzkptBbf/DPcdKTw0YLDBslXJYOPGBuLZERbsh+3x+u4Jp8+"
+        "vo89AC5/AAAA//8DAFBLAwQUAAYACAAAACEA6aYluGYGAABTGwAAEwAAAHhsL3RoZW1lL3RoZW1lMS54"
+        "bWzsWc1uGzcQvhfoOxB7TyzZkmIZkQNLluI2cWLYSoocqV1qlxF3uSApO7oVybFAgaJp0UuB3noo2gZI"
+        "gF7Sp3Gbok2BvEKH5EpaWlRsJwb6Fx1sLffj/M9whrp67UHK0CERkvKsFVQvVwJEspBHNItbwZ1+79J6"
+        "gKTCWYQZz0grmBAZXNt8/72reEMlJCUI9mdyA7eCRKl8Y2VFhrCM5WWekwzeDblIsYJHEa9EAh8B3ZSt"
+        "rFYqjZUU0yxAGU6B7O3hkIYE9TXJYHNKvMvgMVNSL4RMHGjSxNlhsNGoqhFyIjtMoEPMWgHwifhRnzxQ"
+        "AWJYKnjRCirmE6xsXl3BG8UmppbsLe3rmU+xr9gQjVYNTxEPZkyrvVrzyvaMvgEwtYjrdrudbnVGzwBw"
+        "GIKmVpYyzVpvvdqe0iyB7NdF2p1KvVJz8SX6awsyN9vtdr1ZyGKJGpD9WlvAr1cata1VB29AFl9fwNfa"
+        "W51Ow8EbkMU3FvC9K81GzcUbUMJoNlpAa4f2egX1GWTI2Y4Xvg7w9UoBn6MgGmbRpVkMeaaWxVqK73PR"
+        "A4AGMqxohtQkJ0McQhR3cDoQFGsGeIPg0hu7FMqFJc0LyVDQXLWCD3MMGTGn9+r596+eP0Wvnj85fvjs"
+        "+OFPx48eHT/80dJyNu7gLC5vfPntZ39+/TH64+k3Lx9/4cfLMv7XHz755efP/UDIoLlEL7588tuzJy++"
+        "+vT37x574FsCD8rwPk2JRLfIEdrnKehmDONKTgbifDv6CabODpwAbQ/prkoc4K0JZj5cm7jGuyugePiA"
+        "18f3HVkPEjFW1MP5RpI6wF3OWZsLrwFuaF4lC/fHWexnLsZl3D7Ghz7eHZw5ru2Oc6ia06B0bN9JiCPm"
+        "HsOZwjHJiEL6HR8R4tHuHqWOXXdpKLjkQ4XuUdTG1GuSPh04gTTftENT8MvEpzO42rHN7l3U5syn9TY5"
+        "dJGQEJh5hO8T5pjxOh4rnPpI9nHKyga/iVXiE/JgIsIyrisVeDomjKNuRKT07bktQN+S029gqFdet++y"
+        "SeoihaIjH82bmPMycpuPOglOc6/MNEvK2A/kCEIUoz2ufPBd7maIfgY/4Gypu+9S4rj79EJwh8aOSPMA"
+        "0W/GoqjaTv1Nafa6YswoVON3xXh6Om3B0eRLiZ0TJXgZ7l9YeLfxONsjEOuLB8+7uvuu7gb/+bq7LJfP"
+        "Wm3nBRaa5HlfbLrkdGmTPKSMHagJIzel6ZMlHBZRDxZNA2+muNnQlCfwtSjuDi4W2OxBgquPqEoOEpxD"
+        "j101I18sC9KxRDmXMNuZZTN8khO0zThJoc02k2Fdzwy2Hkisdnlkl9fKs+GMjJkUYzN/ThmtaQJnZbZ2"
+        "5e2YVa1US83mqlY1oplS56g2Uxl8uKgaLM6sCV0Igt4FrNyAEV3LDrMJZiTSdrdz89QtmvWFukgmOCKF"
+        "j7Teiz6qGidNY2UaRh4f6TnvFB+VuDU12bfgdhYnldnVlrCbeu9tvDQdbude0nl7Ih1ZVk5OlqGjVtCs"
+        "r9YDFOK8FQxhrIWvaQ5el7rxwyyGu6FQCRv2pyazCde5N5v+sKzCTYW1+4LCTh3IhVTbWCY2NMyrIgRY"
+        "ZoZwI/9qHcx6UQrYSH8DKdbWIRj+NinAjq5ryXBIQlV2dmnF3FEYQFFK+VgRcZBER2jAxmIfg/t1qII+"
+        "EZVwO2Eqgn6AqzRtbfPKLc5F0pUvsAzOrmOWJ7gotzpFp5ls4SaPZzKYJyutEQ9088pulDu/KiblL0iV"
+        "chj/z1TR5wlcF6xF2gMh3OQKjHS+tgIuVMKhCuUJDXsCLrlM7YBogetYeA1BBffJ5r8gh/q/zTlLw6Q1"
+        "TH1qn8ZIUDiPVCII2YOyZKLvFGLV4uyyJFlByERUSVyZW7EH5JCwvq6BDX22ByiBUDfVpCgDBncy/tzn"
+        "IoMGsW5y/qmdj03m87YHujuwLZbdf8ZepFYq+qWjoOk9+0xPNSsHrznYz3nU2oq1oPFq/cxHbQ6XPkj/"
+        "gfOPipDZHyf0gdrn+1BbEfzWYNsrBFF9yTYeSBdIWx4H0DjZRRtMmpRtWIru9sLbKLiRLjrdGV/I0jfp"
+        "dM9p7Flz5rJzcvH13ef5jF1Y2LF1udP1mBqS9mSK6vZoOsgYx5hftco/PPHBfXD0Nlzxj5mS9mr/AVzx"
+        "wZRhfySA5LfONVs3/wIAAP//AwBQSwMEFAAGAAgAAAAhAHhwoFUfBAAAMBYAAA0AAAB4bC9zdHlsZXMu"
+        "eG1s5FjNiuNGEL4H8g6i7xr9WPLaRtKyXo9gYQOBmUCubbllN9vqFq32rLwhkGNOOYWQfYCFQHLYQyB5"
+        "oDBJ3iLV+rE1rD1ee73JmDAwVrdaX33VVV1dVcHjMmPGDZEFFTxEzoWNDMITMaN8HqIvrmNzgIxCYT7D"
+        "THASohUp0OPo00+CQq0YuVoQogyA4EWIFkrlI8sqkgXJcHEhcsLhTSpkhhUM5dwqcknwrNAfZcxybbtv"
+        "ZZhyVCOMsuR9QDIsXyxzMxFZjhWdUkbVqsJCRpaMns25kHjKgGrpeDgxSqcvXaOUrZBq9h05GU2kKESq"
+        "LgDXEmlKE/Iu3aE1tHCyQQLk45Ac37LdO7qX8kgkz5LkhmrzoShIBVeFkYglVyEaAlG9BaMXXLzksX4F"
+        "Fm5WRUHxyrjBDGYcZEVBIpiQhgLTwc5VMxxnpF5x+8PbP399e/vjd3///L1em+KMslX9ztUTlcmbxRkF"
+        "A+hJS5OpKR0k7KfXt29+2yLJq2gusCzA5Wrmvf4eQR0dTgRra4knhx1+FNTBxrByPg1RHPdt/fevqHCP"
+        "z/R2WfIAP6r87uR2cE+1N5XzF+D9lLH1gXT12YOJKIDIpYjkMQyM5vl6lcPJ4xBka5+u1u1ZPZd45bh+"
+        "5wOrEhgFUyFnENTbUKAl11NRwEiqwIclnS/0rxI5/J8KpSDwRcGM4rngmOkD3H7R/RIuA4j7IVILiNtt"
+        "2MBLJZqoYWn4Bn3v2opDRWHvUqDZsty7tlZmuy6NUmCahDB2pZX5Ml3vk46OZWrwZRZn6tksRHAd6jDW"
+        "PoJRmsd6T+qB3qsuWo3dgQW3OgbXKNO1gF2sHCC4ndX6awPnOVvp+N/YaBdWbwcWyGiZ3MWqR+PK1zR2"
+        "PX7C6JxnpBYXBbgdGgsh6SugoW+dBN4TuJQh9VA06c68lDi/JmVL1irT3Xu3S/v3ZgymO3RnP+JuaEe6"
+        "T133IRhoH8nz86Kz2NZH/7/DeYpwss9bPziCnF/MO5zxWcQl45CL48gjrxO2zUX3H158584fugpb05aH"
+        "m2p4hyZae47ZJvGB1BYd5Lz+iamcPi87Mgd4MMfrXPhXZQcUGp1q5k4ts65KDF0qh+iP37/569tfOun8"
+        "dEmZonxLHQOYs3JTGVWFsdKNtapmWkuBAmlGUrxk6nr9MkSb58/IjC4zaEU1qz6nN0JVECHaPD/XxahT"
+        "dXMg839eQAUJv8ZS0hB9dTl+NJxcxq45sMcD0+sR3xz644npe0/Hk0k8tF376ded9t4HNPeqbiSUBI43"
+        "Khi0AGWjbEP+ajMXos6gpl+V4UC7y33o9u0nvmObcc92TK+PB+ag3/PN2HfcSd8bX/qx3+HuH9kEtC3H"
+        "qduJmrw/UjQjjPLWVq2FurNgJBjeo4TVWsLatHqjfwAAAP//AwBQSwMEFAAGAAgAAAAhAMJWolR1AgAA"
+        "dgUAABQAAAB4bC9zaGFyZWRTdHJpbmdzLnhtbKSUz1PaQBTH78zwP2Ryag812IPTdgIenOlMbz20fwAD"
+        "UZiBDSWhU28pYqVSQGsoRTID6FCxCGL5FQX0jyG7G078C32AtRV6Mjlkf7y3331v32eXX/0QDDDvhbDk"
+        "F5GTXV5ysIyAPKLXjzac7Ns3L588YxlJdiOvOyAiwcluChK76rLbeEmSGViLJCfrk+XQC46TPD4h6JaW"
+        "xJCAwLIuhoNuGYbhDU4KhQW3V/IJghwMcE8djhUu6PYjlvGIESTDvs9ZJoL87yLC2t2Ei5f8Ll52kdIW"
+        "1r5iPUqrCUOv4eMjXO/gzCdc06laGO12Rx9TQyVFYnlSLBEtiRO5oZKmatOsJsxShedkF89NpGZyuFs2"
+        "BhrePsH1ywXbXtysxG+VclGS0Rc8zk+HikIKZfjTxmDSLy46NVJYr84vhWDNvkrbsVGmO28z9J7R65FM"
+        "Dte/L2xZ0yGlmce8DTL+j9osAeMqQdWL6YqQD2on+z2vw8y6iORXXie7wjLyZggKisQ1Ed0CwHL3juru"
+        "IEbfDuw2s901b2JW9GgyRXZ+2W20f0XyRZItE61gtz3Cly2ixWH42JJ46xxqZ7eRv3V7YNoAFtTVzBWs"
+        "hINPDkAE7yUt5ZSuTThrHVqKRK8CI6PTLFE7cPaNAa0WreiN+3GincHNArrMUh6wBqZps0fbF+bOT5zI"
+        "UPXIPB6M+1/w1rZxnSeduFn7gfd3jcENVSswb+hJfJ39c3OjOJ7FycYMh3H/kDT2sZZg4AMwJg3AMW2y"
+        "5XH/syWemxUSS0+2+OetmD0UMAnxzOJklhlyVhppyj23KV5gwo00IDZUog+LhIN30/UbAAD//wMAUEsD"
+        "BBQABgAIAAAAIQA7bTJLwQAAAEIBAAAjAAAAeGwvd29ya3NoZWV0cy9fcmVscy9zaGVldDEueG1sLnJl"
+        "bHOEj8GKwjAURfcD/kN4e5PWhQxDUzciuFXnA2L62gbbl5D3FP17sxxlwOXlcM/lNpv7PKkbZg6RLNS6"
+        "AoXkYxdosPB72i2/QbE46twUCS08kGHTLr6aA05OSonHkFgVC7GFUST9GMN+xNmxjgmpkD7m2UmJeTDJ"
+        "+Ysb0Kyqam3yXwe0L0617yzkfVeDOj1SWf7sjn0fPG6jv85I8s+ESTmQYD6iSDnIRe3ygGJB63f2nmt9"
+        "DgSmbczL8/YJAAD//wMAUEsDBBQABgAIAAAAIQA/mcwOIwEAAOQGAAAnAAAAeGwvcHJpbnRlclNldHRp"
+        "bmdzL3ByaW50ZXJTZXR0aW5nczEuYmlucmNwY1Bg8GYwZTBkMGIoALLTGPIZioC0I5CXCmQXMwSARUoY"
+        "dBnCGDyBUIHBGajelAEEGFmY2e4wcLAx/29gZ2TgZJjFbcKRwsDIwM8QwcTEwAQkmYE8RwYTsGrqEIxQ"
+        "Y0A0DP8HAnTTXTz9QpUYIhi3MIcwOc2uPYDPdm64JAvUVIjZVHT2qFGDPARg6YoYZ0YAFQf7hniB1Aow"
+        "eJCidTQd4AmBECYGBreACDcGBo4cZPYfMYim//XImlFKAma0SACaBM7KJhyz4LkbLAaRGI0GpBBwRC+f"
+        "mRlYgdJM4PIVWBIyMjGkMDAxWupBSn1wwIIKdkQBDDEsBWYmC5wFUaPHQB4E2sHIieRQRoYTQNcwTEON"
+        "PaAihABGXgQAAAD//wMAUEsDBBQABgAIAAAAIQCRHyoEaAEAAJgCAAARAAgBZG9jUHJvcHMvY29yZS54"
+        "bWwgogQBKKAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMkk1OwzAUhPdI3CHyPnV+lKqyklQC1BWVKlEEYmfZryUi"
+        "cSzbkOYk7FghdlyA8wDnwEmakAILlsnMfJp5cjzfFbnzAEpnpUiQP/GQA4KVPBPbBF2uF+4MOdpQwWle"
+        "CkhQDRrN0+OjmEnCSgUrVUpQJgPtWJLQhMkE3RojCcaa3UJB9cQ6hBU3pSqosZ9qiyVld3QLOPC8KS7A"
+        "UE4NxQ3QlQMR7ZGcDUh5r/IWwBmGHAoQRmN/4uNvrwFV6D8DrTJyFpmppd20rztmc9aJg3uns8FYVdWk"
+        "Ctsatr+Pr5fnF+1UNxPNrRigNOaMMAXUlCpt9st6l8d49LM5YE61WdpbbzLgJ3X6/vb68fLsfD49xvi3"
+        "2gdWKhMGeBp4wdT1Qjf0115A/IhEwc2Q6022Rru66wLcsTtIt7pXrsLTs/UCHfB8EkXEiyzvR77Z1QGL"
+        "fe9/Em3DKQlnI2IPSNvSh28p/QIAAP//AwBQSwMEFAAGAAgAAAAhAA1ANB6tAQAADAMAABAACAFkb2NQ"
+        "cm9wcy9hcHAueG1sIKIEASigAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAnJLBahsxEIbvhb7DonusdRpCMFqFkjTk"
+        "0FKDndxV7awtKkuLNFnsnnsLvYVAaA7NoVAo9NJDT32b2s1jdHaXOOskp95m5h9+ffolsT+f2aSCEI13"
+        "Gev3UpaA0z43bpKxk/HR1h5LIiqXK+sdZGwBke3L58/EMPgSAhqICVm4mLEpYjngPOopzFTskexIKXyY"
+        "KaQ2TLgvCqPh0OuzGTjk22m6y2GO4HLIt8q1IWsdBxX+r2nudc0XT8eLkoCleFmW1miFdEv5xujgoy8w"
+        "eTXXYAXvioLoRqDPgsGFTAXvtmKklYUDMpaFshEEvx+IY1B1aENlQpSiwkEFGn1IovlAsW2z5J2KUONk"
+        "rFLBKIeEVa+1TVPbMmKQy19f//y+vr35Jjjp7awpu6vd2uzIfrNAxeZibdBykLBJODZoIb4thirgE8D9"
+        "LnDD0OK2OKuPn1dfblbXn5bnV38vft5+P19e/niE2wRABz846rVx7+NJOfaHCuEuyc2hGE1VgJzCXye9"
+        "HohjCjHY2uRgqtwE8rudx0L97qft55b93V76IqUn7cwEv//G8h8AAAD//wMAUEsBAi0AFAAGAAgAAAAh"
+        "AEE3gs9uAQAABAUAABMAAAAAAAAAAAAAAAAAAAAAAFtDb250ZW50X1R5cGVzXS54bWxQSwECLQAUAAYA"
+        "CAAAACEAtVUwI/QAAABMAgAACwAAAAAAAAAAAAAAAACnAwAAX3JlbHMvLnJlbHNQSwECLQAUAAYACAAA"
+        "ACEAb0IyIEkDAAAIBwAADwAAAAAAAAAAAAAAAADMBgAAeGwvd29ya2Jvb2sueG1sUEsBAi0AFAAGAAgA"
+        "AAAhAIE+lJfzAAAAugIAABoAAAAAAAAAAAAAAAAAQgoAAHhsL19yZWxzL3dvcmtib29rLnhtbC5yZWxz"
+        "UEsBAi0AFAAGAAgAAAAhAOjd0OKaBgAA6RkAABgAAAAAAAAAAAAAAAAAdQwAAHhsL3dvcmtzaGVldHMv"
+        "c2hlZXQxLnhtbFBLAQItABQABgAIAAAAIQDppiW4ZgYAAFMbAAATAAAAAAAAAAAAAAAAAEUTAAB4bC90"
+        "aGVtZS90aGVtZTEueG1sUEsBAi0AFAAGAAgAAAAhAHhwoFUfBAAAMBYAAA0AAAAAAAAAAAAAAAAA3BkA"
+        "AHhsL3N0eWxlcy54bWxQSwECLQAUAAYACAAAACEAwlaiVHUCAAB2BQAAFAAAAAAAAAAAAAAAAAAmHgAA"
+        "eGwvc2hhcmVkU3RyaW5ncy54bWxQSwECLQAUAAYACAAAACEAO20yS8EAAABCAQAAIwAAAAAAAAAAAAAA"
+        "AADNIAAAeGwvd29ya3NoZWV0cy9fcmVscy9zaGVldDEueG1sLnJlbHNQSwECLQAUAAYACAAAACEAP5nM"
+        "DiMBAADkBgAAJwAAAAAAAAAAAAAAAADPIQAAeGwvcHJpbnRlclNldHRpbmdzL3ByaW50ZXJTZXR0aW5n"
+        "czEuYmluUEsBAi0AFAAGAAgAAAAhAJEfKgRoAQAAmAIAABEAAAAAAAAAAAAAAAAANyMAAGRvY1Byb3Bz"
+        "L2NvcmUueG1sUEsBAi0AFAAGAAgAAAAhAA1ANB6tAQAADAMAABAAAAAAAAAAAAAAAAAA1iUAAGRvY1By"
+        "b3BzL2FwcC54bWxQSwUGAAAAAAwADAAmAwAAuSgAAAAA"
+    )
+
+    def generate_appeal_form_excel(student_id, cls_name, records):
+        """[愛校2.0] 生成消警告申請單 Excel，直接套用學校官方模板，100% 保留原版格式。"""
+        import base64
+        from openpyxl import load_workbook
+
+        # 從嵌入模板載入（保留所有框線、合併、字型、列印設定）
+        tmpl_bytes = base64.b64decode(_APPEAL_FORM_TEMPLATE_B64)
+        wb = load_workbook(io.BytesIO(tmpl_bytes))
+        ws = wb.active
+
+        # ── Row 3：填入班級 / 學號（姓名欄留空，手寫）──
+        # A3='班　級'(label) B3=班級值  C3='姓　名'(label) D3=空  E3='學　號'(label) F3:G3=學號值
+        from openpyxl.styles import Alignment
+        _ac = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        ws['B3'] = cls_name
+        ws['B3'].alignment = _ac          # [Fix] 置中
+        ws['D3'] = ''
+        ws['F3'] = str(student_id)        # F3:G3 merged，填左上角
+        ws['F3'].alignment = _ac          # [Fix] 置中
+
+        # ── Row 5-12：填入服務紀錄（最多 8 列）──
+        # 欄對應：A=愛校事由, B=缺曠日期(留空), C:D(merged)=工作內容, E=時間起迄(含日期), F=師長驗收(留空), G=累計時數
+        total_hours = 0.0
+        for i in range(8):
+            r = 5 + i
+            if i < len(records):
+                rec = records[i]
+                h = 0.0
+                try: h = float(rec.get('hours', 0))
+                except (ValueError, TypeError): pass
+                st       = rec.get('start_time', '')
+                et       = rec.get('end_time', '')
+                rec_date = rec.get('date', '')
+                # [Fix] 時間起迄加上日期，格式：YYYY-MM-DD\nHH:MM~HH:MM
+                if rec_date and (st or et):
+                    time_str = f"{rec_date}\n{st}~{et}" if (st and et) else f"{rec_date}\n{st}"
+                elif st or et:
+                    time_str = f"{st}~{et}" if (st and et) else st
+                else:
+                    time_str = rec_date
+                ws.cell(row=r, column=1).value = '消警告'
+                ws.cell(row=r, column=2).value = None          # [Fix] 缺曠日期留空，手填
+                ws.cell(row=r, column=3).value = rec.get('work_content', '')  # C:D merged，填C
+                ws.cell(row=r, column=5).value = time_str
+                ws.cell(row=r, column=7).value = h if h else None
+                total_hours += h
+            else:
+                # 空白列：清除可能殘留的樣板文字
+                for col in (1, 2, 3, 5, 7):
+                    ws.cell(row=r, column=col).value = None
+
+        # ── Row 13：合計愛校時數 → F13（F13:G13 merged）──
+        ws['F13'] = round(total_hours, 2)
+
+        # ── Row 20：列印日期 ──
+        now_tw = datetime.now(TW_TZ)
+        roc_y  = now_tw.year - 1911
+        ws['A20'] = (
+            f'（本表由衛生組系統自動產製，僅供消警告使用，不得銷過。'
+            f'列印日期：民國 {roc_y} 年 {now_tw.month} 月 {now_tw.day} 日）'
+        )
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return buf.getvalue()
 
     PUBLISHED_COLS = ["週次", "排名", "年級", "班級", "總扣分", "優良次數", "總成績", "評等", "排名模式", "發布時間"]
 
@@ -1445,6 +2294,29 @@ try:
         st.title("🤝 愛校服務認領區")
         st.info("💡 這裡的任務清單與 Notion 行事曆即時同步！成功認領後，任務會自動標記並更新。")
         
+        # [新增] 愛校服務 2.0：欠時查詢
+        with st.expander("🔍 查詢我的欠時與明細"):
+            _query_sid = st.text_input("請輸入你的學號", placeholder="例如：112001", key="debt_query_sid")
+            if st.button("🔎 查詢", key="debt_query_btn"):
+                if not _query_sid:
+                    st.error("請先輸入學號！")
+                else:
+                    _debts_map = load_student_debts()
+                    _my_hours = _debts_map.get(clean_id(_query_sid), 0.0)
+                    if _my_hours > 0:
+                        st.warning(f"⚠️ 你目前共有 **{_my_hours}** 小時的欠時尚未歸還。")
+                        # [新增] 顯示 Google Sheet 中的備註說明
+                        _debt_note = load_student_debt_note(clean_id(_query_sid))
+                        if _debt_note:
+                            st.info(f"📝 備註說明：{_debt_note}")
+                        _hist_df = load_debt_history(clean_id(_query_sid))
+                        if not _hist_df.empty:
+                            st.dataframe(_hist_df, hide_index=True)
+                        else:
+                            st.caption("暫無歷史異動紀錄。")
+                    else:
+                        st.success("🎉 你目前沒有欠時紀錄，繼續保持！")
+
         n_token = st.secrets.get("notion_token") or st.secrets.get("system_config", {}).get("notion_token")
         if not NOTION_INSTALLED:
             st.error("⚠️ 系統偵測到未安裝 `notion-client` 套件，請通知管理員檢查系統設定。")
@@ -1473,6 +2345,8 @@ try:
                         with col2:
                             with st.form(f"claim_form_{t['id']}"):
                                 s_id = st.text_input("請輸入您的【學號】來認領：", placeholder="例如：112001", key=f"claim_sid_{t['id']}")
+                                # [新增] 愛校服務 2.0：服務目的選擇
+                                purpose_choice = st.selectbox("本次愛校服務目的", ["還時數", "消警告", "糾察懲罰"], key=f"claim_purpose_{t['id']}")
                                 if st.form_submit_button("🚀 確認認領", use_container_width=True):
                                     if time.time() - st.session_state.last_action_time < 3:
                                         st.warning("⚠️ 系統處理中，請勿連續點擊！")
@@ -1480,8 +2354,17 @@ try:
                                         st.error("學號不能為空！")
                                     else:
                                         st.session_state.last_action_time = time.time()
+                                        # [新增] 愛校服務 2.0：欠時防呆
+                                        _purpose = purpose_choice
+                                        _debts_check = load_student_debts()
+                                        _my_debt = _debts_check.get(clean_id(s_id), 0.0)
+                                        if _my_debt > 0 and _purpose != "還時數":
+                                            _purpose = "還時數"
+                                            st.warning(f"⚠️ 你目前仍有 {_my_debt} 小時欠時未還，本次目的已自動改為「還時數」！")
+                                        # [Debug] 記錄實際寫入 Notion 的 purpose_tag
+                                        print(f"[claim] sid={s_id}, purpose_tag='{_purpose}', label will be: {s_id}({_purpose})")
                                         with st.spinner("連線至 Notion 更新看板中..."):
-                                            success, msg = claim_notion_task(t['id'], s_id)
+                                            success, msg = claim_notion_task(t['id'], s_id, purpose_tag=_purpose)
                                         if success:
                                             if msg == "滿團":
                                                 st.success(f"✅ 學號 {s_id} 認領成功！此任務已額滿，自動從看板隱藏。")
@@ -2337,9 +3220,9 @@ try:
         pwd_input = st.text_input("管理密碼", type="password", key="admin_pwd")
         if pwd_input == st.secrets["system_config"]["admin_password"]:
             
-            t_mon, t_rollcall, t4, t_appeal, t_excellent, t2, t1, t_settings, t3 = st.tabs([
+            t_mon, t_rollcall, t4, t_appeal, t_excellent, t2, t1, t_settings, t3, t_debt = st.tabs([
                 "👀 衛生糾察", "👮 環保糾察", "📝 扣分明細", "📣 申訴", "⭐ 優良審核", "📊 成績總表", 
-                "🧹 晨掃審核", "⚙️ 設定", "🎖️ 服務時數發放"
+                "🧹 晨掃審核", "⚙️ 設定", "🎖️ 服務時數發放", "🤝 愛校與欠時管理"  # [新增] 愛校服務 2.0
             ])
             
             with t_mon:
@@ -2429,12 +3312,21 @@ try:
 
             with t_appeal:
                 st.subheader("📣 申訴審核")
+
+                # [Fix] 用 session_state 紀錄本地已排入佇列的申訴 ID，避免重複顯示
+                if "queued_appeal_ids" not in st.session_state:
+                    st.session_state.queued_appeal_ids = set()
+
                 ap_df = load_appeals()
                 pending_aps = ap_df[ap_df["處理狀態"]=="待處理"]
+                # 過濾掉已排入佇列的
+                if not pending_aps.empty and st.session_state.queued_appeal_ids:
+                    pending_aps = pending_aps[~pending_aps["對應紀錄ID"].astype(str).isin(st.session_state.queued_appeal_ids)]
                 
                 if pending_aps.empty: 
                     st.success("目前無待審核的申訴案件。")
                 else:
+                    st.caption(f"共 {len(pending_aps)} 筆待審核，審核後系統將背景處理，不需等待。")
                     for i, r in pending_aps.iterrows():
                         with st.container(border=True):
                             c1, c2 = st.columns([3,2])
@@ -2452,11 +3344,33 @@ try:
                             
                             col_btn1, col_btn2 = c1.columns(2)
                             if col_btn1.button("✅ 核可並撤銷扣分", key=f"ok_{i}"): 
-                                update_appeal_status(i, "已核可", r["對應紀錄ID"], reply_text)
-                                st.rerun()
+                                _tid = enqueue_task("appeal_review", {
+                                    "record_id": str(r["對應紀錄ID"]),
+                                    "status": "已核可",
+                                    "reply_text": reply_text
+                                })
+                                if _tid:
+                                    st.session_state.queued_appeal_ids.add(str(r["對應紀錄ID"]))
+                                    c1.success("✅ 已排入佇列，系統將背景處理核可與撤銷扣分。")
+                                else:
+                                    c1.error("❌ 排入佇列失敗，請重試或檢查網路連線。")
                             if col_btn2.button("🚫 駁回維持原判", key=f"ng_{i}"): 
-                                update_appeal_status(i, "已駁回", r["對應紀錄ID"], reply_text)
-                                st.rerun()
+                                _tid = enqueue_task("appeal_review", {
+                                    "record_id": str(r["對應紀錄ID"]),
+                                    "status": "已駁回",
+                                    "reply_text": reply_text
+                                })
+                                if _tid:
+                                    st.session_state.queued_appeal_ids.add(str(r["對應紀錄ID"]))
+                                    c1.info("已排入佇列，系統將背景處理駁回。")
+                                else:
+                                    c1.error("❌ 排入佇列失敗，請重試或檢查網路連線。")
+
+                    if st.button("🔄 重新整理申訴列表", key="refresh_appeals"):
+                        st.session_state.queued_appeal_ids.clear()
+                        load_appeals.clear()
+                        load_main_data.clear()
+                        st.rerun()
 
             with t_excellent:
                 st.subheader("⭐ 優良審核")
@@ -2860,7 +3774,7 @@ try:
                     (df["晨間打掃原始分"] == 0) &
                     (~df["修正"]) &
                     (~df["紀錄ID"].astype(str).isin(st.session_state.approved_morning_ids))
-                ]
+                ].drop_duplicates(subset=["紀錄ID"])
                 
                 # [Fix] 排除已有審核完成紀錄的重複項目
                 if approved_cls_dates and not pending_df.empty:
@@ -2878,25 +3792,24 @@ try:
                 else:
                     st.caption(f"共 {len(pending_df)} 筆待審核，審核後不會立刻跳頁，可以繼續審核其他筆。")
 
-                # [Fix #5] _do_approve 移至迴圈外，所有依賴都透過參數明確傳入，
-                # 避免 Python closure 在迴圈中捕捉到最後一次的 r 變數
-                def _do_approve(record_id, s_val, note_text, reply, col_ref, cached_main_df):
-                    ws = get_worksheet(SHEET_TABS["main"])
-                    id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
-                    # [Fix] 統一轉為 str 並 strip，避免型別或空白不一致
-                    id_list = [str(v).strip() for v in id_list]
-                    record_id_str = str(record_id).strip()
-                    if record_id_str in id_list:
-                        ridx = id_list.index(record_id_str) + 1
-                        ws.update_cell(ridx, EXPECTED_COLUMNS.index("晨間打掃原始分") + 1, s_val)
-                        ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, "晨間打掃(學期加分)")
-                        matched = cached_main_df.loc[cached_main_df["紀錄ID"].astype(str) == str(record_id), "備註"]
-                        old_note = str(matched.iloc[0]) if not matched.empty else ""
-                        new_note = f"{old_note} \n組長回覆: {reply}" if reply else f"{old_note} \n組長核可: {note_text}"
-                        ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註") + 1, new_note)
+                # [Fix Async] _do_approve_async：enqueue_task 同步排隊，檢查回傳值才顯示成功
+                def _do_approve_async(record_id, s_val, note_text, reply, col_ref, cached_main_df):
+                    """將晨掃審核排入佇列，Worker 背景處理"""
+                    matched = cached_main_df.loc[cached_main_df["紀錄ID"].astype(str) == str(record_id), "備註"]
+                    old_note = str(matched.iloc[0]) if not matched.empty else ""
+                    new_note = f"{old_note} \n組長回覆: {reply}" if reply else f"{old_note} \n組長核可: {note_text}"
+                    _tid = enqueue_task("morning_sweep_approve", {
+                        "record_id": str(record_id),
+                        "action": "approve",
+                        "score_val": s_val,
+                        "new_item": "晨間打掃(學期加分)",
+                        "new_note": new_note
+                    })
+                    if _tid:
                         st.session_state.approved_morning_ids.add(str(record_id))
-                        load_main_data.clear()
-                        col_ref.success(f"✅ 已核可，學期加 {abs(s_val):g} 分")
+                        col_ref.success(f"✅ 已排入佇列！學期加 {abs(s_val):g} 分（背景處理中）")
+                    else:
+                        col_ref.error("❌ 排入佇列失敗，請重試或檢查網路連線。")
 
                 for i, r in pending_df.iterrows():
                     with st.container(border=True):
@@ -2946,35 +3859,35 @@ try:
 
                         reply_msg = c1.text_input("💬 給予回應 (可留白)", key=f"rm_{r['紀錄ID']}_{i}")
 
-                        # ── 審核按鈕：給分 or 駁回 ──
+                        # ── 審核按鈕：給分 or 駁回（全部改為 async） ──
                         if score_val is not None:
                             if c3.button(f"✅ 給分 ({suggested:g}分)", key=f"approve_{r['紀錄ID']}_{i}"):
-                                _do_approve(r["紀錄ID"], score_val,
+                                _do_approve_async(r["紀錄ID"], score_val,
                                             f"給分{suggested:g}分（{score_label.split('→')[0].strip()}）",
                                             reply_msg, c1, main_df)
                         else:
                             # 無法自動計算時，提供手動選項
                             manual_score = c3.selectbox("給分", [2, 1, 0.5, 0.25], key=f"manual_{r['紀錄ID']}_{i}")
                             if c3.button("✅ 給分", key=f"approve_{r['紀錄ID']}_{i}"):
-                                _do_approve(r["紀錄ID"], -manual_score, f"手動給分 {manual_score} 分",
+                                _do_approve_async(r["紀錄ID"], -manual_score, f"手動給分 {manual_score} 分",
                                             reply_msg, c1, main_df)
 
                         if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}_{i}"):
-                            ws = get_worksheet(SHEET_TABS["main"])
-                            id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
-                            # [Fix] 統一轉為 str 並 strip
-                            id_list = [str(v).strip() for v in id_list]
-                            rid_str = str(r["紀錄ID"]).strip()
-                            if rid_str in id_list:
-                                ridx = id_list.index(rid_str) + 1
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("評分項目") + 1, "晨間打掃(已駁回)")
-                                old_note = str(r['備註'])
-                                rej_msg  = reply_msg if reply_msg else "未達標準，請見諒"
-                                new_note = f"{old_note} \n組長駁回: {rej_msg}"
-                                ws.update_cell(ridx, EXPECTED_COLUMNS.index("備註") + 1, new_note)
-                                st.session_state.approved_morning_ids.add(rid_str)
-                                load_main_data.clear()
-                                c1.error("🗑️ 已駁回")
+                            old_note = str(r['備註'])
+                            rej_msg  = reply_msg if reply_msg else "未達標準，請見諒"
+                            new_note = f"{old_note} \n組長駁回: {rej_msg}"
+                            _tid = enqueue_task("morning_sweep_approve", {
+                                "record_id": str(r["紀錄ID"]),
+                                "action": "reject",
+                                "score_val": 0,
+                                "new_item": "晨間打掃(已駁回)",
+                                "new_note": new_note
+                            })
+                            if _tid:
+                                st.session_state.approved_morning_ids.add(str(r["紀錄ID"]))
+                                c1.error("🗑️ 已排入佇列（駁回處理中）")
+                            else:
+                                c1.error("❌ 排入佇列失敗，請重試或檢查網路連線。")
 
                 if not pending_df.empty or st.session_state.approved_morning_ids:
                     if st.button("🔄 審核完畢，重新整理列表"):
@@ -3180,6 +4093,339 @@ try:
                                     st.success(f"✅ 已為 {len(valid_ids)} 位同學發放 {hours_sid}h 服務時數！")
                                     time.sleep(1.5)
                                     st.rerun()
+
+            # [Fix] _strip_notion_invisible / _parse_claimant_tag 已移至全域定義（約 line 674），
+            # Worker 與 Admin UI 共用，不再重複定義。
+
+            # [新增] 愛校服務 2.0：愛校與欠時管理 Tab
+            with t_debt:
+                st.subheader("🤝 愛校與欠時管理")
+
+                # ── 區塊 A：📥 待驗收愛校任務 ──
+                with st.expander("📥 待驗收愛校任務", expanded=True):
+                    _claimed_tasks = fetch_claimed_notion_tasks()
+                    if not _claimed_tasks:
+                        st.success("🎉 目前沒有待驗收的任務！")
+                    else:
+                        for _ct in _claimed_tasks:
+                            with st.container(border=True):
+                                st.write(f"📌 **{_ct['title']}**")
+                                st.caption(f"📅 日期：{_ct['date']}　|　📝 內容：{_ct.get('area', '未填寫')}　|　認領學生：{', '.join(_ct['claimants'])}")
+
+                                # [Fix] 使用統一解析函式，避免重複邏輯
+                                _appeal_students = []
+                                _punish_students = []
+                                _debt_students = []
+                                _parsed_tags_display = []  # [Fix] 收集解析結果供管理員確認
+                                for _clm in _ct["claimants"]:
+                                    _sid, _tag = _parse_claimant_tag(_clm)
+                                    if _sid:
+                                        _parsed_tags_display.append(f"{_sid}→**{_tag}**")
+                                        if _tag == "消警告":
+                                            _appeal_students.append(_sid)
+                                        elif _tag == "糾察懲罰":
+                                            _punish_students.append(_sid)
+                                        else:
+                                            _debt_students.append(_sid)
+
+                                # 顯示各目的標籤摘要
+                                _tag_parts = []
+                                if _debt_students:
+                                    _tag_parts.append(f"🟢 還時數 {len(_debt_students)} 人")
+                                if _appeal_students:
+                                    _tag_parts.append(f"🔔 消警告 {len(_appeal_students)} 人")
+                                if _punish_students:
+                                    _tag_parts.append(f"⚫ 糾察懲罰 {len(_punish_students)} 人")
+                                if _tag_parts:
+                                    st.markdown("　".join(_tag_parts))
+
+                                # [Fix] 顯示每位學生的解析結果，方便管理員確認 tag 是否正確
+                                if _parsed_tags_display:
+                                    st.caption(f"🔍 標籤解析結果：{'、'.join(_parsed_tags_display)}")
+
+                                if _appeal_students:
+                                    st.info(f"💡 偵測到 {len(_appeal_students)} 位學生申請「消警告」（{', '.join(_appeal_students)}），驗收完成後請至下方「🖨️ 銷過單核發」區塊產製申請表單。")
+
+                                # 將按鈕名稱改得更符合實際動作
+                                if st.button("✅ 依標籤自動驗收", key=f"verify_{_ct['id']}"):
+                                    _hr_match = re.search(r"[\(\uff08]([\d.]+)\s*(?:hr|小時|h)[\)\uff09]", _ct["title"], re.IGNORECASE)
+                                    _task_hours = float(_hr_match.group(1)) if _hr_match else 1.0
+
+                                    _verify_payload = {
+                                        "notion_page_id": _ct["id"],
+                                        "task_title": _ct["title"],
+                                        "task_date": _ct.get("date", str(today_tw)),
+                                        "task_area": _ct.get("area", _ct["title"]),
+                                        "time_start": _ct.get("time_start", ""),
+                                        "task_hours": _task_hours,
+                                        "claimants": _ct["claimants"]
+                                    }
+                                    _tid = enqueue_task("campus_service_verify", _verify_payload)
+
+                                    if _tid:
+                                        msg_parts = ["✅ 已排入佇列！系統將背景完成以下操作："]
+                                        if _debt_students:
+                                            msg_parts.append(f"🟢 還時數 {len(_debt_students)} 人（扣欠時 + 發服務時數）")
+                                        if _appeal_students:
+                                            msg_parts.append(f"🔔 消警告 {len(_appeal_students)} 人（寫入 service_hours，稍後可產製銷過單）")
+                                        if _punish_students:
+                                            msg_parts.append(f"⚫ 糾察懲罰 {len(_punish_students)} 人（不發時數）")
+                                        msg_parts.append("📡 Notion 狀態將自動更新為「任務已驗收」")
+                                        st.success("\n".join(msg_parts))
+                                        st.caption(f"🔍 診斷資訊：task_id = `{_tid[:8]}...`　請在 task_queue_v3 搜尋此 ID 確認是否存在")
+                                        st.toast("✅ 驗收已排入佇列，背景處理中", icon="✅")
+                                    else:
+                                        st.error("❌ 排入佇列失敗，請重試。若持續失敗請檢查 Google Sheets 連線。")
+                                        
+                # ── 區塊 B：⚠️ 欠時懲處結算報表 ──
+                with st.expander("⚠️ 欠時懲處結算報表", expanded=True):
+                    if st.button("🚀 結算滿 1 小時警告名單", key="debt_settle_btn"):
+                        _all_debts = load_student_debts()
+                        _warn_list = []
+                        for _dsid, _dhours in _all_debts.items():
+                            if _dhours >= 1.0:
+                                _warnings = math.floor(_dhours)
+                                _remaining = round(_dhours - _warnings, 2)
+                                _cls_name = ROSTER_DICT.get(_dsid, "未知班級")
+                                _warn_list.append({
+                                    "學號": _dsid, "班級": _cls_name,
+                                    "未完成時數": _dhours, "應記警告支數": _warnings,
+                                    "結算後剩餘欠時": _remaining
+                                })
+                        if not _warn_list:
+                            st.success("🎉 目前沒有學生達到記警告的門檻！")
+                        else:
+                            _warn_df = pd.DataFrame(_warn_list).sort_values(["班級", "學號"]).reset_index(drop=True)
+                            st.warning(f"⚠️ 共有 **{len(_warn_df)}** 位學生達到記警告門檻：")
+                            st.dataframe(_warn_df, hide_index=True)
+                            _csv_data = _warn_df.to_csv(index=False).encode("utf-8-sig")
+                            st.download_button(
+                                label="📥 下載結算報表 (CSV)",
+                                data=_csv_data,
+                                file_name=f"欠時結算報表_{datetime.now(TW_TZ).strftime('%Y%m%d')}.csv",
+                                mime="text/csv"
+                            )
+                            _excel_buf = io.BytesIO()
+                            with pd.ExcelWriter(_excel_buf, engine="openpyxl") as _ew:
+                                _warn_df.to_excel(_ew, sheet_name="欠時結算", index=False)
+                            _excel_buf.seek(0)
+                            st.download_button(
+                                label="📥 下載結算報表 (Excel)",
+                                data=_excel_buf.getvalue(),
+                                file_name=f"欠時結算報表_{datetime.now(TW_TZ).strftime('%Y%m%d')}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key="debt_excel_dl"
+                            )
+
+                # ── 區塊 C：🖨️ 銷過單核發 (一鍵批次) ──
+                with st.expander("🖨️ 銷過單核發 (消警告單)", expanded=True):
+                    st.info("💡 系統自動查詢所有「愛校服務(消警告)」紀錄，一鍵產製所有學生的《愛校服務申請單》。")
+
+                    # [Fix] 共用解析函式：將原始紀錄轉成申請單格式
+                    def _parse_appeal_record(rec):
+                        """解析 service_hours 中的消警告紀錄，回傳標準化 dict"""
+                        _class_field = str(rec.get("班級", ""))
+                        _parts = _class_field.split("|")
+                        _work_content = _parts[0].strip() if _parts else ""
+                        _start_time = _parts[1].strip() if len(_parts) > 1 else ""
+                        _hours = 0.0
+                        try:
+                            _hours = float(rec.get("時數", 0))
+                        except (ValueError, TypeError):
+                            pass
+                        _date_str = str(rec.get("日期", ""))
+                        _end_time = ""
+                        if _start_time:
+                            try:
+                                _st = datetime.strptime(_start_time, "%H:%M")
+                                _et = _st + timedelta(hours=_hours)
+                                _end_time = _et.strftime("%H:%M")
+                            except Exception:
+                                pass
+                        return {
+                            "work_content": _work_content,
+                            "date": _date_str,
+                            "start_time": _start_time,
+                            "end_time": _end_time,
+                            "hours": _hours
+                        }
+
+                    if st.button("🔎 查詢所有消警告紀錄", key="btn_fetch_all_appeals"):
+                        try:
+                            def _fetch_all_appeal_records():
+                                ws_svc = get_worksheet(SHEET_TABS["service_hours"])
+                                if not ws_svc:
+                                    return []
+                                _svc_data = ws_svc.get_all_records()
+                                _df_svc = pd.DataFrame(_svc_data)
+                                if _df_svc.empty or "類別" not in _df_svc.columns:
+                                    return []
+                                return _df_svc[_df_svc["類別"] == "愛校服務(消警告)"].to_dict('records')
+
+                            with st.spinner("正在查詢所有消警告紀錄..."):
+                                _all_appeal_records = execute_with_retry(_fetch_all_appeal_records)
+
+                            if not _all_appeal_records:
+                                st.warning("⚠️ 目前找不到任何消警告服務紀錄。請確認是否已有消警告驗收完成。")
+                            else:
+                                # 依學號分組
+                                _grouped = {}
+                                for _rec in _all_appeal_records:
+                                    _sid = str(_rec.get("學號", "")).strip()
+                                    if not _sid:
+                                        continue
+                                    if _sid not in _grouped:
+                                        _grouped[_sid] = []
+                                    _grouped[_sid].append(_rec)
+
+                                # 顯示摘要表格
+                                _summary_rows = []
+                                for _sid, _recs in sorted(_grouped.items()):
+                                    _cls_name = ROSTER_DICT.get(clean_id(_sid), "未知班級")
+                                    _total_h = sum(float(r.get("時數", 0)) for r in _recs)
+                                    _summary_rows.append({
+                                        "學號": _sid,
+                                        "班級": _cls_name,
+                                        "服務筆數": len(_recs),
+                                        "總時數": round(_total_h, 2)
+                                    })
+
+                                st.success(f"✅ 共找到 **{len(_all_appeal_records)}** 筆消警告紀錄，涵蓋 **{len(_grouped)}** 位學生：")
+                                _summary_df = pd.DataFrame(_summary_rows)
+                                st.dataframe(_summary_df, hide_index=True)
+
+                                # 存入 session_state 供後續下載
+                                st.session_state["_appeal_grouped"] = _grouped
+                                st.session_state["_appeal_summary"] = _summary_rows
+
+                        except Exception as e:
+                            st.error(f"❌ 查詢消警告紀錄時發生錯誤：{e}")
+
+                    # ── 查詢結果存在 session_state 時，顯示下載區 ──
+                    if st.session_state.get("_appeal_grouped"):
+                        _grouped = st.session_state["_appeal_grouped"]
+                        _summary_rows = st.session_state.get("_appeal_summary", [])
+
+                        st.markdown("---")
+                        st.markdown("#### 📥 下載銷過單")
+
+                        # ── 一鍵下載全部（ZIP） ──
+                        if st.button("📦 一鍵打包下載全部銷過單 (ZIP)", key="btn_dl_all_zip"):
+                            import zipfile as _zipfile
+                            _zip_buf = io.BytesIO()
+                            _gen_count = 0
+                            with _zipfile.ZipFile(_zip_buf, 'w', _zipfile.ZIP_DEFLATED) as _zf:
+                                for _sid, _recs in sorted(_grouped.items()):
+                                    _cls_name = ROSTER_DICT.get(clean_id(_sid), "未知班級")
+                                    _parsed = [_parse_appeal_record(r) for r in _recs[:8]]
+                                    if _parsed:
+                                        _excel_bytes = generate_appeal_form_excel(clean_id(_sid), _cls_name, _parsed)
+                                        _zf.writestr(f"愛校申請單_{_cls_name}_{_sid}.xlsx", _excel_bytes)
+                                        _gen_count += 1
+                            _zip_buf.seek(0)
+                            st.download_button(
+                                label=f"📦 下載 ZIP（共 {_gen_count} 份申請單）",
+                                data=_zip_buf.getvalue(),
+                                file_name=f"消警告銷過單_全部_{datetime.now(TW_TZ).strftime('%Y%m%d')}.zip",
+                                mime="application/zip",
+                                key="dl_all_appeal_zip"
+                            )
+                            st.success(f"✅ 已產製 {_gen_count} 份銷過單！")
+
+                        # ── 個別學生下載 ──
+                        st.markdown("##### 或選擇單一學生下載")
+                        _sid_options = [f"{r['學號']} ({r['班級']}, {r['總時數']}h, {r['服務筆數']}筆)"
+                                        for r in _summary_rows]
+                        _sel_appeal_student = st.selectbox("選擇學生", _sid_options, key="sel_appeal_student")
+
+                        if _sel_appeal_student:
+                            _sel_sid = _sel_appeal_student.split(" ")[0]
+                            _sel_recs = _grouped.get(_sel_sid, [])
+                            _sel_cls = ROSTER_DICT.get(clean_id(_sel_sid), "未知班級")
+
+                            if _sel_recs:
+                                _parsed_recs = [_parse_appeal_record(r) for r in _sel_recs[:8]]
+
+                                # 顯示預覽
+                                _preview_df = pd.DataFrame([{
+                                    "序號": i + 1,
+                                    "工作內容": r["work_content"],
+                                    "服務日期": r["date"],
+                                    "起始時間": r["start_time"] if r["start_time"] else "—",
+                                    "結束時間": r["end_time"] if r["end_time"] else "—",
+                                    "時數": r["hours"]
+                                } for i, r in enumerate(_parsed_recs)])
+                                st.dataframe(_preview_df, hide_index=True)
+
+                                _total_h = sum(r["hours"] for r in _parsed_recs)
+                                st.metric("總計服務時數", f"{_total_h:g} 小時")
+
+                                # 產製個別 Excel
+                                _excel_bytes = generate_appeal_form_excel(
+                                    clean_id(_sel_sid), _sel_cls, _parsed_recs
+                                )
+                                st.download_button(
+                                    label=f"📥 下載 {_sel_cls} {_sel_sid} 的銷過單",
+                                    data=_excel_bytes,
+                                    file_name=f"愛校申請單_{_sel_cls}_{_sel_sid}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key="dl_single_appeal"
+                                )
+
+                        st.caption("💡 下載後請用 Excel 開啟，確認格式無誤後列印 A4 紙張，再持表單至學務處完成後續流程。")
+
+                # ── 區塊 D：🛠️ 消警告資料補寫工具 ──
+                with st.expander("🛠️ 消警告資料補寫（修復遺失紀錄）", expanded=False):
+                    st.warning("⚠️ 此工具用於手動補寫因系統異常而遺失的消警告 service_hours 紀錄。請確認資料正確後再送出。")
+
+                    _rc1, _rc2 = st.columns(2)
+                    _rc_date = _rc1.date_input("服務日期", today_tw, key="rc_fix_date")
+                    _rc_hours = _rc2.number_input("服務時數", value=1.0, step=0.5, min_value=0.5, key="rc_fix_hours")
+                    _rc_work = st.text_input("工作內容", key="rc_fix_work", placeholder="例如：校園清潔、廁所打掃")
+                    _rc_time_start = st.text_input("起始時間（選填，格式 HH:MM）", key="rc_fix_time", placeholder="例如: 15:50")
+                    _rc_sids_raw = st.text_area(
+                        "學號清單（每行一個或逗號分隔）",
+                        key="rc_fix_sids",
+                        placeholder="例如：\n112001\n112002, 112003",
+                        height=100
+                    )
+
+                    # 即時解析
+                    _rc_valid_sids = []
+                    _rc_invalid_sids = []
+                    if _rc_sids_raw.strip():
+                        _rc_raw_list = [s.strip() for s in re.split(r'[\n,、，\s]+', _rc_sids_raw) if s.strip()]
+                        for _sid_r in _rc_raw_list:
+                            _csid = clean_id(_sid_r)
+                            if _csid in ROSTER_DICT:
+                                if _csid not in _rc_valid_sids:
+                                    _rc_valid_sids.append(_csid)
+                            else:
+                                if _sid_r not in _rc_invalid_sids:
+                                    _rc_invalid_sids.append(_sid_r)
+                    if _rc_valid_sids:
+                        st.success(f"✅ 有效學號 {len(_rc_valid_sids)} 人")
+                    if _rc_invalid_sids:
+                        st.error(f"❌ 無效學號：{', '.join(_rc_invalid_sids)}")
+
+                    if st.button("📝 補寫消警告紀錄", key="btn_fix_appeal"):
+                        if not _rc_valid_sids:
+                            st.error("❌ 請輸入至少一個有效學號！")
+                        elif not _rc_work.strip():
+                            st.error("❌ 請填寫工作內容！")
+                        elif _rc_invalid_sids:
+                            st.error("❌ 請先修正無效學號！")
+                        else:
+                            _class_field = f"{_rc_work.strip()}|{_rc_time_start.strip()}" if _rc_time_start.strip() else _rc_work.strip()
+                            _write_service_hours_direct(
+                                _class_field,
+                                "愛校服務(消警告)",
+                                _rc_hours,
+                                _rc_valid_sids,
+                                str(_rc_date)
+                            )
+                            st.success(f"✅ 已補寫 {len(_rc_valid_sids)} 位學生的消警告紀錄至 service_hours！")
+                            st.info("💡 補寫完成後，請到上方「🖨️ 銷過單核發」區塊查詢並產製銷過單。")
 
         elif pwd_input != "":
             st.error("密碼錯誤")
