@@ -460,9 +460,16 @@ try:
         # 失敗：回傳 None，呼叫端必須檢查並顯示錯誤，不可靜默假設成功
         task_id = str(uuid.uuid4())
         try:
+            target_sheet_url = None
             def _action():
+                nonlocal target_sheet_url
                 ws = get_worksheet(SHEET_TABS["task_queue"])
                 if not ws: raise Exception("無法取得 task_queue 工作表")
+                # [DEBUG] 記錄實際寫入的試算表 URL，供診斷用
+                try:
+                    target_sheet_url = ws.spreadsheet.url
+                except Exception:
+                    target_sheet_url = "unknown"
                 ws.append_row([
                     task_id, task_type,
                     datetime.now(timezone.utc).isoformat(),
@@ -470,6 +477,7 @@ try:
                     "PENDING", 0, ""
                 ], value_input_option="RAW")
             execute_with_retry(_action)
+            print(f"[enqueue] 成功寫入 task_id={task_id[:8]} type={task_type} sheet={target_sheet_url}")
             return task_id  # 確認寫入成功才回傳
         except Exception as e:
             print(f"[enqueue] 加入佇列失敗: {e}")
@@ -4157,6 +4165,7 @@ try:
                                             msg_parts.append(f"⚫ 糾察懲罰 {len(_punish_students)} 人（不發時數）")
                                         msg_parts.append("📡 Notion 狀態將自動更新為「任務已驗收」")
                                         st.success("\n".join(msg_parts))
+                                        st.caption(f"🔍 診斷資訊：task_id = `{_tid[:8]}...`　請在 task_queue_v3 搜尋此 ID 確認是否存在")
                                         st.toast("✅ 驗收已排入佇列，背景處理中", icon="✅")
                                     else:
                                         st.error("❌ 排入佇列失敗，請重試。若持續失敗請檢查 Google Sheets 連線。")
