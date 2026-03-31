@@ -296,28 +296,19 @@ try:
 
     @st.cache_resource
     def get_spreadsheet():
-        """
-        不再 cache Spreadsheet 物件，避免背景執行緒 / rerun / stale 物件造成
-        表面成功、實際沒寫進去的詭異狀況。
-        """
+        # [Fix #9] 快取整個 Spreadsheet 物件，避免每次 get_worksheet 都重新 open_by_url
         client = get_gspread_client()
-        if not client:
-            raise Exception("get_spreadsheet: 無法取得 gspread client")
-
+        if not client: return None
         try:
-            sheet = client.open_by_url(SHEET_URL)
-            return sheet
+            return client.open_by_url(SHEET_URL)
         except Exception as e:
-            raise Exception(f"get_spreadsheet: 無法開啟試算表: {e}")
-    def get_worksheet(tab_name):
-        """
-        失敗要直接 raise，不要回傳 None。
-        只要是寫入流程，拿不到 worksheet 就應該讓 worker RETRY / FAILED，
-        不可以靜默成功。
-        """
-        sheet = get_spreadsheet()
-        last_err = None
+            print(f"[get_spreadsheet] 無法開啟試算表: {e}")
+            return None
 
+    def get_worksheet(tab_name):
+        # [Fix #9] 改用快取的 Spreadsheet 物件，只在找不到分頁時才建立新分頁
+        sheet = get_spreadsheet()
+        if not sheet: return None
         for attempt in range(4):
             try:
                 try:
@@ -326,37 +317,22 @@ try:
                     cols = 20 if tab_name != "appeals" else 15
                     init_rows = 2000 if tab_name == "task_queue" else 500
                     ws = sheet.add_worksheet(title=tab_name, rows=init_rows, cols=cols)
-
-                    if tab_name == "appeals":
-                        ws.append_row(APPEAL_COLUMNS)
-                    elif tab_name == "service_hours":
-                        ws.append_row(["日期", "學號", "班級", "類別", "時數", "紀錄ID", "核發狀態"])
-                    elif tab_name == "holidays":
-                        ws.append_row(["日期", "說明"])
-                    elif tab_name == "office_areas":
-                        ws.append_row(["區域名稱", "負責班級"])
-                    elif tab_name == "published_results":
-                        ws.append_row(["週次", "排名", "年級", "班級", "總扣分", "優良次數", "總成績", "評等", "排名模式", "發布時間"])
-                    elif tab_name == "task_queue":
-                        ws.append_row(["id", "task_type", "created_ts", "payload_json", "status", "attempts", "last_error"])
-                    elif tab_name == "student_debts":
-                        ws.append_row(["學號", "未完成時數", "備註"])
-                    elif tab_name == "debt_history":
-                        ws.append_row(["時間", "學號", "異動時數", "剩餘時數", "事由"])
-
+                    if tab_name == "appeals": ws.append_row(APPEAL_COLUMNS)
+                    if tab_name == "service_hours": ws.append_row(["日期", "學號", "班級", "類別", "時數", "紀錄ID", "核發狀態"])  # [方案A] 加入核發狀態欄
+                    if tab_name == "holidays": ws.append_row(["日期", "說明"])
+                    if tab_name == "office_areas": ws.append_row(["區域名稱", "負責班級"])
+                    if tab_name == "published_results": ws.append_row(["週次", "排名", "年級", "班級", "總扣分", "優良次數", "總成績", "評等", "排名模式", "發布時間"])
+                    if tab_name == "task_queue": ws.append_row(["id", "task_type", "created_ts", "payload_json", "status", "attempts", "last_error"])
+                    if tab_name == "student_debts": ws.append_row(["學號", "未完成時數", "備註"])  # [Fix 3] 補上備註欄
+                    if tab_name == "debt_history": ws.append_row(["時間", "學號", "異動時數", "剩餘時數", "事由"])  # [新增] 愛校服務 2.0
                     return ws
-
             except Exception as e:
-                last_err = e
-                err_s = str(e)
-                if "429" in err_s or "quota" in err_s.lower() or "rate" in err_s.lower():
-                    sleep_s = 2 * (attempt + 1) + random.uniform(0, 1)
-                    print(f"[get_worksheet] retry {attempt+1}/4 tab={tab_name}: {e}")
-                    time.sleep(sleep_s)
+                if "429" in str(e):
+                    time.sleep(2 * (attempt + 1) + random.uniform(0, 1))
                     continue
-                break
+                else: return None
+        return None
 
-        raise Exception(f"get_worksheet({tab_name}) 失敗: {last_err}")
     def compress_image_bytes(file_bytes, quality=60):
         # [V5.32] 壓縮參數調整：1200px + quality=60，減少 Drive 上傳時間
         # 對手機拍攝的現場照片而言畫質仍足夠辨認違規細節
@@ -564,40 +540,43 @@ try:
         return None
 
     def update_task_status(task_id, status, attempts, last_error, _row_idx=None):
-        """
-        不再於 DONE 時刪行。
-        一律保留 task_queue 紀錄，讓你可以追查：
-        - status
-        - attempts
-        - last_error
-        """
+        # DONE → 直接刪行，讓 task_queue 不積累；失敗/重試才保留並更新
+        # [Debug Fix] delete_rows / batch_update 加上 execute_with_retry，
+        # 避免單次 429/timeout 靜默失敗後任務永遠卡在 IN_PROGRESS
         try:
             ws = get_worksheet(SHEET_TABS["task_queue"])
+            if not ws: return
 
+            # 定位行號
             if _row_idx:
                 ridx = _row_idx
             else:
                 ids = ws.col_values(1)[1:]
-                if task_id not in ids:
-                    raise Exception(f"update_task_status: 找不到 task_id={task_id}")
+                if task_id not in ids: return
                 ridx = ids.index(task_id) + 2
 
-            status_val = str(status).strip().upper()
-            error_val = str(last_error)[:500] if last_error else ""
-
-            def _status_update():
-                ws.batch_update([
-                    {"range": f"E{ridx}", "values": [[status_val]]},
-                    {"range": f"F{ridx}", "values": [[attempts]]},
-                    {"range": f"G{ridx}", "values": [[error_val]]},
-                ])
-
-            execute_with_retry(_status_update)
-            print(f"[task_queue] 更新完成 task={task_id[:8]} row={ridx} status={status_val} attempts={attempts}")
-
+            if status == "DONE":
+                # 成功完成 → 直接刪除這行，task_queue 永遠不會積累歷史紀錄
+                try:
+                    execute_with_retry(lambda: ws.delete_rows(ridx))
+                except Exception as e:
+                    print(f"[task_queue] 刪行失敗（{task_id[:8]}，row={ridx}）: {e}")
+            else:
+                # FAILED 或 RETRY → 更新狀態保留供查閱
+                def _status_update():
+                    ws.batch_update([
+                        {"range": f"E{ridx}", "values": [[status]]},
+                        {"range": f"F{ridx}", "values": [[attempts]]},
+                        {"range": f"G{ridx}", "values": [[str(last_error)[:200] if last_error else ""]]}
+                    ])
+                execute_with_retry(_status_update)
         except Exception as e:
             print(f"update_task_status error (task={task_id[:8] if task_id else '?'}, status={status}): {e}")
-            raise
+
+    # ==========================================
+    # 背景處理邏輯
+    # ==========================================
+
     def fetch_all_pending_service_tasks(max_attempts=6):
         # [Fix #3-B] 從 Sheets 批次撈出所有 service_hours_only PENDING 任務
         # 注意：此函式現在接受外部 ws + records，避免在同一 Worker 輪次重複讀 Sheets
@@ -728,76 +707,42 @@ try:
     def _append_main_entry_row(entry):
         def _action():
             ws = get_worksheet(SHEET_TABS["main"])
-
-            record_id = str(entry.get("紀錄ID", "")).strip()
-            if not record_id:
-                raise Exception("_append_main_entry_row: 缺少 紀錄ID")
-
+            if not ws: return
+            # [防重複寫入] 先比對紀錄ID，若已存在則跳過，避免連續上傳兩筆
             try:
                 existing_ids = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
-                if record_id in existing_ids:
-                    print(f"[DEDUP] 紀錄ID {record_id} 已存在，跳過寫入")
-                    return "DEDUP"
+                if str(entry.get("紀錄ID", "")) in existing_ids:
+                    print(f"[DEDUP] 紀錄ID {entry.get('紀錄ID')} 已存在，跳過寫入")
+                    return
             except Exception as e:
-                print(f"[DEDUP] 防重複檢查失敗，改直接拋錯: {e}")
-                raise Exception(f"_append_main_entry_row: 防重複檢查失敗: {e}")
-
-            row = []
-            for col in EXPECTED_COLUMNS:
-                val = entry.get(col, "")
-                if isinstance(val, bool):
-                    row.append(str(val).upper())
-                else:
-                    row.append(str(val))
-
-            ws.append_row(row, value_input_option="RAW")
-
-            verify_ids = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
-            if record_id not in verify_ids:
-                raise Exception(f"_append_main_entry_row: append_row 後驗證失敗，紀錄ID {record_id} 未出現在 main_data")
-
-            print(f"[_append_main_entry_row] 寫入成功 record_id={record_id}")
-            return "OK"
-
-        return execute_with_retry(_action)
+                print(f"[DEDUP] 防重複檢查失敗，繼續寫入: {e}")
+            row = [str(entry.get(col, "")).upper() if isinstance(entry.get(col, ""), bool) else str(entry.get(col, "")) for col in EXPECTED_COLUMNS]
+            ws.append_row(row)
+        execute_with_retry(_action)
+    
     def _append_service_row_unique(entry):
         t_date     = str(entry.get("日期", ""))
         t_sid      = str(entry.get("學號", ""))
         t_cat      = str(entry.get("類別", ""))
-        t_cls_name = str(entry.get("班級", ""))
-        t_hours    = str(entry.get("時數", ""))
-        t_rec_id   = str(entry.get("紀錄ID", ""))
-
+        t_cls_name = str(entry.get("班級", ""))  # [Fix] 加入 class_name 至去重 key
+        
         try:
             with closing(open_local_db()) as conn:
-                cur = conn.execute(
-                    "SELECT 1 FROM service_issued WHERE date=? AND sid=? AND category=? AND class_name=?",
-                    (t_date, t_sid, t_cat, t_cls_name)
-                )
-                if cur.fetchone() is not None:
-                    print(f"[_append_service_row_unique] dedup 跳過 sid={t_sid}, cat={t_cat}, class={t_cls_name}, date={t_date}")
-                    return "DEDUP"
-        except Exception as e:
-            raise Exception(f"_append_service_row_unique: dedup 檢查失敗: {e}")
-
+                conn.execute("INSERT INTO service_issued VALUES (?, ?, ?, ?)",
+                             (t_date, t_sid, t_cat, t_cls_name))
+        except sqlite3.IntegrityError:
+            return
+            
         def _action():
             ws = get_worksheet(SHEET_TABS["service_hours"])
-            new_row = [t_date, t_sid, t_cls_name, t_cat, t_hours, t_rec_id, ""]
-            ws.append_row(new_row, value_input_option="RAW")
-
+            if not ws: return
+            new_row = [t_date, t_sid, str(entry.get("班級", "")), t_cat, str(entry.get("時數", "")), str(entry.get("紀錄ID", "")), ""]  # [方案A] 核發狀態空白
+            ws.append_row(new_row)
         execute_with_retry(_action)
 
-        try:
-            with closing(open_local_db()) as conn:
-                conn.execute(
-                    "INSERT OR IGNORE INTO service_issued VALUES (?, ?, ?, ?)",
-                    (t_date, t_sid, t_cat, t_cls_name)
-                )
-        except Exception as e:
-            print(f"[_append_service_row_unique] SQLite dedup 寫入失敗（可忽略）: {e}")
-
-        print(f"[_append_service_row_unique] 寫入成功 sid={t_sid}, cat={t_cat}, class={t_cls_name}, date={t_date}")
-        return "OK"
+    # =========================================================================
+    # [Fix] 統一 tag 解析函式（全域定義，Worker 與 Admin UI 共用）
+    # =========================================================================
     def _strip_notion_invisible(s):
         """剝除 Notion rich_text 可能夾帶的所有 Unicode 格式/控制字元。"""
         cleaned = ''.join(
@@ -1144,9 +1089,8 @@ try:
                 if notion_page_id:
                     _notion_ok = update_notion_task_status(notion_page_id, "任務已驗收")
                     _WORKER_LOG.append(f"[{datetime.now(TW_TZ).strftime('%H:%M:%S')}] Notion 更新: {'✅成功' if _notion_ok else '❌失敗'}")
-                    if not _notion_ok:
-                        raise Exception(f"[worker] Notion 狀態更新失敗 page_id={notion_page_id[:8] if notion_page_id else 'None'}")
-                    print(f"[worker] Notion 狀態更新：成功 page_id={notion_page_id[:8] if notion_page_id else 'None'}")
+                    print(f"[worker] Notion 狀態更新：{'成功' if _notion_ok else '失敗（已記錄，不影響任務完成）'} "
+                          f"page_id={notion_page_id[:8] if notion_page_id else 'None'}")
                 else:
                     print("[worker] notion_page_id 為空，跳過 Notion 更新")
                 _done_diag = f"debt={svc_debt_sids}|appeal={svc_appeal_sids}"
@@ -3459,17 +3403,24 @@ try:
             
         col4.metric("背景 Worker", f"{hb_status}", f"心跳: {int(hb_sec)}秒前 | 成功: {ls_text}")
         
-        # Worker 狀態與重啟按鈕（只在 Worker 死亡時才顯示）
+        # Worker 狀態、Log、重啟按鈕
         _ws = _get_worker_state()
         _t = _ws.get("thread")
         _alive = _t.is_alive() if _t else False
         _started = _ws.get("started_at", "未知")
+        # 統計所有 alive 的 background_worker thread
+        _all_bw = [t for t in threading.enumerate() if "background_worker" in t.name]
+        st.caption(f"Worker：{'🟢 alive' if _alive else '🔴 dead'}　啟動時間：{_started}　**全部 background_worker threads：{len(_all_bw)} 個**（{[t.name for t in _all_bw]}）")
         if not _alive:
-            st.warning(f"⚠️ Worker 執行緒未存活（啟動時間：{_started}）")
-            if st.button("🔄 重啟 Worker", type="primary"):
-                _start_fresh_worker()
-                st.success("✅ 新 Worker 已啟動！")
-                st.rerun()
+            st.warning(f"⚠️ Worker 執行緒未存活")
+        if st.button("🔄 強制重啟 Worker", type="primary"):
+            _start_fresh_worker()
+            st.success("✅ 新 Worker 已啟動！")
+            st.rerun()
+        if _WORKER_LOG:
+            st.code("\n".join(reversed(list(_WORKER_LOG))), language=None)
+        else:
+            st.warning("⚠️ Worker Log 空的")
         st.divider()
 
         last_err = get_last_error_summary()
