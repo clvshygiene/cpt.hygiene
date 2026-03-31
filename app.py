@@ -51,7 +51,7 @@ if sys_env == "DEV":
     st.warning("🚧 **目前位於 DEV 測試環境！** 在這裡送出的資料僅供測試，不會影響正式成績。")
 else:
     st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
-    st.sidebar.caption("🔧 app version: v_DIAG_5")  # [DIAG] 確認部署版本用，修好後可刪除
+    st.sidebar.caption("🔧 app version: v_DIAG_6")  # [DIAG] 確認部署版本用，修好後可刪除
 
 
 # --- 2. 核心參數與全域設定 ---
@@ -593,6 +593,9 @@ try:
 
     def _extract_svc_tasks(ws, records, max_attempts=6):
         # 從已讀取的 records 中提取 service_hours_only 任務，避免重複讀 Sheets
+        _svc_found = [r.get("id","?")[:8] for r in records if r.get("task_type")=="service_hours_only" and r.get("status") in ("PENDING","RETRY")]
+        if _svc_found:
+            _WORKER_LOG.append(f"[{datetime.now(TW_TZ).strftime('%H:%M:%S')}] _extract_svc_tasks: 找到 {len(_svc_found)} 筆 svc 任務: {_svc_found}")
         result = []
         batch_updates = []
         for i, r in enumerate(records):
@@ -619,18 +622,24 @@ try:
 
     def _extract_next_task(ws, records, max_attempts=6):
         # 從已讀取的 records 中取出第一筆非 service_hours_only 的 PENDING 任務
+        _now_s = datetime.now(TW_TZ).strftime("%H:%M:%S")
+        _all_statuses = [r.get("status","?") for r in records]
+        _WORKER_LOG.append(f"[{_now_s}] _extract_next_task called, total_records={len(records)}, statuses={_all_statuses[:10]}")
         for i, r in enumerate(records):
             if (r.get("task_type") != "service_hours_only"
                     and r.get("status") in ("PENDING", "RETRY")
                     and int(r.get("attempts", 0)) < max_attempts):
                 row_idx = i + 2
                 attempts_new = int(r.get("attempts", 0)) + 1
+                _WORKER_LOG.append(f"[{_now_s}] ✅ 找到任務！id={str(r.get('id',''))[:8]} type={r.get('task_type')} status={r.get('status')} row={row_idx}")
                 try:
                     ws.batch_update([
                         {"range": f"E{row_idx}", "values": [["IN_PROGRESS"]]},
                         {"range": f"F{row_idx}", "values": [[attempts_new]]}
                     ])
+                    _WORKER_LOG.append(f"[{_now_s}] ✅ 已標記 IN_PROGRESS row={row_idx}")
                 except Exception as e:
+                    _WORKER_LOG.append(f"[{_now_s}] ❌ 標記 IN_PROGRESS 失敗: {e}")
                     print(f"[fetch_next] 標記 IN_PROGRESS 失敗: {e}")
                     return None
                 return {
@@ -1286,9 +1295,8 @@ try:
                 # 處理含照片的任務（同一批 records，不重複讀）
                 task = _extract_next_task(ws, records)
                 if not task:
-                    # [配額修復 v2] 空閒輪詢拉長至 120 秒（2 分鐘）
-                    # 每天讀取次數：86400 / 120 = 720 次，為 UI 操作保留足夠配額
-                    time.sleep(120.0)
+                    # [DIAG v5] 暫時改為 5 秒，讓新 Worker 搶得到任務，確認診斷完成後可改回 30 秒
+                    time.sleep(5.0)
                     continue
 
                 _idle_loops = 0
