@@ -761,16 +761,26 @@ try:
                     is_dup = cur.fetchone() is not None
             except Exception:
                 pass
-            if not is_dup:
-                rows.append([svc_date, str(sid), class_name, category, str(hours), uuid.uuid4().hex[:8], ""])  # [方案A] 核發狀態空白
+            if is_dup:
+                print(f"[service_hours] dedup 跳過 sid={sid} date={svc_date} cat={category}")
+            else:
+                rows.append([svc_date, str(sid), class_name, category, str(hours), uuid.uuid4().hex[:8], ""])
                 dedup_keys.append((svc_date, str(sid), category, class_name))
+
+        print(f"[service_hours] 準備寫入 {len(rows)} 筆，student_list={student_list}，category={category}，date={svc_date}，class={class_name}")
+
         if not rows:
+            print(f"[service_hours] ⚠️ 全部被 dedup 過濾，不寫入。student_list={student_list}")
             return
+
         def _action():
             ws = get_worksheet(SHEET_TABS["service_hours"])
             if not ws: raise Exception("無法取得 service_hours 工作表")
             ws.append_rows(rows, value_input_option="RAW")
+
         execute_with_retry(_action)
+        print(f"[service_hours] ✅ 寫入成功 {len(rows)} 筆")
+
         for key in dedup_keys:
             try:
                 with closing(open_local_db()) as conn:
@@ -3239,7 +3249,7 @@ try:
         col2.metric("失敗", metrics.get("failed", 0))
         col3.metric("延遲(s)", int(metrics.get("oldest_pending_sec", 0)))
         
-        hb_status = "🟢 正常運作" if hb_sec < 60 else "🔴 已休眠/停止"
+        hb_status = "🟢 正常運作" if hb_sec < 300 else "🔴 已休眠/停止"
         is_dry_run = str(st.secrets.get("system_config", {}).get("dry_run", "false")).lower() in ["true", "1"]
         
         if is_dry_run: hb_status = "🟡 演習模式 (Dry Run)"
