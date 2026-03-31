@@ -51,7 +51,7 @@ if sys_env == "DEV":
     st.warning("🚧 **目前位於 DEV 測試環境！** 在這裡送出的資料僅供測試，不會影響正式成績。")
 else:
     st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
-    st.sidebar.caption("🔧 app version: v_DIAG_7")  # [DIAG] 確認部署版本用，修好後可刪除
+    st.sidebar.caption("🔧 app version: v_DIAG_9")  # [DIAG] 確認部署版本用，修好後可刪除
 
 
 # --- 2. 核心參數與全域設定 ---
@@ -1306,8 +1306,8 @@ try:
                 # 處理含照片的任務（同一批 records，不重複讀）
                 task = _extract_next_task(ws, records)
                 if not task:
-                    # [DIAG v5] 暫時改為 5 秒，讓新 Worker 搶得到任務，確認診斷完成後可改回 30 秒
-                    time.sleep(5.0)
+                    # [DIAG] 改為 15 秒，避免配額耗盡
+                    time.sleep(15.0)
                     continue
 
                 _idle_loops = 0
@@ -1346,32 +1346,38 @@ try:
                 time.sleep(5.0)
 
     @st.cache_resource
-    def ensure_worker_started():
-        # [DIAG v4] 寫入 _WORKER_LOG，確認此函式有被呼叫
-        _WORKER_LOG.append(f"[{datetime.now(TW_TZ).strftime('%H:%M:%S')}] ensure_worker_started 被呼叫，sys_env={sys_env}")
+    def _get_worker_state():
+        """儲存 Worker 的 stop_event 與 thread 引用，跨 rerun 不被清空。"""
+        return {"stop_event": None, "thread": None, "started_at": None}
 
-        if sys_env == "DEV":
-            _WORKER_LOG.append("[ensure] DEV 環境，Worker 停用，直接回傳")
-            return threading.Event()
-
-        _WORKER_LOG.append("[ensure] PROD 環境，開始建立執行緒...")
+    def _start_fresh_worker():
+        """啟動新 Worker，記錄到 _get_worker_state()。"""
+        state = _get_worker_state()
+        # 先停掉舊的（若存在）
+        if state["stop_event"] is not None:
+            state["stop_event"].set()
+            _WORKER_LOG.append(f"[{datetime.now(TW_TZ).strftime('%H:%M:%S')}] 已送出停止訊號給舊 Worker")
         stop_event = threading.Event()
+        t = threading.Thread(target=background_worker, args=(stop_event,), daemon=True)
         try:
-            t = threading.Thread(target=background_worker, args=(stop_event,), daemon=True)
-            _WORKER_LOG.append(f"[ensure] Thread 物件建立成功: {t}")
-            try:
-                add_script_run_ctx(t)
-                _WORKER_LOG.append("[ensure] add_script_run_ctx 成功")
-            except Exception as e:
-                _WORKER_LOG.append(f"[ensure] add_script_run_ctx 失敗（繼續）: {e}")
-            t.start()
-            _WORKER_LOG.append(f"[ensure] t.start() 完成，is_alive={t.is_alive()}")
-        except Exception as e:
-            _WORKER_LOG.append(f"[ensure] ❌ 建立/啟動執行緒時發生例外: {e}")
-            import traceback as _tb
-            _WORKER_LOG.append(_tb.format_exc()[:300])
-
+            add_script_run_ctx(t)
+        except Exception:
+            pass
+        t.start()
+        state["stop_event"] = stop_event
+        state["thread"] = t
+        state["started_at"] = datetime.now(TW_TZ).strftime("%H:%M:%S")
+        _WORKER_LOG.clear()
+        _WORKER_LOG.append(f"[{state['started_at']}] ✅ 新 Worker 啟動，is_alive={t.is_alive()}")
         return stop_event
+
+    @st.cache_resource
+    def ensure_worker_started():
+        _WORKER_LOG.append(f"[{datetime.now(TW_TZ).strftime('%H:%M:%S')}] ensure_worker_started 被呼叫，sys_env={sys_env}")
+        if sys_env == "DEV":
+            _WORKER_LOG.append("[ensure] DEV 環境，Worker 停用")
+            return threading.Event()
+        return _start_fresh_worker()
     _ = ensure_worker_started()
 
     # ==========================================
@@ -3408,13 +3414,22 @@ try:
             
         col4.metric("背景 Worker", f"{hb_status}", f"心跳: {int(hb_sec)}秒前 | 成功: {ls_text}")
         
-        # [DIAG v3] 顯示 module-level Worker log
-        st.subheader("🔍 Worker 即時診斷 Log（v_DIAG_3）")
+        # [DIAG v8] Worker 重啟按鈕 + 診斷 Log
+        st.subheader("🔍 Worker 即時診斷 Log（v_DIAG_8）")
+        _ws = _get_worker_state()
+        _t = _ws.get("thread")
+        _alive = _t.is_alive() if _t else False
+        _started = _ws.get("started_at", "未知")
+        st.caption(f"Worker 狀態：{'🟢 alive' if _alive else '🔴 dead / 未啟動'}　啟動時間：{_started}")
+        if st.button("🔄 強制重啟 Worker（殺舊換新）", type="primary"):
+            _start_fresh_worker()
+            st.success("✅ 新 Worker 已啟動！請稍後重新整理此頁確認 log 有在更新。")
+            st.rerun()
         if _WORKER_LOG:
-            log_text = "\n".join(reversed(list(_WORKER_LOG)))  # 最新的在最上面
+            log_text = "\n".join(reversed(list(_WORKER_LOG)))
             st.code(log_text, language=None)
         else:
-            st.warning("⚠️ _WORKER_LOG 是空的，代表 Worker 執行緒從未寫入任何 log。可能 Worker 根本沒有啟動，或啟動後立刻崩潰。")
+            st.warning("⚠️ _WORKER_LOG 是空的")
         st.divider()
 
         last_err = get_last_error_summary()
