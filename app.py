@@ -17,7 +17,7 @@ from datetime import datetime, date, timedelta
 from datetime import timezone
 import pytz
 import gspread
-import fitz  # [新增] PyMuPDF 套件，用來處理消警告單
+# import fitz  # [移除] 消警告單已改用 Excel 產製，不再需要 PyMuPDF
 from google.oauth2.service_account import Credentials as SACredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -188,12 +188,19 @@ try:
                 props = page.get("properties", {})
                 title = props.get("任務名稱", {}).get("title", [{}])
                 title_text = title[0].get("text", {}).get("content", "未命名任務") if title else "未命名任務"
+                # [愛校2.0] 任務內容
+                area = props.get("任務內容", {}).get("rich_text", [{}])
+                area_text = area[0].get("text", {}).get("content", "未填寫") if area else "未填寫"
                 date_obj = props.get("任務日期", {}).get("date", {})
                 raw_date = date_obj.get("start", "未定") if date_obj else "未定"
+                time_start = ""
                 if raw_date != "未定":
                     try:
                         parsed_date = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
                         date_val = parsed_date.strftime("%Y-%m-%d")
+                        # [愛校2.0] 若有時間資訊，保存起始時間供銷過單使用
+                        if len(raw_date) > 10:
+                            time_start = parsed_date.strftime("%H:%M")
                     except Exception:
                         date_val = raw_date
                 else:
@@ -202,8 +209,9 @@ try:
                 claimed_str = claimed_obj[0].get("text", {}).get("content", "") if claimed_obj else ""
                 claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
                 tasks.append({
-                    "id": page["id"], "title": title_text,
-                    "date": date_val, "claimants": claimants
+                    "id": page["id"], "title": title_text, "area": area_text,
+                    "date": date_val, "time_start": time_start,
+                    "claimants": claimants
                 })
             return tasks
         except Exception as e:
@@ -1035,6 +1043,151 @@ try:
         except Exception as e:
             print(f"[update_student_debt] {e}")
             return False
+
+    def generate_appeal_form_excel(student_id, cls_name, records):
+        """[愛校2.0] 生成消警告申請單 Excel 檔（取代 PDF 套印，避免座標偏移問題）"""
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "愛校服務申請單"
+
+        # 頁面設定（A4 直印）
+        ws.page_setup.paperSize = ws.PAPERSIZE_A4
+        ws.page_setup.orientation = 'portrait'
+        ws.page_margins.left = 0.6
+        ws.page_margins.right = 0.6
+        ws.page_margins.top = 0.5
+        ws.page_margins.bottom = 0.5
+
+        # 欄寬
+        ws.column_dimensions['A'].width = 6    # 序號
+        ws.column_dimensions['B'].width = 30   # 工作內容
+        ws.column_dimensions['C'].width = 14   # 服務日期
+        ws.column_dimensions['D'].width = 12   # 起始時間
+        ws.column_dimensions['E'].width = 12   # 結束時間
+        ws.column_dimensions['F'].width = 8    # 時數
+        ws.column_dimensions['G'].width = 10   # 確認
+
+        # 樣式定義
+        title_font = Font(name='微軟正黑體', size=18, bold=True)
+        header_font = Font(name='微軟正黑體', size=12, bold=True)
+        info_font = Font(name='微軟正黑體', size=12)
+        cell_font = Font(name='微軟正黑體', size=11)
+        small_font = Font(name='微軟正黑體', size=9, color='808080')
+        total_font = Font(name='微軟正黑體', size=14, bold=True)
+        thin_border = Border(
+            left=Side(style='thin'), right=Side(style='thin'),
+            top=Side(style='thin'), bottom=Side(style='thin')
+        )
+        center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        left_align = Alignment(horizontal='left', vertical='center', wrap_text=True)
+        right_align = Alignment(horizontal='right', vertical='center')
+        header_fill = PatternFill(start_color='D9E2F3', end_color='D9E2F3', fill_type='solid')
+
+        # ── Row 1：標題 ──
+        ws.merge_cells('A1:G1')
+        ws['A1'] = '中壢家商 愛校服務申請單'
+        ws['A1'].font = title_font
+        ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
+        ws.row_dimensions[1].height = 42
+
+        # ── Row 2：空行 ──
+        ws.row_dimensions[2].height = 8
+
+        # ── Row 3：學生資訊 ──
+        now_tw = datetime.now(TW_TZ)
+        roc_year = now_tw.year - 1911
+        ws.merge_cells('A3:C3')
+        ws['A3'] = f'班級：{cls_name}　　學號：{student_id}'
+        ws['A3'].font = info_font
+        ws['A3'].alignment = left_align
+        ws.merge_cells('D3:G3')
+        ws['D3'] = f'列印日期：{roc_year} 年 {now_tw.month} 月 {now_tw.day} 日'
+        ws['D3'].font = info_font
+        ws['D3'].alignment = right_align
+        ws.row_dimensions[3].height = 28
+
+        # ── Row 4：空行 ──
+        ws.row_dimensions[4].height = 6
+
+        # ── Row 5：表頭 ──
+        headers = ['序號', '工作內容', '服務日期', '起始時間', '結束時間', '時數', '確認']
+        for col_idx, header in enumerate(headers, 1):
+            cell = ws.cell(row=5, column=col_idx, value=header)
+            cell.font = header_font
+            cell.alignment = center_align
+            cell.border = thin_border
+            cell.fill = header_fill
+        ws.row_dimensions[5].height = 30
+
+        # ── Row 6-13：資料列（共 8 列）──
+        total_hours = 0.0
+        for row_idx in range(8):
+            row_num = 6 + row_idx
+            ws.row_dimensions[row_num].height = 28
+            if row_idx < len(records):
+                rec = records[row_idx]
+                values = [
+                    row_idx + 1, rec.get('work_content', ''), rec.get('date', ''),
+                    rec.get('start_time', ''), rec.get('end_time', ''),
+                    rec.get('hours', ''), ''  # 確認欄留空供簽章
+                ]
+                try:
+                    total_hours += float(rec.get('hours', 0))
+                except (ValueError, TypeError):
+                    pass
+            else:
+                values = [row_idx + 1, '', '', '', '', '', '']
+            for col_idx, value in enumerate(values, 1):
+                cell = ws.cell(row=row_num, column=col_idx, value=value)
+                cell.font = cell_font
+                cell.alignment = left_align if col_idx == 2 else center_align
+                cell.border = thin_border
+
+        # ── Row 14：總計列 ──
+        ws.merge_cells('A14:E14')
+        ws['A14'] = '總計服務時數'
+        ws['A14'].font = header_font
+        ws['A14'].alignment = right_align
+        ws['A14'].border = thin_border
+        for col in range(2, 6):
+            ws.cell(row=14, column=col).border = thin_border
+        ws['F14'] = total_hours
+        ws['F14'].font = total_font
+        ws['F14'].alignment = center_align
+        ws['F14'].border = thin_border
+        ws['G14'] = ''
+        ws['G14'].border = thin_border
+        ws.row_dimensions[14].height = 30
+
+        # ── Row 15-16：空行 ──
+        ws.row_dimensions[15].height = 15
+        ws.row_dimensions[16].height = 15
+
+        # ── Row 17：簽名欄 ──
+        ws.merge_cells('A17:C17')
+        ws['A17'] = '學生簽名：＿＿＿＿＿＿＿＿'
+        ws['A17'].font = info_font
+        ws['A17'].alignment = left_align
+        ws.merge_cells('D17:G17')
+        ws['D17'] = '衛生組長核章：＿＿＿＿＿＿'
+        ws['D17'].font = info_font
+        ws['D17'].alignment = left_align
+        ws.row_dimensions[17].height = 35
+
+        # ── Row 19：備註 ──
+        ws.merge_cells('A19:G19')
+        ws['A19'] = '※ 本表經衛生組長核章後，請持此表至學務處完成後續紙本流程。'
+        ws['A19'].font = small_font
+        ws['A19'].alignment = left_align
+
+        # 輸出
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return buf.getvalue()
 
     PUBLISHED_COLS = ["週次", "排名", "年級", "班級", "總扣分", "優良次數", "總成績", "評等", "排名模式", "發布時間"]
 
@@ -3356,83 +3509,37 @@ try:
                         for _ct in _claimed_tasks:
                             with st.container(border=True):
                                 st.write(f"📌 **{_ct['title']}**")
-                                st.caption(f"📅 日期：{_ct['date']}　|　認領學生：{', '.join(_ct['claimants'])}")
+                                st.caption(f"📅 日期：{_ct['date']}　|　📝 內容：{_ct.get('area', '未填寫')}　|　認領學生：{', '.join(_ct['claimants'])}")
 
-                                # [新增] 聰明 UX：自動偵測消警告名單，直接產出專屬下載按鈕！
+                                # [愛校2.0] 自動偵測各目的學生名單
                                 _appeal_students = []
+                                _punish_students = []
+                                _debt_students = []
                                 for _clm in _ct["claimants"]:
                                     _sid_match = re.match(r"(\d+)", _clm)
                                     _tag_match = re.search(r"\((.*?)\)", _clm)
-                                    if _sid_match and _tag_match and _tag_match.group(1) == "消警告":
-                                        _appeal_students.append(_sid_match.group(1))
+                                    if _sid_match:
+                                        _tag = _tag_match.group(1) if _tag_match else "還時數"
+                                        if _tag == "消警告":
+                                            _appeal_students.append(_sid_match.group(1))
+                                        elif _tag == "糾察懲罰":
+                                            _punish_students.append(_sid_match.group(1))
+                                        else:
+                                            _debt_students.append(_sid_match.group(1))
+
+                                # 顯示各目的標籤摘要
+                                _tag_parts = []
+                                if _debt_students:
+                                    _tag_parts.append(f"🟢 還時數 {len(_debt_students)} 人")
+                                if _appeal_students:
+                                    _tag_parts.append(f"🔔 消警告 {len(_appeal_students)} 人")
+                                if _punish_students:
+                                    _tag_parts.append(f"⚫ 糾察懲罰 {len(_punish_students)} 人")
+                                if _tag_parts:
+                                    st.markdown("　".join(_tag_parts))
 
                                 if _appeal_students:
-                                    st.info("💡 偵測到以下學生申請「消警告」，請先點擊下載申請單，再按下驗收！")
-                                    # 動態排列下載按鈕
-                                    btn_cols = st.columns(len(_appeal_students))
-                                    for idx, _sid in enumerate(_appeal_students):
-                                        _clean_sid = clean_id(_sid)
-                                        _cls_name = ROSTER_DICT.get(_clean_sid, "")
-                                        
-                                        # --- 這是要替換的完整 PDF 產製區塊 ---
-                                        try:
-                                            _doc = fitz.open("愛校服務申請單.pdf")
-                                            _page = _doc[0]
-                                            
-                                            _font_path = "kaiu.ttf"
-                                            if not os.path.exists(_font_path):
-                                                st.error("❌ 找不到 kaiu.ttf 字型檔，請確認是否已上傳至 GitHub！")
-                                            else:
-                                                _page.insert_font(fontname="kaiu", fontfile=_font_path)
-                                                
-                                                # 1. 印表頭基本資料
-                                                _header_data = [
-                                                    (_cls_name, 120, 150),   # 班級
-                                                    (_clean_sid, 300, 150),  # 學號
-                                                ]
-                                                for _text, _x, _y in _header_data:
-                                                    _page.insert_text(fitz.Point(_x, _y), _text, fontsize=14, fontname="kaiu", color=(0, 0, 0))
-                                                    
-                                                # 2. 撈取並印出「消警告」明細
-                                                ws_svc = get_worksheet(SHEET_TABS["service_hours"])
-                                                _total_hours = 0.0
-                                                if ws_svc:
-                                                    _svc_data = ws_svc.get_all_records()
-                                                    _df_svc = pd.DataFrame(_svc_data)
-                                                    
-                                                    if not _df_svc.empty and "學號" in _df_svc.columns and "類別" in _df_svc.columns:
-                                                        # 找出這個學號，且類別是消警告的紀錄
-                                                        _my_appeals = _df_svc[(_df_svc["學號"].astype(str) == _clean_sid) & (_df_svc["類別"] == "愛校服務(消警告)")].copy()
-                                                        
-                                                        _start_y = 230  # 表格第一列起始高度
-                                                        _line_gap = 25  # 行距
-                                                        
-                                                        for r_idx, row in enumerate(_my_appeals.itertuples()):
-                                                            if r_idx >= 10: break  # 表格上限10筆
-                                                            _curr_y = _start_y + (r_idx * _line_gap)
-                                                            
-                                                            _page.insert_text(fitz.Point(90, _curr_y), str(row.日期), fontsize=11, fontname="kaiu")
-                                                            _page.insert_text(fitz.Point(210, _curr_y), str(row.班級)[:18], fontsize=10, fontname="kaiu")
-                                                            _page.insert_text(fitz.Point(490, _curr_y), str(row.時數), fontsize=11, fontname="kaiu")
-                                                            _total_hours += float(row.時數)
-                                                            
-                                                # 3. 印出總計時數
-                                                _page.insert_text(fitz.Point(490, 515), f"{_total_hours:g}", fontsize=13, fontname="kaiu")
-                                                    
-                                                _pdf_bytes = _doc.write()
-                                                _doc.close()
-                                                
-                                                with btn_cols[idx]:
-                                                    st.download_button(
-                                                        label=f"📥 下載 {_clean_sid} 銷過單",
-                                                        data=_pdf_bytes,
-                                                        file_name=f"愛校申請單_{_cls_name}_{_clean_sid}.pdf",
-                                                        mime="application/pdf",
-                                                        key=f"dl_pdf_{_ct['id']}_{_clean_sid}"
-                                                    )
-                                        except Exception as e:
-                                            st.error(f"產製 PDF 發生錯誤：{e}")
-                                        # --- 替換區塊結束 ---
+                                    st.info(f"💡 偵測到 {len(_appeal_students)} 位學生申請「消警告」（{', '.join(_appeal_students)}），驗收完成後請至下方「🖨️ 銷過單核發」區塊產製申請表單。")
 
                                 # 將按鈕名稱改得更符合實際動作
                                 if st.button("✅ 依標籤自動驗收", key=f"verify_{_ct['id']}"):
@@ -3455,12 +3562,13 @@ try:
                                                 if update_student_debt(_sid_val, -_task_hours, f"愛校驗收：{_ct['title']}"):
                                                     _debt_deducted_count += 1
                                                 _issued_sids.append(_sid_val)
+                                                time.sleep(0.3)  # [防429] 每人之間加小延遲
                                                 
                                             elif _tag_val == "消警告":
                                                 _appeal_sids.append(_sid_val)
                                                 
                                             elif _tag_val == "糾察懲罰":
-                                                pass 
+                                                pass  # 糾察懲罰：一筆勾銷，不給時數也不消警告
 
                                     # 1. 正常發放「還時數」的服務時數
                                     if _issued_sids:
@@ -3473,12 +3581,16 @@ try:
                                         }
                                         enqueue_task("service_hours_only", _payload_normal)
                                         
-                                    # 2. [新增] 將「消警告」的明細存入資料庫，類別標記為專屬標籤，方便 PDF 撈取
+                                    # 2. [愛校2.0] 將「消警告」的明細存入 service_hours，含工作內容與起始時間
                                     if _appeal_sids:
+                                        _work_content = _ct.get('area', _ct['title'])
+                                        _time_start = _ct.get('time_start', '')
+                                        _class_field = f"{_work_content}|{_time_start}" if _time_start else _work_content
+                                        _task_date = _ct.get('date', str(today_tw))
                                         _payload_appeal = {
                                             "student_list": _appeal_sids,
-                                            "date": str(today_tw),
-                                            "class_name": _ct['title'],  # 巧妙地把「打掃內容」存在班級欄位紀錄下來
+                                            "date": _task_date if _task_date != "未定" else str(today_tw),
+                                            "class_name": _class_field,  # 格式：「工作內容|起始時間」供銷過單撈取
                                             "category": "愛校服務(消警告)", 
                                             "hours": _task_hours
                                         }
@@ -3490,7 +3602,9 @@ try:
                                     if _debt_deducted_count > 0 or _issued_sids:
                                         msg_parts.append(f"🟢 幫 {_debt_deducted_count} 人扣除欠時，並排程核發 {len(_issued_sids)} 人一般服務時數。")
                                     if _appeal_sids:
-                                        msg_parts.append(f"🔔 紀錄已儲存！請點擊上方按鈕為 {len(_appeal_sids)} 位學生產製《消警告申請單》。")
+                                        msg_parts.append(f"🔔 消警告紀錄已儲存！請至下方「🖨️ 銷過單核發」區塊為 {len(_appeal_sids)} 位學生產製表單。")
+                                    if _punish_students:
+                                        msg_parts.append(f"⚫ {len(_punish_students)} 位糾察懲罰學生已標記完成（不發時數、不消警告）。")
                                         
                                     st.success("\n".join(msg_parts))
                                     time.sleep(3.5)
@@ -3536,71 +3650,107 @@ try:
                                 key="debt_excel_dl"
                             )
 
-                # ── 區塊 C：🖨️ 銷過單核發 (PDF 自動生成) ──
+                # ── 區塊 C：🖨️ 銷過單核發 (Excel 自動生成) ──
                 with st.expander("🖨️ 銷過單核發 (消警告單)", expanded=True):
-                    st.info("💡 輸入學號，系統將自動套印《愛校服務申請單.pdf》供下載。確認格式無誤後，未來將升級為自動寄信給學生。")
+                    st.info("💡 輸入學號，系統將自動從已驗收的消警告紀錄中產製《愛校服務申請單》Excel 檔供下載列印。")
                     
                     _pdf_sid = st.text_input("請輸入要申請銷過的【學號】", placeholder="例如：112001", key="pdf_gen_sid")
                     
-                    if st.button("🪄 一鍵生成 PDF 申請單", key="btn_gen_pdf"):
+                    if st.button("🪄 查詢並產製銷過單", key="btn_gen_pdf"):
                         if not _pdf_sid:
                             st.error("請先輸入學號！")
                         else:
                             _clean_sid = clean_id(_pdf_sid)
                             _cls_name = ROSTER_DICT.get(_clean_sid, "")
                             
-                            # 尋找學生姓名 (從 main_data 中找，若找不到則留白)
-                            _student_name = ""
-                            _all_records = load_main_data()
-                            if not _all_records.empty:
-                                # 這裡利用一個小技巧：從過去的扣分紀錄中抓取姓名(如果有存的話)，或者依賴你的系統是否有其他對照表
-                                # 若系統目前沒有儲存姓名對照表，我們請學生自己手寫，或暫時留白
-                                pass 
-                            
                             if not _cls_name:
                                 st.error(f"❌ 在名單中找不到學號 {_clean_sid} 的班級資料！")
                             else:
                                 try:
-                                    # 1. 讀取空白底稿
-                                    _doc = fitz.open("愛校服務申請單.pdf")
-                                    _page = _doc[0]  # 取第一頁
+                                    # 從 service_hours 撈取所有消警告紀錄
+                                    def _fetch_appeal_records():
+                                        ws_svc = get_worksheet(SHEET_TABS["service_hours"])
+                                        if not ws_svc:
+                                            return []
+                                        _svc_data = ws_svc.get_all_records()
+                                        _df_svc = pd.DataFrame(_svc_data)
+                                        if _df_svc.empty or "學號" not in _df_svc.columns:
+                                            return []
+                                        _my_records = _df_svc[
+                                            (_df_svc["學號"].astype(str) == _clean_sid) &
+                                            (_df_svc["類別"] == "愛校服務(消警告)")
+                                        ]
+                                        return _my_records.to_dict('records')
                                     
-                                    # 2. 設定今日日期 (民國年)
-                                    _now_date = datetime.now(TW_TZ)
-                                    _roc_year = _now_date.year - 1911
-                                    _month = _now_date.month
-                                    _day = _now_date.day
+                                    with st.spinner("正在查詢消警告紀錄..."):
+                                        _raw_records = execute_with_retry(_fetch_appeal_records)
                                     
-                                    # 3. 定義要印上去的文字與座標 (x, y)
-                                    # ⚠️ 這裡的座標是預估值，稍後下載後若有偏差，只需微調這裡的數字即可
-                                    _text_data = [
-                                        (str(_roc_year), 400, 115),  # 年
-                                        (str(_month), 460, 115),     # 月
-                                        (str(_day), 510, 115),       # 日
-                                        (_cls_name, 120, 140),       # 班級
-                                        (_clean_sid, 450, 140)       # 學號
-                                    ]
-                                    
-                                    # 4. 將文字精準壓印到 PDF 上
-                                    for _text, _x, _y in _text_data:
-                                        # 使用 PyMuPDF 內建的 cjk (中日韓) 字體以支援中文顯示
-                                        _page.insert_text(fitz.Point(_x, _y), _text, fontsize=14, fontname="cjk", color=(0, 0, 0))
-                                    
-                                    # 5. 輸出成位元組 (Bytes) 供下載
-                                    _pdf_bytes = _doc.write()
-                                    _doc.close()
-                                    
-                                    st.success("✅ PDF 產生成功！請點擊下方按鈕下載檢查：")
-                                    st.download_button(
-                                        label="📥 下載專屬愛校服務申請單 (PDF)",
-                                        data=_pdf_bytes,
-                                        file_name=f"愛校申請單_{_cls_name}_{_clean_sid}.pdf",
-                                        mime="application/pdf"
-                                    )
-                                    
+                                    if not _raw_records:
+                                        st.warning(f"⚠️ 找不到學號 {_clean_sid} 的消警告服務紀錄。請確認是否已驗收完成。")
+                                    else:
+                                        # 解析紀錄：從「班級」欄位解析工作內容與起始時間
+                                        _parsed_records = []
+                                        for _rec in _raw_records[:8]:  # 最多 8 筆
+                                            _class_field = str(_rec.get("班級", ""))
+                                            _parts = _class_field.split("|")
+                                            _work_content = _parts[0].strip() if _parts else ""
+                                            _start_time = _parts[1].strip() if len(_parts) > 1 else ""
+                                            _hours = 0.0
+                                            try:
+                                                _hours = float(_rec.get("時數", 0))
+                                            except (ValueError, TypeError):
+                                                pass
+                                            _date_str = str(_rec.get("日期", ""))
+                                            
+                                            # 自動計算結束時間 = 起始時間 + 時數
+                                            _end_time = ""
+                                            if _start_time:
+                                                try:
+                                                    _st = datetime.strptime(_start_time, "%H:%M")
+                                                    _et = _st + timedelta(hours=_hours)
+                                                    _end_time = _et.strftime("%H:%M")
+                                                except Exception:
+                                                    pass
+                                            
+                                            _parsed_records.append({
+                                                "work_content": _work_content,
+                                                "date": _date_str,
+                                                "start_time": _start_time,
+                                                "end_time": _end_time,
+                                                "hours": _hours
+                                            })
+                                        
+                                        # 顯示預覽表格
+                                        st.success(f"✅ 找到 {len(_parsed_records)} 筆消警告紀錄（最多顯示 8 筆）：")
+                                        _preview_df = pd.DataFrame([{
+                                            "序號": i + 1,
+                                            "工作內容": r["work_content"],
+                                            "服務日期": r["date"],
+                                            "起始時間": r["start_time"] if r["start_time"] else "—",
+                                            "結束時間": r["end_time"] if r["end_time"] else "—",
+                                            "時數": r["hours"]
+                                        } for i, r in enumerate(_parsed_records)])
+                                        st.dataframe(_preview_df, hide_index=True)
+                                        
+                                        _total_h = sum(r["hours"] for r in _parsed_records)
+                                        st.metric("總計服務時數", f"{_total_h:g} 小時")
+                                        
+                                        # 產製 Excel
+                                        _excel_bytes = generate_appeal_form_excel(
+                                            _clean_sid, _cls_name, _parsed_records
+                                        )
+                                        st.download_button(
+                                            label="📥 下載愛校服務申請單 (Excel)",
+                                            data=_excel_bytes,
+                                            file_name=f"愛校申請單_{_cls_name}_{_clean_sid}.xlsx",
+                                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                            key="dl_appeal_excel"
+                                        )
+                                        st.caption("💡 下載後請用 Excel 開啟，確認格式無誤後列印 A4 紙張，再持表單至學務處完成後續流程。")
+                                        
                                 except Exception as e:
-                                    st.error(f"❌ 產生 PDF 時發生錯誤：{e}")
-                                    st.caption("請確認 `愛校服務申請單.pdf` 是否已正確上傳至 GitHub。")
+                                    st.error(f"❌ 產製銷過單時發生錯誤：{e}")
+                                    st.caption("請確認 Google Sheets 的 service_hours 工作表連線是否正常。")
 
         elif pwd_input != "":
             st.error("密碼錯誤")
