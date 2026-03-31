@@ -42,7 +42,7 @@ if sys_env == "DEV":
     st.warning("🚧 **目前位於 DEV 測試環境！** 在這裡送出的資料僅供測試，不會影響正式成績。")
 else:
     st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
-    st.sidebar.caption("🔧 app version: v_DIAG_1")  # [DIAG] 確認部署版本用，修好後可刪除
+    st.sidebar.caption("🔧 app version: v_DIAG_2")  # [DIAG] 確認部署版本用，修好後可刪除
 
 
 # --- 2. 核心參數與全域設定 ---
@@ -872,11 +872,20 @@ try:
     def process_task(task):
         task_type, payload = task["task_type"], task["payload"]
 
-        # [DIAG] 每次 process_task 被呼叫都立即寫一筆到 Sheets，
-        # 讓我們不依賴 print() 也能確認 Worker 是否真的有執行到這裡
+        # [DIAG v2] 直接寫進 debt_history，確保不依賴 ws 狀態
         _task_id_diag = str(task.get("id", ""))
         _diag_detail = f"type={task_type} payload_keys={list(payload.keys()) if payload else 'EMPTY'}"
-        _write_worker_diag(_task_id_diag, task_type, "CALLED", _diag_detail)
+        try:
+            _dh_ws2 = get_worksheet(SHEET_TABS["debt_history"])
+            if _dh_ws2:
+                _dh_ws2.append_row(
+                    [datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+                     f"DIAG_{_task_id_diag[:8]}", 0, 0,
+                     f"[PROCESS_TASK_CALLED] {_diag_detail}"],
+                    value_input_option="RAW"
+                )
+        except Exception:
+            pass
         
         is_dry_run = str(st.secrets.get("system_config", {}).get("dry_run", "false")).lower() in ["true", "1"]
         if is_dry_run:
@@ -944,9 +953,19 @@ try:
                 # [Patch B] task_id 為空時停用 dedup 保護（不應發生，但防禦極端情況）
                 _dedup_enabled = bool(_task_id_for_dedup)
 
-                # [DIAG] 直接寫 Sheets 診斷（不依賴 print/log）
-                _claimants_diag = f"claimants={claimants}|area={task_area}|date={task_date_str}|hours={task_hours}"
-                _write_worker_diag(_task_id_for_dedup, "campus_service_verify", "VERIFY_START", _claimants_diag)
+                # [DIAG v2] 把 payload 直接寫進 debt_history，永不消失，不依賴 ws 狀態
+                try:
+                    _dh_ws = get_worksheet(SHEET_TABS["debt_history"])
+                    if _dh_ws:
+                        _diag_now = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
+                        _diag_payload_str = str(payload)[:300]
+                        _dh_ws.append_row(
+                            [_diag_now, f"DIAG_{_task_id_for_dedup[:8]}", 0, 0,
+                             f"[WORKER_DIAG] claimants={claimants} | payload={_diag_payload_str}"],
+                            value_input_option="RAW"
+                        )
+                except Exception as _dh_e:
+                    pass  # 診斷失敗不影響主流程
                 print(f"[verify] ▶ 開始執行 task_id={_task_id_for_dedup[:8] if _task_id_for_dedup else '?'} "
                       f"claimants={claimants} area={task_area} date={task_date_str} hours={task_hours}")
 
