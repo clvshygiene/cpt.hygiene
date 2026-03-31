@@ -3403,33 +3403,31 @@ try:
             
         col4.metric("背景 Worker", f"{hb_status}", f"心跳: {int(hb_sec)}秒前 | 成功: {ls_text}")
         
-        # Worker 狀態、Log、重啟按鈕
-        _ws = _get_worker_state()
-        _t = _ws.get("thread")
-        _alive = _t.is_alive() if _t else False
-        _started = _ws.get("started_at", "未知")
-        # 統計所有 alive 的 background_worker thread
-        _all_bw = [t for t in threading.enumerate() if "background_worker" in t.name]
-        st.caption(f"Worker：{'🟢 alive' if _alive else '🔴 dead'}　啟動時間：{_started}　**全部 background_worker threads：{len(_all_bw)} 個**（{[t.name for t in _all_bw]}）")
-        if not _alive:
-            st.warning(f"⚠️ Worker 執行緒未存活")
-        if st.button("🔄 強制重啟 Worker", type="primary"):
-            _start_fresh_worker()
-            st.success("✅ 新 Worker 已啟動！")
-            st.rerun()
-        if _WORKER_LOG:
-            st.code("\n".join(reversed(list(_WORKER_LOG))), language=None)
-        else:
-            st.warning("⚠️ Worker Log 空的")
-        st.divider()
-
         last_err = get_last_error_summary()
         if last_err != "無紀錄":
             st.error(f"🚨 **最後錯誤紀錄:** {last_err}")
 
         pwd_input = st.text_input("管理密碼", type="password", key="admin_pwd")
         if pwd_input == st.secrets["system_config"]["admin_password"]:
-            
+
+            # Worker 狀態、Log、重啟按鈕（密碼驗證後才顯示）
+            _ws = _get_worker_state()
+            _t = _ws.get("thread")
+            _alive = _t.is_alive() if _t else False
+            _started = _ws.get("started_at", "未知")
+            _all_bw = [t for t in threading.enumerate() if "background_worker" in t.name]
+            st.caption(f"Worker：{'🟢 alive' if _alive else '🔴 dead'}　啟動時間：{_started}　threads：{len(_all_bw)} 個")
+            if not _alive:
+                st.warning("⚠️ Worker 執行緒未存活")
+            if st.button("🔄 強制重啟 Worker", type="primary", key="restart_worker_btn"):
+                _start_fresh_worker()
+                st.success("✅ 新 Worker 已啟動！")
+                st.rerun()
+            if _WORKER_LOG:
+                with st.expander("📋 Worker Log", expanded=False):
+                    st.code("\n".join(reversed(list(_WORKER_LOG))), language=None)
+            st.divider()
+
             t_mon, t_rollcall, t4, t_appeal, t_excellent, t2, t1, t_settings, t3, t_debt = st.tabs([
                 "👀 衛生糾察", "👮 環保糾察", "📝 扣分明細", "📣 申訴", "⭐ 優良審核", "📊 成績總表", 
                 "🧹 晨掃審核", "⚙️ 設定", "🎖️ 服務時數發放", "🤝 愛校與欠時管理"  # [新增] 愛校服務 2.0
