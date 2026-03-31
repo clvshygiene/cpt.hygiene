@@ -564,6 +564,8 @@ try:
 
     def update_task_status(task_id, status, attempts, last_error, _row_idx=None):
         # DONE → 直接刪行，讓 task_queue 不積累；失敗/重試才保留並更新
+        # [Debug Fix] delete_rows / batch_update 加上 execute_with_retry，
+        # 避免單次 429/timeout 靜默失敗後任務永遠卡在 IN_PROGRESS
         try:
             ws = get_worksheet(SHEET_TABS["task_queue"])
             if not ws: return
@@ -579,18 +581,20 @@ try:
             if status == "DONE":
                 # 成功完成 → 直接刪除這行，task_queue 永遠不會積累歷史紀錄
                 try:
-                    ws.delete_rows(ridx)
+                    execute_with_retry(lambda: ws.delete_rows(ridx))
                 except Exception as e:
-                    print(f"[task_queue] 刪行失敗（忽略）: {e}")
+                    print(f"[task_queue] 刪行失敗（{task_id[:8]}，row={ridx}）: {e}")
             else:
                 # FAILED 或 RETRY → 更新狀態保留供查閱
-                ws.batch_update([
-                    {"range": f"E{ridx}", "values": [[status]]},
-                    {"range": f"F{ridx}", "values": [[attempts]]},
-                    {"range": f"G{ridx}", "values": [[str(last_error)[:200] if last_error else ""]]}
-                ])
+                def _status_update():
+                    ws.batch_update([
+                        {"range": f"E{ridx}", "values": [[status]]},
+                        {"range": f"F{ridx}", "values": [[attempts]]},
+                        {"range": f"G{ridx}", "values": [[str(last_error)[:200] if last_error else ""]]}
+                    ])
+                execute_with_retry(_status_update)
         except Exception as e:
-            print(f"update_task_status error: {e}")
+            print(f"update_task_status error (task={task_id[:8] if task_id else '?'}, status={status}): {e}")
 
     # ==========================================
     # 背景處理邏輯
@@ -975,26 +979,42 @@ try:
                         task_date_str if task_date_str != "未定" else str(date.today())
                     )
 
-                # [Fix 2] 消警告不再直接呼叫 _write_service_hours_direct，
-                #         改為排入獨立的 service_hours_only 子任務，
-                #         讓它擁有自己的 6 次重試，與 debt 操作完全解耦，
-                #         避免前面流程成功後因 Sheets 超時導致整個 task 被 RETRY
-                #         再次重複執行 debt 扣時。
+                # [Fix 2 / Debug Fix] 消警告改寫入 SQLite fallback_queue，不直接打 Sheets API。
+                # 原本 enqueue_task("service_hours_only") 是同步寫 task_queue_v3，
+                # 與後面 update_task_status 的 delete_rows 連續打同一個分頁，
+                # 任何一次 429/timeout 都會讓 delete_rows 靜默失敗，任務永遠卡 IN_PROGRESS。
+                # 改寫 SQLite 後 drain_fallback_queue 會在下輪推至 Sheets，完全解耦。
                 if svc_appeal_sids:
                     _cf = f"{task_area}|{time_start_v}" if time_start_v else task_area
                     _ad = task_date_str if task_date_str != "未定" else str(date.today())
-                    enqueue_task("service_hours_only", {
+                    _sub_task_id = str(uuid.uuid4())
+                    _sub_payload_json = json.dumps({
                         "date":         _ad,
                         "category":     "愛校服務(消警告)",
                         "class_name":   _cf,
                         "hours":        task_hours,
                         "student_list": svc_appeal_sids
-                    })
-                    print(f"[worker] 消警告 service_hours 已排入子任務，共 {len(svc_appeal_sids)} 人：{svc_appeal_sids}")
+                    }, ensure_ascii=False)
+                    try:
+                        with closing(open_local_db()) as _sq:
+                            _sq.execute(
+                                "INSERT OR IGNORE INTO fallback_queue VALUES (?, ?, ?, ?)",
+                                (_sub_task_id, "service_hours_only",
+                                 _sub_payload_json,
+                                 datetime.now(timezone.utc).isoformat())
+                            )
+                        print(f"[worker] 消警告 service_hours_only 已寫入 fallback_queue，"
+                              f"共 {len(svc_appeal_sids)} 人：{svc_appeal_sids}")
+                    except Exception as _fe:
+                        print(f"[worker] 消警告 fallback_queue 寫入失敗（下輪重試）: {_fe}")
 
                 # 更新 Notion 狀態
                 if notion_page_id:
-                    update_notion_task_status(notion_page_id, "任務已驗收")
+                    _notion_ok = update_notion_task_status(notion_page_id, "任務已驗收")
+                    print(f"[worker] Notion 狀態更新：{'成功' if _notion_ok else '失敗（已記錄，不影響任務完成）'} "
+                          f"page_id={notion_page_id[:8] if notion_page_id else 'None'}")
+                else:
+                    print("[worker] notion_page_id 為空，跳過 Notion 更新")
                 print(f"[worker] campus_service_verify 完成：debt={svc_debt_sids} appeal={svc_appeal_sids}")
 
             # ── [愛校2.0 Async] 背景晨掃審核 ──────────────────────────
