@@ -116,7 +116,8 @@ try:
                 req_num = req_num_obj if req_num_obj else 1  
                 
                 claimed_obj = props.get("認領學號", {}).get("rich_text", [])
-                claimed_str = claimed_obj[0].get("text", {}).get("content", "") if claimed_obj else ""
+                # [Fix] 合併所有 rich_text blocks，Notion 超過一定長度會自動拆成多個 block
+                claimed_str = "".join(b.get("text", {}).get("content", "") for b in claimed_obj)
                 current_claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
                 current_count = len(current_claimants)
                 
@@ -141,7 +142,8 @@ try:
             req_num = req_num_obj if req_num_obj else 1
             
             claimed_obj = props.get("認領學號", {}).get("rich_text", [])
-            claimed_str = claimed_obj[0].get("text", {}).get("content", "") if claimed_obj else ""
+            # [Fix] 合併所有 rich_text blocks，Notion 超過一定長度會自動拆成多個 block
+            claimed_str = "".join(b.get("text", {}).get("content", "") for b in claimed_obj)
             current_claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
             
             if any(str(student_id) in c for c in current_claimants):  
@@ -207,7 +209,8 @@ try:
                 else:
                     date_val = "未定"
                 claimed_obj = props.get("認領學號", {}).get("rich_text", [])
-                claimed_str = claimed_obj[0].get("text", {}).get("content", "") if claimed_obj else ""
+                # [Fix] 合併所有 rich_text blocks，Notion 超過一定長度會自動拆成多個 block
+                claimed_str = "".join(b.get("text", {}).get("content", "") for b in claimed_obj)
                 claimants = [s.strip() for s in claimed_str.split(",") if s.strip()]
                 tasks.append({
                     "id": page["id"], "title": title_text, "area": area_text,
@@ -1320,12 +1323,16 @@ try:
 
         # ── Row 3：填入班級 / 學號（姓名欄留空，手寫）──
         # A3='班　級'(label) B3=班級值  C3='姓　名'(label) D3=空  E3='學　號'(label) F3:G3=學號值
+        from openpyxl.styles import Alignment
+        _ac = Alignment(horizontal='center', vertical='center', wrap_text=True)
         ws['B3'] = cls_name
+        ws['B3'].alignment = _ac          # [Fix] 置中
         ws['D3'] = ''
-        ws['F3'] = str(student_id)   # F3:G3 merged，填左上角
+        ws['F3'] = str(student_id)        # F3:G3 merged，填左上角
+        ws['F3'].alignment = _ac          # [Fix] 置中
 
         # ── Row 5-12：填入服務紀錄（最多 8 列）──
-        # 欄對應：A=愛校事由, B=缺曠日期, C:D(merged)=工作內容, E=時間起迄, F=師長驗收(留空), G=累計時數
+        # 欄對應：A=愛校事由, B=缺曠日期(留空), C:D(merged)=工作內容, E=時間起迄(含日期), F=師長驗收(留空), G=累計時數
         total_hours = 0.0
         for i in range(8):
             r = 5 + i
@@ -1334,11 +1341,18 @@ try:
                 h = 0.0
                 try: h = float(rec.get('hours', 0))
                 except (ValueError, TypeError): pass
-                st = rec.get('start_time', '')
-                et = rec.get('end_time', '')
-                time_str = f"{st}~{et}" if st and et else st
+                st       = rec.get('start_time', '')
+                et       = rec.get('end_time', '')
+                rec_date = rec.get('date', '')
+                # [Fix] 時間起迄加上日期，格式：YYYY-MM-DD\nHH:MM~HH:MM
+                if rec_date and (st or et):
+                    time_str = f"{rec_date}\n{st}~{et}" if (st and et) else f"{rec_date}\n{st}"
+                elif st or et:
+                    time_str = f"{st}~{et}" if (st and et) else st
+                else:
+                    time_str = rec_date
                 ws.cell(row=r, column=1).value = '消警告'
-                ws.cell(row=r, column=2).value = rec.get('date', '')
+                ws.cell(row=r, column=2).value = None          # [Fix] 缺曠日期留空，手填
                 ws.cell(row=r, column=3).value = rec.get('work_content', '')  # C:D merged，填C
                 ws.cell(row=r, column=5).value = time_str
                 ws.cell(row=r, column=7).value = h if h else None
