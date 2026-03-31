@@ -1064,7 +1064,7 @@ try:
                 # 寫入 service_hours：還時數（直接寫，已有 SQLite dedup 保護）
                 if svc_debt_sids:
                     _written_debt = _write_service_hours_direct(
-                        "愛校打掃", "返校打掃", task_hours, svc_debt_sids,
+                        "愛校打掃", "返校打掃(補打掃)", task_hours, svc_debt_sids,
                         task_date_str if task_date_str != "未定" else str(date.today())
                     )
                     # [Fix] dedup 空轉（0筆）印出警告，但不 RETRY
@@ -2460,7 +2460,7 @@ try:
     st.sidebar.markdown("📅 [衛生組行事曆](https://www.notion.so/312b7f229eea80c584a1e794c7b955a4)")
     st.sidebar.markdown("📸 [衛生組 Instagram](https://www.instagram.com/clvs_captain.h/)")
     st.sidebar.markdown("📂 [衛生組公開資料區](https://drive.google.com/drive/folders/14QcUILCmHKnKhDx2X1dIUl_6PNRndCub)")
-    st.sidebar.markdown("<div class='sidebar-footer'>中壢家商 衛生組 © 2025</div>", unsafe_allow_html=True)
+    st.sidebar.markdown("<div class='sidebar-footer'>衛生組長林ㄊㄩ製作@2025</div>", unsafe_allow_html=True)
 
     # --- Mode: 愛校任務認領 🤝 ---
     if app_mode == "愛校任務認領 🤝":
@@ -2876,10 +2876,13 @@ try:
                                                 if assigned_classes:
                                                     if is_last_task:
                                                         st.success("✅ 送出成功！今日任務已全數完成，系統將自動核發 0.25 小時！")
+                                                        st.caption("📡 若送出後畫面沒有反應，請稍候 30 秒再試一次，不要連續按多次。")
                                                     else:
                                                         st.success(f"✅ 送出成功！尚缺 {len(pending_classes)-1} 個班級，請繼續努力！")
+                                                        st.caption("📡 若送出後畫面沒有反應，請稍候 30 秒再試一次，不要連續按多次。")
                                                 else:
                                                     st.success("✅ 送出成功！系統將自動排程發放本日 0.25 小時。")
+                                                    st.caption("📡 若送出後畫面沒有反應，請稍候 30 秒再試一次，不要連續按多次。")
                                                 time.sleep(1.5)
                                                 st.rerun()
 
