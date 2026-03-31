@@ -456,8 +456,8 @@ try:
 
     def enqueue_task(task_type, payload):
         # [Fix #3-B] 寫入 Sheets task_queue 分頁，同步等待確認後返回
-        # 同步版本確保任務確實進入佇列才返回，前台可立即顯示成功訊息給使用者
-        # ※ threading 非同步版本在 Streamlit Cloud 不可靠（渲染完即砍執行緒），已廢棄
+        # 成功：回傳 task_id（字串）
+        # 失敗：回傳 None，呼叫端必須檢查並顯示錯誤，不可靜默假設成功
         task_id = str(uuid.uuid4())
         try:
             def _action():
@@ -470,9 +470,10 @@ try:
                     "PENDING", 0, ""
                 ], value_input_option="RAW")
             execute_with_retry(_action)
+            return task_id  # 確認寫入成功才回傳
         except Exception as e:
             print(f"[enqueue] 加入佇列失敗: {e}")
-        return task_id
+            return None  # 失敗明確回傳 None，讓 UI 顯示錯誤
 
     def get_pending_count():
         try:
@@ -3328,21 +3329,27 @@ try:
                             
                             col_btn1, col_btn2 = c1.columns(2)
                             if col_btn1.button("✅ 核可並撤銷扣分", key=f"ok_{i}"): 
-                                enqueue_task("appeal_review", {
+                                _tid = enqueue_task("appeal_review", {
                                     "record_id": str(r["對應紀錄ID"]),
                                     "status": "已核可",
                                     "reply_text": reply_text
                                 })
-                                st.session_state.queued_appeal_ids.add(str(r["對應紀錄ID"]))
-                                c1.success("✅ 已排入佇列，系統將背景處理核可與撤銷扣分。")
+                                if _tid:
+                                    st.session_state.queued_appeal_ids.add(str(r["對應紀錄ID"]))
+                                    c1.success("✅ 已排入佇列，系統將背景處理核可與撤銷扣分。")
+                                else:
+                                    c1.error("❌ 排入佇列失敗，請重試或檢查網路連線。")
                             if col_btn2.button("🚫 駁回維持原判", key=f"ng_{i}"): 
-                                enqueue_task("appeal_review", {
+                                _tid = enqueue_task("appeal_review", {
                                     "record_id": str(r["對應紀錄ID"]),
                                     "status": "已駁回",
                                     "reply_text": reply_text
                                 })
-                                st.session_state.queued_appeal_ids.add(str(r["對應紀錄ID"]))
-                                c1.info("已排入佇列，系統將背景處理駁回。")
+                                if _tid:
+                                    st.session_state.queued_appeal_ids.add(str(r["對應紀錄ID"]))
+                                    c1.info("已排入佇列，系統將背景處理駁回。")
+                                else:
+                                    c1.error("❌ 排入佇列失敗，請重試或檢查網路連線。")
 
                     if st.button("🔄 重新整理申訴列表", key="refresh_appeals"):
                         st.session_state.queued_appeal_ids.clear()
@@ -3770,21 +3777,24 @@ try:
                 else:
                     st.caption(f"共 {len(pending_df)} 筆待審核，審核後不會立刻跳頁，可以繼續審核其他筆。")
 
-                # [Fix Async] _do_approve_async：改為 enqueue_task_nb，前台立即回應不阻塞
+                # [Fix Async] _do_approve_async：enqueue_task 同步排隊，檢查回傳值才顯示成功
                 def _do_approve_async(record_id, s_val, note_text, reply, col_ref, cached_main_df):
-                    """將晨掃審核排入佇列，前台立即回應，Worker 背景處理"""
+                    """將晨掃審核排入佇列，Worker 背景處理"""
                     matched = cached_main_df.loc[cached_main_df["紀錄ID"].astype(str) == str(record_id), "備註"]
                     old_note = str(matched.iloc[0]) if not matched.empty else ""
                     new_note = f"{old_note} \n組長回覆: {reply}" if reply else f"{old_note} \n組長核可: {note_text}"
-                    enqueue_task("morning_sweep_approve", {
+                    _tid = enqueue_task("morning_sweep_approve", {
                         "record_id": str(record_id),
                         "action": "approve",
                         "score_val": s_val,
                         "new_item": "晨間打掃(學期加分)",
                         "new_note": new_note
                     })
-                    st.session_state.approved_morning_ids.add(str(record_id))
-                    col_ref.success(f"✅ 已排入佇列！學期加 {abs(s_val):g} 分（背景處理中）")
+                    if _tid:
+                        st.session_state.approved_morning_ids.add(str(record_id))
+                        col_ref.success(f"✅ 已排入佇列！學期加 {abs(s_val):g} 分（背景處理中）")
+                    else:
+                        col_ref.error("❌ 排入佇列失敗，請重試或檢查網路連線。")
 
                 for i, r in pending_df.iterrows():
                     with st.container(border=True):
@@ -3848,19 +3858,21 @@ try:
                                             reply_msg, c1, main_df)
 
                         if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}_{i}"):
-                            # [Fix 4] 駁回改為非阻塞排隊
                             old_note = str(r['備註'])
                             rej_msg  = reply_msg if reply_msg else "未達標準，請見諒"
                             new_note = f"{old_note} \n組長駁回: {rej_msg}"
-                            enqueue_task("morning_sweep_approve", {
+                            _tid = enqueue_task("morning_sweep_approve", {
                                 "record_id": str(r["紀錄ID"]),
                                 "action": "reject",
                                 "score_val": 0,
                                 "new_item": "晨間打掃(已駁回)",
                                 "new_note": new_note
                             })
-                            st.session_state.approved_morning_ids.add(str(r["紀錄ID"]))
-                            c1.error("🗑️ 已排入佇列（駁回處理中）")
+                            if _tid:
+                                st.session_state.approved_morning_ids.add(str(r["紀錄ID"]))
+                                c1.error("🗑️ 已排入佇列（駁回處理中）")
+                            else:
+                                c1.error("❌ 排入佇列失敗，請重試或檢查網路連線。")
 
                 if not pending_df.empty or st.session_state.approved_morning_ids:
                     if st.button("🔄 審核完畢，重新整理列表"):
@@ -4124,7 +4136,6 @@ try:
                                     _hr_match = re.search(r"[\(\uff08]([\d.]+)\s*(?:hr|小時|h)[\)\uff09]", _ct["title"], re.IGNORECASE)
                                     _task_hours = float(_hr_match.group(1)) if _hr_match else 1.0
 
-                                    # [Fix 4] 改為非阻塞排隊，前台按下後立即返回
                                     _verify_payload = {
                                         "notion_page_id": _ct["id"],
                                         "task_title": _ct["title"],
@@ -4132,22 +4143,23 @@ try:
                                         "task_area": _ct.get("area", _ct["title"]),
                                         "time_start": _ct.get("time_start", ""),
                                         "task_hours": _task_hours,
-                                        "claimants": _ct["claimants"]  # Worker 會自行解析 tag
+                                        "claimants": _ct["claimants"]
                                     }
-                                    enqueue_task("campus_service_verify", _verify_payload)
+                                    _tid = enqueue_task("campus_service_verify", _verify_payload)
 
-                                    # [Fix 5] 移除 time.sleep(2) + st.rerun()，改用 st.toast 即時提示
-                                    # 前台立即回應（用之前已解析的分類結果顯示摘要）
-                                    msg_parts = ["✅ 已排入佇列！系統將背景完成以下操作："]
-                                    if _debt_students:
-                                        msg_parts.append(f"🟢 還時數 {len(_debt_students)} 人（扣欠時 + 發服務時數）")
-                                    if _appeal_students:
-                                        msg_parts.append(f"🔔 消警告 {len(_appeal_students)} 人（寫入 service_hours，稍後可產製銷過單）")
-                                    if _punish_students:
-                                        msg_parts.append(f"⚫ 糾察懲罰 {len(_punish_students)} 人（不發時數）")
-                                    msg_parts.append("📡 Notion 狀態將自動更新為「任務已驗收」")
-                                    st.success("\n".join(msg_parts))
-                                    st.toast("✅ 驗收已排入佇列，背景處理中", icon="✅")
+                                    if _tid:
+                                        msg_parts = ["✅ 已排入佇列！系統將背景完成以下操作："]
+                                        if _debt_students:
+                                            msg_parts.append(f"🟢 還時數 {len(_debt_students)} 人（扣欠時 + 發服務時數）")
+                                        if _appeal_students:
+                                            msg_parts.append(f"🔔 消警告 {len(_appeal_students)} 人（寫入 service_hours，稍後可產製銷過單）")
+                                        if _punish_students:
+                                            msg_parts.append(f"⚫ 糾察懲罰 {len(_punish_students)} 人（不發時數）")
+                                        msg_parts.append("📡 Notion 狀態將自動更新為「任務已驗收」")
+                                        st.success("\n".join(msg_parts))
+                                        st.toast("✅ 驗收已排入佇列，背景處理中", icon="✅")
+                                    else:
+                                        st.error("❌ 排入佇列失敗，請重試。若持續失敗請檢查 Google Sheets 連線。")
                                         
                 # ── 區塊 B：⚠️ 欠時懲處結算報表 ──
                 with st.expander("⚠️ 欠時懲處結算報表", expanded=True):
