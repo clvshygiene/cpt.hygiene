@@ -1008,6 +1008,21 @@ try:
             print(f"[load_debt_history] {e}")
             return pd.DataFrame(columns=cols)
 
+    def load_student_debt_note(sid):
+        """讀取 student_debts 工作表的備註欄位，回傳該學號的備註字串"""
+        ws = get_worksheet(SHEET_TABS["student_debts"])
+        if not ws:
+            return ""
+        try:
+            records = ws.get_all_records()
+            for r in records:
+                if clean_id(str(r.get("學號", ""))) == clean_id(str(sid)):
+                    return str(r.get("備註", "")).strip()
+            return ""
+        except Exception as e:
+            print(f"[load_student_debt_note] {e}")
+            return ""
+
     def update_student_debt(sid, change_hours, reason):
         """寫入 debt_history 一筆紀錄並同步更新 student_debts 中的未完成時數"""
         sid = str(sid).strip()
@@ -1045,7 +1060,7 @@ try:
             return False
 
     def generate_appeal_form_excel(student_id, cls_name, records):
-        """[愛校2.0] 生成消警告申請單 Excel 檔（取代 PDF 套印，避免座標偏移問題）"""
+        """[愛校2.0] 生成消警告申請單 Excel 檔，格式比照學務處正式版本（桃園市立中壢家商）"""
         from openpyxl import Workbook
         from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 
@@ -1053,137 +1068,184 @@ try:
         ws = wb.active
         ws.title = "愛校服務申請單"
 
-        # 頁面設定（A4 直印）
-        ws.page_setup.paperSize = ws.PAPERSIZE_A4
+        # ── 頁面設定（A4 直印，自動縮放至單頁寬）──
+        ws.page_setup.paperSize  = ws.PAPERSIZE_A4
         ws.page_setup.orientation = 'portrait'
-        ws.page_margins.left = 0.6
-        ws.page_margins.right = 0.6
-        ws.page_margins.top = 0.5
-        ws.page_margins.bottom = 0.5
+        ws.page_margins.left   = 0.7
+        ws.page_margins.right  = 0.7
+        ws.page_margins.top    = 0.6
+        ws.page_margins.bottom = 0.6
+        ws.page_setup.fitToPage   = True
+        ws.page_setup.fitToWidth  = 1
+        ws.page_setup.fitToHeight = 0
 
-        # 欄寬
-        ws.column_dimensions['A'].width = 6    # 序號
-        ws.column_dimensions['B'].width = 30   # 工作內容
-        ws.column_dimensions['C'].width = 14   # 服務日期
-        ws.column_dimensions['D'].width = 12   # 起始時間
-        ws.column_dimensions['E'].width = 12   # 結束時間
-        ws.column_dimensions['F'].width = 8    # 時數
-        ws.column_dimensions['G'].width = 10   # 確認
+        # ── 欄寬（5 欄：工作內容 / 起 / 迄 / 師長驗收簽章 / 累計時數）──
+        for col, w in {'A': 36, 'B': 12, 'C': 12, 'D': 18, 'E': 10}.items():
+            ws.column_dimensions[col].width = w
 
-        # 樣式定義
-        title_font = Font(name='微軟正黑體', size=18, bold=True)
-        header_font = Font(name='微軟正黑體', size=12, bold=True)
-        info_font = Font(name='微軟正黑體', size=12)
-        cell_font = Font(name='微軟正黑體', size=11)
-        small_font = Font(name='微軟正黑體', size=9, color='808080')
-        total_font = Font(name='微軟正黑體', size=14, bold=True)
-        thin_border = Border(
-            left=Side(style='thin'), right=Side(style='thin'),
-            top=Side(style='thin'), bottom=Side(style='thin')
-        )
-        center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
-        left_align = Alignment(horizontal='left', vertical='center', wrap_text=True)
-        right_align = Alignment(horizontal='right', vertical='center')
-        header_fill = PatternFill(start_color='D9E2F3', end_color='D9E2F3', fill_type='solid')
+        # ── 樣式定義 ──
+        _thin = Side(style='thin')
+        bd = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
+        bd_t = Border(top=_thin)   # 只有上框線（條文區分隔用）
 
-        # ── Row 1：標題 ──
-        ws.merge_cells('A1:G1')
-        ws['A1'] = '中壢家商 愛校服務申請單'
-        ws['A1'].font = title_font
-        ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
-        ws.row_dimensions[1].height = 42
+        f_title = Font(name='微軟正黑體', size=15, bold=True)
+        f_hd    = Font(name='微軟正黑體', size=11, bold=True)
+        f_info  = Font(name='微軟正黑體', size=11)
+        f_cell  = Font(name='微軟正黑體', size=10)
+        f_total = Font(name='微軟正黑體', size=12, bold=True)
+        f_note  = Font(name='微軟正黑體', size=9)
+        f_small = Font(name='微軟正黑體', size=8, color='606060')
+        hfill   = PatternFill(start_color='D6DCE4', end_color='D6DCE4', fill_type='solid')
+        ac = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        al = Alignment(horizontal='left',   vertical='center', wrap_text=True)
+        ar = Alignment(horizontal='right',  vertical='center')
 
-        # ── Row 2：空行 ──
-        ws.row_dimensions[2].height = 8
-
-        # ── Row 3：學生資訊 ──
         now_tw = datetime.now(TW_TZ)
-        roc_year = now_tw.year - 1911
-        ws.merge_cells('A3:C3')
-        ws['A3'] = f'班級：{cls_name}　　學號：{student_id}'
-        ws['A3'].font = info_font
-        ws['A3'].alignment = left_align
-        ws.merge_cells('D3:G3')
-        ws['D3'] = f'列印日期：{roc_year} 年 {now_tw.month} 月 {now_tw.day} 日'
-        ws['D3'].font = info_font
-        ws['D3'].alignment = right_align
-        ws.row_dimensions[3].height = 28
+        roc_y  = now_tw.year - 1911
 
-        # ── Row 4：空行 ──
-        ws.row_dimensions[4].height = 6
+        # ── 輔助函式 ──
+        def mc(r_range, value="", font=None, align=None, fill=None, border=None):
+            """合併儲存格並設定樣式"""
+            ws.merge_cells(r_range)
+            cell = ws[r_range.split(':')[0]]
+            cell.value = value
+            if font:   cell.font      = font
+            if align:  cell.alignment = align
+            if fill:   cell.fill      = fill
+            if border: cell.border    = border
+            return cell
 
-        # ── Row 5：表頭 ──
-        headers = ['序號', '工作內容', '服務日期', '起始時間', '結束時間', '時數', '確認']
-        for col_idx, header in enumerate(headers, 1):
-            cell = ws.cell(row=5, column=col_idx, value=header)
-            cell.font = header_font
-            cell.alignment = center_align
-            cell.border = thin_border
-            cell.fill = header_fill
-        ws.row_dimensions[5].height = 30
+        def rc(row, col, value="", font=None, align=None, fill=None, border=None):
+            """單一儲存格設定"""
+            cell = ws.cell(row=row, column=col, value=value)
+            if font:   cell.font      = font
+            if align:  cell.alignment = align
+            if fill:   cell.fill      = fill
+            if border: cell.border    = border
+            return cell
 
-        # ── Row 6-13：資料列（共 8 列）──
+        def apply_border_range(r1, c1, r2, c2, border):
+            """對矩形範圍內每個儲存格套用 border"""
+            for r in range(r1, r2 + 1):
+                for c in range(c1, c2 + 1):
+                    ws.cell(row=r, column=c).border = border
+
+        # ── 行高 ──
+        row_heights = {
+            1: 40,   # 主標題
+            2: 6,    # 空行
+            3: 26,   # 班級/姓名/學號
+            4: 26,   # 愛校事由
+            5: 26,   # 獎懲缺 / 曠日期
+            6: 8,    # 空行
+            7: 28,   # 表頭
+        }
+        for r, h in row_heights.items():
+            ws.row_dimensions[r].height = h
+        for r in range(8, 16):   # 資料列 8 列
+            ws.row_dimensions[r].height = 26
+        for r, h in {16: 28, 17: 8, 18: 22, 19: 22, 20: 44, 21: 8, 22: 18, 23: 22, 24: 14}.items():
+            ws.row_dimensions[r].height = h
+
+        # ════════════════════════════════
+        # R1：主標題
+        # ════════════════════════════════
+        mc('A1:E1',
+           "桃園市立中壢家商學生銷過『愛校服務』申請表",
+           font=f_title, align=ac)
+
+        # ════════════════════════════════
+        # R3：班級 / 姓名 / 學號（三等分）
+        # ════════════════════════════════
+        mc('A3:B3', f'班　級：{cls_name}', font=f_info, align=al, border=bd)
+        rc(3, 3, '姓　名：', font=f_info, align=al, border=bd)
+        mc('D3:E3', f'學　號：{student_id}', font=f_info, align=al, border=bd)
+
+        # ════════════════════════════════
+        # R4：愛校事由（整行）
+        # ════════════════════════════════
+        mc('A4:E4', '愛校事由：', font=f_info, align=al, border=bd)
+
+        # ════════════════════════════════
+        # R5：獎懲缺 / 曠日期
+        # ════════════════════════════════
+        mc('A5:B5', '獎懲缺：□ 警告　□ 小過　□ 大過', font=f_info, align=al, border=bd)
+        mc('C5:E5',
+           f'曠日期（　　年　　月　　日）：',
+           font=f_info, align=al, border=bd)
+
+        # ════════════════════════════════
+        # R7：表頭（5 欄）
+        # ════════════════════════════════
+        for ci, h in enumerate(['工作內容', '愛校時間(起)', '愛校時間(迄)', '師長驗收簽章', '累計時數'], 1):
+            rc(7, ci, h, font=f_hd, align=ac, fill=hfill, border=bd)
+
+        # ════════════════════════════════
+        # R8-R15：資料列（共 8 列）
+        # ════════════════════════════════
         total_hours = 0.0
-        for row_idx in range(8):
-            row_num = 6 + row_idx
-            ws.row_dimensions[row_num].height = 28
-            if row_idx < len(records):
-                rec = records[row_idx]
-                values = [
-                    row_idx + 1, rec.get('work_content', ''), rec.get('date', ''),
-                    rec.get('start_time', ''), rec.get('end_time', ''),
-                    rec.get('hours', ''), ''  # 確認欄留空供簽章
+        for i in range(8):
+            rn = 8 + i
+            if i < len(records):
+                rec = records[i]
+                vals = [
+                    rec.get('work_content', ''),
+                    rec.get('start_time', ''),
+                    rec.get('end_time', ''),
+                    '',   # 師長驗收簽章（留空）
+                    rec.get('hours', '')
                 ]
                 try:
                     total_hours += float(rec.get('hours', 0))
                 except (ValueError, TypeError):
                     pass
             else:
-                values = [row_idx + 1, '', '', '', '', '', '']
-            for col_idx, value in enumerate(values, 1):
-                cell = ws.cell(row=row_num, column=col_idx, value=value)
-                cell.font = cell_font
-                cell.alignment = left_align if col_idx == 2 else center_align
-                cell.border = thin_border
+                vals = ['', '', '', '', '']
+            for ci, v in enumerate(vals, 1):
+                rc(rn, ci, v,
+                   font=f_cell,
+                   align=al if ci == 1 else ac,
+                   border=bd)
 
-        # ── Row 14：總計列 ──
-        ws.merge_cells('A14:E14')
-        ws['A14'] = '總計服務時數'
-        ws['A14'].font = header_font
-        ws['A14'].alignment = right_align
-        ws['A14'].border = thin_border
-        for col in range(2, 6):
-            ws.cell(row=14, column=col).border = thin_border
-        ws['F14'] = total_hours
-        ws['F14'].font = total_font
-        ws['F14'].alignment = center_align
-        ws['F14'].border = thin_border
-        ws['G14'] = ''
-        ws['G14'].border = thin_border
-        ws.row_dimensions[14].height = 30
+        # ════════════════════════════════
+        # R16：合計愛校時數
+        # ════════════════════════════════
+        mc('A16:D16', '合計愛校時數', font=f_hd, align=ar, border=bd)
+        rc(16, 5, total_hours, font=f_total, align=ac, border=bd)
 
-        # ── Row 15-16：空行 ──
-        ws.row_dimensions[15].height = 15
-        ws.row_dimensions[16].height = 15
+        # ════════════════════════════════
+        # R18：審查簽核 標題列
+        # ════════════════════════════════
+        mc('A18:E18', '審　查　簽　核', font=f_hd, align=ac, fill=hfill, border=bd)
 
-        # ── Row 17：簽名欄 ──
-        ws.merge_cells('A17:C17')
-        ws['A17'] = '學生簽名：＿＿＿＿＿＿＿＿'
-        ws['A17'].font = info_font
-        ws['A17'].alignment = left_align
-        ws.merge_cells('D17:G17')
-        ws['D17'] = '衛生組長核章：＿＿＿＿＿＿'
-        ws['D17'].font = info_font
-        ws['D17'].alignment = left_align
-        ws.row_dimensions[17].height = 35
+        # R19：職稱列
+        for ci, role in enumerate(['導師', '生輔組長', '主任教官', '學務主任', '校長'], 1):
+            rc(19, ci, role,
+               font=Font(name='微軟正黑體', size=10, bold=True),
+               align=ac, fill=hfill, border=bd)
 
-        # ── Row 19：備註 ──
-        ws.merge_cells('A19:G19')
-        ws['A19'] = '※ 本表經衛生組長核章後，請持此表至學務處完成後續紙本流程。'
-        ws['A19'].font = small_font
-        ws['A19'].alignment = left_align
+        # R20：簽章空白列（高度加大供蓋章）
+        for ci in range(1, 6):
+            rc(20, ci, '', border=bd)
 
-        # 輸出
+        # ════════════════════════════════
+        # R22-R24：官方條文 + 自動產製說明
+        # ════════════════════════════════
+        notes = [
+            ('A22:E22',
+             '1、愛校服務申請：銷警告 1 次需愛校服務累計 1 小時，銷小過 1 次需愛校服務累計 8 小時，銷大過 1 次需愛校服務累計 24 小時。',
+             f_note),
+            ('A23:E23',
+             '2、愛校服務需利用課餘時間，每日愛校不得超過 2 小時，由學務處分配擔任各處室師長公差勤務，並請師長驗收簽證。',
+             f_note),
+            ('A24:E24',
+             f'（本表由衛生組系統自動產製，列印日期：民國 {roc_y} 年 {now_tw.month} 月 {now_tw.day} 日）',
+             f_small),
+        ]
+        for r_range, text, font in notes:
+            mc(r_range, text, font=font, align=al)
+
+        # ── 輸出 ──
         buf = io.BytesIO()
         wb.save(buf)
         buf.seek(0)
@@ -1743,6 +1805,10 @@ try:
                     _my_hours = _debts_map.get(clean_id(_query_sid), 0.0)
                     if _my_hours > 0:
                         st.warning(f"⚠️ 你目前共有 **{_my_hours}** 小時的欠時尚未歸還。")
+                        # [新增] 顯示 Google Sheet 中的備註說明
+                        _debt_note = load_student_debt_note(clean_id(_query_sid))
+                        if _debt_note:
+                            st.info(f"📝 備註說明：{_debt_note}")
                         _hist_df = load_debt_history(clean_id(_query_sid))
                         if not _hist_df.empty:
                             st.dataframe(_hist_df, hide_index=True)
@@ -3506,9 +3572,14 @@ try:
                 sid = sid_match.group(1) if sid_match else None
                 # 同時匹配半形 () 和全形（）
                 tag_match = re.search(r"[\(\uff08](.*?)[\)\uff09]", claimant_str)
-                tag = tag_match.group(1).strip() if tag_match else "還時數"
-                # [Debug] 輸出解析結果到 console
-                print(f"[parse_tag] raw='{claimant_str}' → sid={sid}, tag='{tag}'")
+                if tag_match:
+                    # [Fix] 正規化：去除零寬空格、不換行空格等 Notion 常見隱藏字元，防止 == 比對失敗
+                    raw_tag = tag_match.group(1)
+                    tag = raw_tag.strip().replace('\u200b', '').replace('\xa0', ' ').replace('\u3000', '').strip()
+                else:
+                    tag = "還時數"
+                # [Debug] 加 repr() 方便排查隱藏字元問題
+                print(f"[parse_tag] raw='{claimant_str}' → sid={sid}, tag='{tag}' repr={repr(tag)}")
                 return sid, tag
 
             # [新增] 愛校服務 2.0：愛校與欠時管理 Tab
@@ -3578,21 +3649,24 @@ try:
                                         if _sid_val:
                                             _verify_log.append(f"{_sid_val}({_tag_val})")
                                             
-                                            if _tag_val == "還時數":
+                                            # [Fix] 正規化標籤，防止 Notion 隱藏字元造成 == 比對失敗
+                                            _tag_norm = _tag_val.strip().replace('\u200b', '').replace('\xa0', ' ').replace('\u3000', '').strip()
+
+                                            if _tag_norm == "還時數":
                                                 if update_student_debt(_sid_val, -_task_hours, f"愛校驗收：{_ct['title']}"):
                                                     _debt_deducted_count += 1
                                                 _issued_sids.append(_sid_val)
                                                 time.sleep(0.3)  # [防429] 每人之間加小延遲
                                                 
-                                            elif _tag_val == "消警告":
+                                            elif _tag_norm == "消警告":
                                                 _appeal_sids.append(_sid_val)
                                                 
-                                            elif _tag_val == "糾察懲罰":
+                                            elif _tag_norm == "糾察懲罰":
                                                 _punish_sids_verify.append(_sid_val)
                                             
                                             else:
-                                                # [Fix] 防禦：若 tag 不是預期的三種值，視為還時數並警告
-                                                print(f"[verify] 未知 tag '{_tag_val}' for {_sid_val}，視為還時數")
+                                                # [Fix] 防禦：若 tag 不是預期的三種值，視為還時數並輸出 repr 供排查
+                                                print(f"[verify] 未知 tag '{_tag_val}' repr={repr(_tag_val)} for {_sid_val}，視為還時數")
                                                 if update_student_debt(_sid_val, -_task_hours, f"愛校驗收：{_ct['title']}"):
                                                     _debt_deducted_count += 1
                                                 _issued_sids.append(_sid_val)
