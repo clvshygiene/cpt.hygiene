@@ -31,10 +31,14 @@ try:
 except ImportError:
     NOTION_INSTALLED = False
 
-# --- [DIAG v3] Module-level Worker log（不依賴 Sheets、SQLite、print）---
-# 背景執行緒直接 append 到這個 list，組長後台頁面直接讀取顯示
+# --- [DIAG v4] Module-level Worker log，用 cache_resource 保護，跨 rerun 不被清空 ---
 import collections
-_WORKER_LOG = collections.deque(maxlen=50)  # 最多保留 50 筆，自動丟棄最舊的
+
+@st.cache_resource
+def _get_worker_log():
+    return collections.deque(maxlen=100)
+
+_WORKER_LOG = _get_worker_log()
 
 # --- 1. 網頁設定 ---
 # 透過 Streamlit Secrets 判斷目前是測試區還是正式區 (預設為正式區)
@@ -47,7 +51,7 @@ if sys_env == "DEV":
     st.warning("🚧 **目前位於 DEV 測試環境！** 在這裡送出的資料僅供測試，不會影響正式成績。")
 else:
     st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
-    st.sidebar.caption("🔧 app version: v_DIAG_4")  # [DIAG] 確認部署版本用，修好後可刪除
+    st.sidebar.caption("🔧 app version: v_DIAG_5")  # [DIAG] 確認部署版本用，修好後可刪除
 
 
 # --- 2. 核心參數與全域設定 ---
