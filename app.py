@@ -1795,6 +1795,8 @@ try:
                                         if _my_debt > 0 and _purpose != "還時數":
                                             _purpose = "還時數"
                                             st.warning(f"⚠️ 你目前仍有 {_my_debt} 小時欠時未還，本次目的已自動改為「還時數」！")
+                                        # [Debug] 記錄實際寫入 Notion 的 purpose_tag
+                                        print(f"[claim] sid={s_id}, purpose_tag='{_purpose}', label will be: {s_id}({_purpose})")
                                         with st.spinner("連線至 Notion 更新看板中..."):
                                             success, msg = claim_notion_task(t['id'], s_id, purpose_tag=_purpose)
                                         if success:
@@ -3496,6 +3498,19 @@ try:
                                     time.sleep(1.5)
                                     st.rerun()
 
+            # [Fix] 統一 tag 解析函式，同時支援半形 () 和全形（）括號
+            def _parse_claimant_tag(claimant_str):
+                """從認領學號字串解析出 (學號, 標籤)，支援半形/全形括號"""
+                claimant_str = str(claimant_str).strip()
+                sid_match = re.match(r"(\d+)", claimant_str)
+                sid = sid_match.group(1) if sid_match else None
+                # 同時匹配半形 () 和全形（）
+                tag_match = re.search(r"[\(\uff08](.*?)[\)\uff09]", claimant_str)
+                tag = tag_match.group(1).strip() if tag_match else "還時數"
+                # [Debug] 輸出解析結果到 console
+                print(f"[parse_tag] raw='{claimant_str}' → sid={sid}, tag='{tag}'")
+                return sid, tag
+
             # [新增] 愛校服務 2.0：愛校與欠時管理 Tab
             with t_debt:
                 st.subheader("🤝 愛校與欠時管理")
@@ -3511,21 +3526,21 @@ try:
                                 st.write(f"📌 **{_ct['title']}**")
                                 st.caption(f"📅 日期：{_ct['date']}　|　📝 內容：{_ct.get('area', '未填寫')}　|　認領學生：{', '.join(_ct['claimants'])}")
 
-                                # [愛校2.0] 自動偵測各目的學生名單
+                                # [Fix] 使用統一解析函式，避免重複邏輯
                                 _appeal_students = []
                                 _punish_students = []
                                 _debt_students = []
+                                _parsed_tags_display = []  # [Fix] 收集解析結果供管理員確認
                                 for _clm in _ct["claimants"]:
-                                    _sid_match = re.match(r"(\d+)", _clm)
-                                    _tag_match = re.search(r"\((.*?)\)", _clm)
-                                    if _sid_match:
-                                        _tag = _tag_match.group(1) if _tag_match else "還時數"
+                                    _sid, _tag = _parse_claimant_tag(_clm)
+                                    if _sid:
+                                        _parsed_tags_display.append(f"{_sid}→**{_tag}**")
                                         if _tag == "消警告":
-                                            _appeal_students.append(_sid_match.group(1))
+                                            _appeal_students.append(_sid)
                                         elif _tag == "糾察懲罰":
-                                            _punish_students.append(_sid_match.group(1))
+                                            _punish_students.append(_sid)
                                         else:
-                                            _debt_students.append(_sid_match.group(1))
+                                            _debt_students.append(_sid)
 
                                 # 顯示各目的標籤摘要
                                 _tag_parts = []
@@ -3538,6 +3553,10 @@ try:
                                 if _tag_parts:
                                     st.markdown("　".join(_tag_parts))
 
+                                # [Fix] 顯示每位學生的解析結果，方便管理員確認 tag 是否正確
+                                if _parsed_tags_display:
+                                    st.caption(f"🔍 標籤解析結果：{'、'.join(_parsed_tags_display)}")
+
                                 if _appeal_students:
                                     st.info(f"💡 偵測到 {len(_appeal_students)} 位學生申請「消警告」（{', '.join(_appeal_students)}），驗收完成後請至下方「🖨️ 銷過單核發」區塊產製申請表單。")
 
@@ -3549,14 +3568,15 @@ try:
                                     _debt_deducted_count = 0
                                     _issued_sids = []  # 收集還時數名單
                                     _appeal_sids = []  # 收集消警告名單
+                                    _punish_sids_verify = []  # [Fix] 收集糾察懲罰名單
+                                    _verify_log = []  # [Fix] 驗收明細日誌
                                     
+                                    # [Fix] 使用統一解析函式，確保顯示邏輯與驗收邏輯完全一致
                                     for _clm in _ct["claimants"]:
-                                        _sid_match = re.match(r"(\d+)", _clm)
-                                        _tag_match = re.search(r"\((.*?)\)", _clm)
+                                        _sid_val, _tag_val = _parse_claimant_tag(_clm)
                                         
-                                        if _sid_match:
-                                            _sid_val = _sid_match.group(1)
-                                            _tag_val = _tag_match.group(1) if _tag_match else "還時數"  
+                                        if _sid_val:
+                                            _verify_log.append(f"{_sid_val}({_tag_val})")
                                             
                                             if _tag_val == "還時數":
                                                 if update_student_debt(_sid_val, -_task_hours, f"愛校驗收：{_ct['title']}"):
@@ -3568,7 +3588,19 @@ try:
                                                 _appeal_sids.append(_sid_val)
                                                 
                                             elif _tag_val == "糾察懲罰":
-                                                pass  # 糾察懲罰：一筆勾銷，不給時數也不消警告
+                                                _punish_sids_verify.append(_sid_val)
+                                            
+                                            else:
+                                                # [Fix] 防禦：若 tag 不是預期的三種值，視為還時數並警告
+                                                print(f"[verify] 未知 tag '{_tag_val}' for {_sid_val}，視為還時數")
+                                                if update_student_debt(_sid_val, -_task_hours, f"愛校驗收：{_ct['title']}"):
+                                                    _debt_deducted_count += 1
+                                                _issued_sids.append(_sid_val)
+                                                time.sleep(0.3)
+
+                                    # [Fix] 在 console 輸出完整驗收日誌
+                                    print(f"[verify] 任務={_ct['title']} | 驗收明細: {', '.join(_verify_log)}")
+                                    print(f"[verify] 還時數={_issued_sids} | 消警告={_appeal_sids} | 糾察懲罰={_punish_sids_verify}")
 
                                     # 1. 正常發放「還時數」的服務時數
                                     if _issued_sids:
@@ -3598,13 +3630,15 @@ try:
                                                 
                                     update_notion_task_status(_ct["id"], "任務已驗收")  
                                     
+                                    # [Fix] 詳細的驗收結果訊息，含每位學生的分類結果
                                     msg_parts = ["✅ 驗收完成！Notion 狀態已更新。"]
+                                    msg_parts.append(f"📋 驗收明細：{', '.join(_verify_log)}")
                                     if _debt_deducted_count > 0 or _issued_sids:
-                                        msg_parts.append(f"🟢 幫 {_debt_deducted_count} 人扣除欠時，並排程核發 {len(_issued_sids)} 人一般服務時數。")
+                                        msg_parts.append(f"🟢 幫 {_debt_deducted_count} 人扣除欠時，並排程核發 {len(_issued_sids)} 人一般服務時數（{', '.join(_issued_sids)}）。")
                                     if _appeal_sids:
-                                        msg_parts.append(f"🔔 消警告紀錄已儲存！請至下方「🖨️ 銷過單核發」區塊為 {len(_appeal_sids)} 位學生產製表單。")
-                                    if _punish_students:
-                                        msg_parts.append(f"⚫ {len(_punish_students)} 位糾察懲罰學生已標記完成（不發時數、不消警告）。")
+                                        msg_parts.append(f"🔔 消警告紀錄已儲存（{', '.join(_appeal_sids)}）！請至下方「🖨️ 銷過單核發」區塊產製表單。")
+                                    if _punish_sids_verify:
+                                        msg_parts.append(f"⚫ {len(_punish_sids_verify)} 位糾察懲罰學生已標記完成（{', '.join(_punish_sids_verify)}，不發時數、不消警告）。")
                                         
                                     st.success("\n".join(msg_parts))
                                     time.sleep(3.5)
@@ -3650,107 +3684,162 @@ try:
                                 key="debt_excel_dl"
                             )
 
-                # ── 區塊 C：🖨️ 銷過單核發 (Excel 自動生成) ──
+                # ── 區塊 C：🖨️ 銷過單核發 (一鍵批次) ──
                 with st.expander("🖨️ 銷過單核發 (消警告單)", expanded=True):
-                    st.info("💡 輸入學號，系統將自動從已驗收的消警告紀錄中產製《愛校服務申請單》Excel 檔供下載列印。")
-                    
-                    _pdf_sid = st.text_input("請輸入要申請銷過的【學號】", placeholder="例如：112001", key="pdf_gen_sid")
-                    
-                    if st.button("🪄 查詢並產製銷過單", key="btn_gen_pdf"):
-                        if not _pdf_sid:
-                            st.error("請先輸入學號！")
-                        else:
-                            _clean_sid = clean_id(_pdf_sid)
-                            _cls_name = ROSTER_DICT.get(_clean_sid, "")
-                            
-                            if not _cls_name:
-                                st.error(f"❌ 在名單中找不到學號 {_clean_sid} 的班級資料！")
+                    st.info("💡 系統自動查詢所有「愛校服務(消警告)」紀錄，一鍵產製所有學生的《愛校服務申請單》。")
+
+                    # [Fix] 共用解析函式：將原始紀錄轉成申請單格式
+                    def _parse_appeal_record(rec):
+                        """解析 service_hours 中的消警告紀錄，回傳標準化 dict"""
+                        _class_field = str(rec.get("班級", ""))
+                        _parts = _class_field.split("|")
+                        _work_content = _parts[0].strip() if _parts else ""
+                        _start_time = _parts[1].strip() if len(_parts) > 1 else ""
+                        _hours = 0.0
+                        try:
+                            _hours = float(rec.get("時數", 0))
+                        except (ValueError, TypeError):
+                            pass
+                        _date_str = str(rec.get("日期", ""))
+                        _end_time = ""
+                        if _start_time:
+                            try:
+                                _st = datetime.strptime(_start_time, "%H:%M")
+                                _et = _st + timedelta(hours=_hours)
+                                _end_time = _et.strftime("%H:%M")
+                            except Exception:
+                                pass
+                        return {
+                            "work_content": _work_content,
+                            "date": _date_str,
+                            "start_time": _start_time,
+                            "end_time": _end_time,
+                            "hours": _hours
+                        }
+
+                    if st.button("🔎 查詢所有消警告紀錄", key="btn_fetch_all_appeals"):
+                        try:
+                            def _fetch_all_appeal_records():
+                                ws_svc = get_worksheet(SHEET_TABS["service_hours"])
+                                if not ws_svc:
+                                    return []
+                                _svc_data = ws_svc.get_all_records()
+                                _df_svc = pd.DataFrame(_svc_data)
+                                if _df_svc.empty or "類別" not in _df_svc.columns:
+                                    return []
+                                return _df_svc[_df_svc["類別"] == "愛校服務(消警告)"].to_dict('records')
+
+                            with st.spinner("正在查詢所有消警告紀錄..."):
+                                _all_appeal_records = execute_with_retry(_fetch_all_appeal_records)
+
+                            if not _all_appeal_records:
+                                st.warning("⚠️ 目前找不到任何消警告服務紀錄。請確認是否已有消警告驗收完成。")
                             else:
-                                try:
-                                    # 從 service_hours 撈取所有消警告紀錄
-                                    def _fetch_appeal_records():
-                                        ws_svc = get_worksheet(SHEET_TABS["service_hours"])
-                                        if not ws_svc:
-                                            return []
-                                        _svc_data = ws_svc.get_all_records()
-                                        _df_svc = pd.DataFrame(_svc_data)
-                                        if _df_svc.empty or "學號" not in _df_svc.columns:
-                                            return []
-                                        _my_records = _df_svc[
-                                            (_df_svc["學號"].astype(str) == _clean_sid) &
-                                            (_df_svc["類別"] == "愛校服務(消警告)")
-                                        ]
-                                        return _my_records.to_dict('records')
-                                    
-                                    with st.spinner("正在查詢消警告紀錄..."):
-                                        _raw_records = execute_with_retry(_fetch_appeal_records)
-                                    
-                                    if not _raw_records:
-                                        st.warning(f"⚠️ 找不到學號 {_clean_sid} 的消警告服務紀錄。請確認是否已驗收完成。")
-                                    else:
-                                        # 解析紀錄：從「班級」欄位解析工作內容與起始時間
-                                        _parsed_records = []
-                                        for _rec in _raw_records[:8]:  # 最多 8 筆
-                                            _class_field = str(_rec.get("班級", ""))
-                                            _parts = _class_field.split("|")
-                                            _work_content = _parts[0].strip() if _parts else ""
-                                            _start_time = _parts[1].strip() if len(_parts) > 1 else ""
-                                            _hours = 0.0
-                                            try:
-                                                _hours = float(_rec.get("時數", 0))
-                                            except (ValueError, TypeError):
-                                                pass
-                                            _date_str = str(_rec.get("日期", ""))
-                                            
-                                            # 自動計算結束時間 = 起始時間 + 時數
-                                            _end_time = ""
-                                            if _start_time:
-                                                try:
-                                                    _st = datetime.strptime(_start_time, "%H:%M")
-                                                    _et = _st + timedelta(hours=_hours)
-                                                    _end_time = _et.strftime("%H:%M")
-                                                except Exception:
-                                                    pass
-                                            
-                                            _parsed_records.append({
-                                                "work_content": _work_content,
-                                                "date": _date_str,
-                                                "start_time": _start_time,
-                                                "end_time": _end_time,
-                                                "hours": _hours
-                                            })
-                                        
-                                        # 顯示預覽表格
-                                        st.success(f"✅ 找到 {len(_parsed_records)} 筆消警告紀錄（最多顯示 8 筆）：")
-                                        _preview_df = pd.DataFrame([{
-                                            "序號": i + 1,
-                                            "工作內容": r["work_content"],
-                                            "服務日期": r["date"],
-                                            "起始時間": r["start_time"] if r["start_time"] else "—",
-                                            "結束時間": r["end_time"] if r["end_time"] else "—",
-                                            "時數": r["hours"]
-                                        } for i, r in enumerate(_parsed_records)])
-                                        st.dataframe(_preview_df, hide_index=True)
-                                        
-                                        _total_h = sum(r["hours"] for r in _parsed_records)
-                                        st.metric("總計服務時數", f"{_total_h:g} 小時")
-                                        
-                                        # 產製 Excel
-                                        _excel_bytes = generate_appeal_form_excel(
-                                            _clean_sid, _cls_name, _parsed_records
-                                        )
-                                        st.download_button(
-                                            label="📥 下載愛校服務申請單 (Excel)",
-                                            data=_excel_bytes,
-                                            file_name=f"愛校申請單_{_cls_name}_{_clean_sid}.xlsx",
-                                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                            key="dl_appeal_excel"
-                                        )
-                                        st.caption("💡 下載後請用 Excel 開啟，確認格式無誤後列印 A4 紙張，再持表單至學務處完成後續流程。")
-                                        
-                                except Exception as e:
-                                    st.error(f"❌ 產製銷過單時發生錯誤：{e}")
-                                    st.caption("請確認 Google Sheets 的 service_hours 工作表連線是否正常。")
+                                # 依學號分組
+                                _grouped = {}
+                                for _rec in _all_appeal_records:
+                                    _sid = str(_rec.get("學號", "")).strip()
+                                    if not _sid:
+                                        continue
+                                    if _sid not in _grouped:
+                                        _grouped[_sid] = []
+                                    _grouped[_sid].append(_rec)
+
+                                # 顯示摘要表格
+                                _summary_rows = []
+                                for _sid, _recs in sorted(_grouped.items()):
+                                    _cls_name = ROSTER_DICT.get(clean_id(_sid), "未知班級")
+                                    _total_h = sum(float(r.get("時數", 0)) for r in _recs)
+                                    _summary_rows.append({
+                                        "學號": _sid,
+                                        "班級": _cls_name,
+                                        "服務筆數": len(_recs),
+                                        "總時數": round(_total_h, 2)
+                                    })
+
+                                st.success(f"✅ 共找到 **{len(_all_appeal_records)}** 筆消警告紀錄，涵蓋 **{len(_grouped)}** 位學生：")
+                                _summary_df = pd.DataFrame(_summary_rows)
+                                st.dataframe(_summary_df, hide_index=True)
+
+                                # 存入 session_state 供後續下載
+                                st.session_state["_appeal_grouped"] = _grouped
+                                st.session_state["_appeal_summary"] = _summary_rows
+
+                        except Exception as e:
+                            st.error(f"❌ 查詢消警告紀錄時發生錯誤：{e}")
+
+                    # ── 查詢結果存在 session_state 時，顯示下載區 ──
+                    if st.session_state.get("_appeal_grouped"):
+                        _grouped = st.session_state["_appeal_grouped"]
+                        _summary_rows = st.session_state.get("_appeal_summary", [])
+
+                        st.markdown("---")
+                        st.markdown("#### 📥 下載銷過單")
+
+                        # ── 一鍵下載全部（ZIP） ──
+                        if st.button("📦 一鍵打包下載全部銷過單 (ZIP)", key="btn_dl_all_zip"):
+                            import zipfile as _zipfile
+                            _zip_buf = io.BytesIO()
+                            _gen_count = 0
+                            with _zipfile.ZipFile(_zip_buf, 'w', _zipfile.ZIP_DEFLATED) as _zf:
+                                for _sid, _recs in sorted(_grouped.items()):
+                                    _cls_name = ROSTER_DICT.get(clean_id(_sid), "未知班級")
+                                    _parsed = [_parse_appeal_record(r) for r in _recs[:8]]
+                                    if _parsed:
+                                        _excel_bytes = generate_appeal_form_excel(clean_id(_sid), _cls_name, _parsed)
+                                        _zf.writestr(f"愛校申請單_{_cls_name}_{_sid}.xlsx", _excel_bytes)
+                                        _gen_count += 1
+                            _zip_buf.seek(0)
+                            st.download_button(
+                                label=f"📦 下載 ZIP（共 {_gen_count} 份申請單）",
+                                data=_zip_buf.getvalue(),
+                                file_name=f"消警告銷過單_全部_{datetime.now(TW_TZ).strftime('%Y%m%d')}.zip",
+                                mime="application/zip",
+                                key="dl_all_appeal_zip"
+                            )
+                            st.success(f"✅ 已產製 {_gen_count} 份銷過單！")
+
+                        # ── 個別學生下載 ──
+                        st.markdown("##### 或選擇單一學生下載")
+                        _sid_options = [f"{r['學號']} ({r['班級']}, {r['總時數']}h, {r['服務筆數']}筆)"
+                                        for r in _summary_rows]
+                        _sel_appeal_student = st.selectbox("選擇學生", _sid_options, key="sel_appeal_student")
+
+                        if _sel_appeal_student:
+                            _sel_sid = _sel_appeal_student.split(" ")[0]
+                            _sel_recs = _grouped.get(_sel_sid, [])
+                            _sel_cls = ROSTER_DICT.get(clean_id(_sel_sid), "未知班級")
+
+                            if _sel_recs:
+                                _parsed_recs = [_parse_appeal_record(r) for r in _sel_recs[:8]]
+
+                                # 顯示預覽
+                                _preview_df = pd.DataFrame([{
+                                    "序號": i + 1,
+                                    "工作內容": r["work_content"],
+                                    "服務日期": r["date"],
+                                    "起始時間": r["start_time"] if r["start_time"] else "—",
+                                    "結束時間": r["end_time"] if r["end_time"] else "—",
+                                    "時數": r["hours"]
+                                } for i, r in enumerate(_parsed_recs)])
+                                st.dataframe(_preview_df, hide_index=True)
+
+                                _total_h = sum(r["hours"] for r in _parsed_recs)
+                                st.metric("總計服務時數", f"{_total_h:g} 小時")
+
+                                # 產製個別 Excel
+                                _excel_bytes = generate_appeal_form_excel(
+                                    clean_id(_sel_sid), _sel_cls, _parsed_recs
+                                )
+                                st.download_button(
+                                    label=f"📥 下載 {_sel_cls} {_sel_sid} 的銷過單",
+                                    data=_excel_bytes,
+                                    file_name=f"愛校申請單_{_sel_cls}_{_sel_sid}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key="dl_single_appeal"
+                                )
+
+                        st.caption("💡 下載後請用 Excel 開啟，確認格式無誤後列印 A4 紙張，再持表單至學務處完成後續流程。")
 
         elif pwd_input != "":
             st.error("密碼錯誤")
