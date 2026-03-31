@@ -2944,22 +2944,22 @@ try:
                         if "http" in str(r['照片路徑']):
                             c2.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=150)
 
-                        reply_msg = c1.text_input("💬 給予回應 (可留白)", key=f"rm_{r['紀錄ID']}")
+                        reply_msg = c1.text_input("💬 給予回應 (可留白)", key=f"rm_{r['紀錄ID']}_{i}")
 
                         # ── 審核按鈕：給分 or 駁回 ──
                         if score_val is not None:
-                            if c3.button(f"✅ 給分 ({suggested:g}分)", key=f"approve_{r['紀錄ID']}"):
+                            if c3.button(f"✅ 給分 ({suggested:g}分)", key=f"approve_{r['紀錄ID']}"_{i}):
                                 _do_approve(r["紀錄ID"], score_val,
                                             f"給分{suggested:g}分（{score_label.split('→')[0].strip()}）",
                                             reply_msg, c1, main_df)
                         else:
                             # 無法自動計算時，提供手動選項
-                            manual_score = c3.selectbox("給分", [2, 1, 0.5, 0.25], key=f"manual_{r['紀錄ID']}")
-                            if c3.button("✅ 給分", key=f"approve_{r['紀錄ID']}"):
+                            manual_score = c3.selectbox("給分", [2, 1, 0.5, 0.25], key=f"manual_{r['紀錄ID']}_{i}")
+                            if c3.button("✅ 給分", key=f"approve_{r['紀錄ID']}_{i}"):
                                 _do_approve(r["紀錄ID"], -manual_score, f"手動給分 {manual_score} 分",
                                             reply_msg, c1, main_df)
 
-                        if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}"):
+                        if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}_{i}"):
                             ws = get_worksheet(SHEET_TABS["main"])
                             id_list = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
                             # [Fix] 統一轉為 str 並 strip
