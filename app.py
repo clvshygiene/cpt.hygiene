@@ -455,7 +455,9 @@ try:
     _QCOL_ERROR    = 7
 
     def enqueue_task(task_type, payload):
-        # [Fix #3-B] 寫入 Sheets task_queue 分頁，不再用 SQLite
+        # [Fix #3-B] 寫入 Sheets task_queue 分頁，同步等待確認後返回
+        # 同步版本確保任務確實進入佇列才返回，前台可立即顯示成功訊息給使用者
+        # ※ threading 非同步版本在 Streamlit Cloud 不可靠（渲染完即砍執行緒），已廢棄
         task_id = str(uuid.uuid4())
         try:
             def _action():
@@ -470,49 +472,6 @@ try:
             execute_with_retry(_action)
         except Exception as e:
             print(f"[enqueue] 加入佇列失敗: {e}")
-        return task_id
-
-    def enqueue_task(task_type, payload):
-        """[Fix 4] 非阻塞版本的 enqueue_task。
-        Sheets append_row 移至背景執行緒，UI 層呼叫後立即返回，
-        不再等待 API 回應（約 1~3 秒），管理後台操作感受大幅改善。
-        若背景寫入失敗，自動存入 SQLite fallback_queue；
-        Worker 每輪開頭會呼叫 _drain_fallback_queue 將其推入 Sheets。"""
-        task_id = str(uuid.uuid4())
-        created_ts = datetime.now(timezone.utc).isoformat()
-        payload_json = json.dumps(payload, ensure_ascii=False)
-
-        def _push():
-            try:
-                def _action():
-                    ws = get_worksheet(SHEET_TABS["task_queue"])
-                    if not ws: raise Exception("無法取得 task_queue 工作表")
-                    ws.append_row([
-                        task_id, task_type, created_ts,
-                        payload_json, "PENDING", 0, ""
-                    ], value_input_option="RAW")
-                execute_with_retry(_action)
-            except Exception as e:
-                print(f"[enqueue_nb] Sheets 失敗，存入 fallback_queue: {e}")
-                try:
-                    with closing(open_local_db()) as _conn:
-                        _conn.execute(
-                            "INSERT OR IGNORE INTO fallback_queue VALUES (?, ?, ?, ?)",
-                            (task_id, task_type, payload_json, created_ts)
-                        )
-                except Exception as e2:
-                    print(f"[enqueue_nb] fallback_queue 也失敗: {e2}")
-
-        try:
-            ctx = get_script_run_ctx()
-            _t = threading.Thread(target=_push, daemon=True)
-            if ctx:
-                add_script_run_ctx(_t, ctx)
-            _t.start()
-        except Exception as e:
-            print(f"[enqueue_nb] 背景執行緒啟動失敗，改為同步執行: {e}")
-            enqueue_task(task_type, payload)  # fallback 到同步版本
-
         return task_id
 
     def get_pending_count():
