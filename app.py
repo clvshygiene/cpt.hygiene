@@ -42,6 +42,7 @@ if sys_env == "DEV":
     st.warning("🚧 **目前位於 DEV 測試環境！** 在這裡送出的資料僅供測試，不會影響正式成績。")
 else:
     st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
+    st.sidebar.caption("🔧 app version: v_DIAG_1")  # [DIAG] 確認部署版本用，修好後可刪除
 
 
 # --- 2. 核心參數與全域設定 ---
@@ -58,8 +59,7 @@ try:
         "appeals": "appeals", "holidays": "holidays", "service_hours": "service_hours",
         "office_areas": "office_areas", "published_results": "published_results",
         "task_queue": "task_queue_v3",  # [Fix #3-B] 雲端佇列分頁，取代本機 SQLite task_queue 表
-        "student_debts": "student_debts", "debt_history": "debt_history",  # [新增] 愛校服務 2.0
-        "worker_log": "worker_log"    # [DIAG] Worker 執行日誌
+        "student_debts": "student_debts", "debt_history": "debt_history"  # [新增] 愛校服務 2.0
     }
 
     EXPECTED_COLUMNS = [
@@ -869,20 +869,6 @@ try:
         except Exception as _de:
             pass  # 診斷本身不能干擾主流程
 
-    def _diag_write_log(task_id, task_type, message):
-        """[DIAG] 將 Worker 執行資訊直接寫入 Google Sheets worker_log 分頁，供診斷用。"""
-        try:
-            ws = get_worksheet(SHEET_TABS["worker_log"])
-            if not ws:
-                return
-            from datetime import datetime
-            import pytz
-            ts = datetime.now(pytz.timezone("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
-            ws.append_row([ts, task_id[:8] if task_id else "?", task_type, str(message)[:500]],
-                          value_input_option="RAW")
-        except Exception as e:
-            pass  # 診斷函式本身不能影響主流程
-
     def process_task(task):
         task_type, payload = task["task_type"], task["payload"]
 
@@ -1088,12 +1074,7 @@ try:
                     print("[worker] notion_page_id 為空，跳過 Notion 更新")
                 _done_diag = f"debt={svc_debt_sids}|appeal={svc_appeal_sids}"
                 _write_worker_diag(_task_id_for_dedup, "campus_service_verify", "VERIFY_DONE", _done_diag)
-                _diag_write_log(
-                    _task_id_for_dedup, "campus_service_verify",
-                    f"DONE debt={svc_debt_sids} appeal={svc_appeal_sids} "
-                    f"debt_failures={debt_failures} notion={'OK' if notion_page_id else 'SKIP'}"
-                )
-                print(f"[worker] ✅ campus_service_verify 完成：debt={svc_debt_sids} appeal={svc_appeal_sids}", flush=True)
+                print(f"[worker] ✅ campus_service_verify 完成：debt={svc_debt_sids} appeal={svc_appeal_sids}")
 
             # ── [愛校2.0 Async] 背景晨掃審核 ──────────────────────────
             elif task_type == "morning_sweep_approve":
@@ -1160,11 +1141,7 @@ try:
                 print(f"[worker] appeal_review 完成：{_ar_record_id} → {_ar_status}")
 
             return True, None
-        except Exception as e:
-            _task_id_dbg = str(task.get("id", ""))
-            _diag_write_log(_task_id_dbg, task.get("task_type", "?"), f"EXCEPTION: {str(e)[:300]}")
-            print(f"[process_task] EXCEPTION: {e}", flush=True)
-            return False, str(e)
+        except Exception as e: return False, str(e)
 
     def background_worker(stop_event=None):
         try: add_script_run_ctx(threading.current_thread(), get_script_run_ctx())
@@ -1283,16 +1260,39 @@ try:
                     continue
 
                 _idle_loops = 0
+                # [DIAG] 用已持有的 ws 直接寫入，不另外呼叫 API，確認 Worker 確實執行到這裡
+                try:
+                    _bw_diag_id = f"DIAG_{str(task.get('id',''))[:8]}_BEFORE_PROCESS"
+                    _bw_payload_preview = str(task.get('payload', {}))[:200]
+                    ws.append_row(
+                        [_bw_diag_id, task.get("task_type","?"),
+                         datetime.now(TW_TZ).strftime("%H:%M:%S"),
+                         _bw_payload_preview, "DIAG", task.get("attempts",0), "BW_BEFORE_PROCESS"],
+                        value_input_option="RAW"
+                    )
+                except Exception as _bw_de:
+                    pass  # 診斷失敗不影響主流程
                 ok, err = process_task(task)
                 if ok: update_last_success_time()
                 else:
                     if err and "DRY_RUN" not in err: update_last_error_summary(err)
 
+                # [DIAG] process_task 結果
+                try:
+                    _bw_result_id = f"DIAG_{str(task.get('id',''))[:8]}_AFTER_PROCESS"
+                    ws.append_row(
+                        [_bw_result_id, task.get("task_type","?"),
+                         datetime.now(TW_TZ).strftime("%H:%M:%S"),
+                         f"ok={ok} err={str(err)[:150]}", "DIAG", task.get("attempts",0), "BW_AFTER_PROCESS"],
+                        value_input_option="RAW"
+                    )
+                except Exception:
+                    pass
                 if not ok and err and "FILE_NOT_FOUND" in str(err): task["attempts"] = 999
                 update_task_status(task["id"], "DONE" if ok else ("FAILED" if task["attempts"] >= 6 else "RETRY"), task["attempts"], err, _row_idx=task.get("_row_idx"))
                 time.sleep(2.0)
             except Exception as e:
-                print(f"[worker] 未預期例外: {e}", flush=True)
+                print(f"[worker] 未預期例外: {e}")
                 time.sleep(5.0)
 
     @st.cache_resource
@@ -1983,11 +1983,7 @@ try:
                 load_appeals.clear()
                 return True, "更新成功"
             return False, "找不到對應的申訴列"
-        except Exception as e:
-            _task_id_dbg = str(task.get("id", ""))
-            _diag_write_log(_task_id_dbg, task.get("task_type", "?"), f"EXCEPTION: {str(e)[:300]}")
-            print(f"[process_task] EXCEPTION: {e}", flush=True)
-            return False, str(e)
+        except Exception as e: return False, str(e)
 
     def delete_rows_by_ids(ids):
         ws = get_worksheet(SHEET_TABS["main"])
