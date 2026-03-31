@@ -11,6 +11,7 @@ import sqlite3
 import json
 import random
 import math  # [新增] 愛校服務 2.0
+import unicodedata  # [Fix] 剝除 Notion rich_text 夾帶的隱藏格式字元
 import concurrent.futures
 from contextlib import closing
 from datetime import datetime, date, timedelta
@@ -366,7 +367,33 @@ try:
         # [Fix #3-B] task_queue 已移至 Google Sheets，這裡只保留兩張輕量表
         conn = sqlite3.connect(QUEUE_DB_PATH, timeout=10.0, isolation_level=None)
         conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("CREATE TABLE IF NOT EXISTS service_issued (date TEXT, sid TEXT, category TEXT, PRIMARY KEY(date, sid, category))")
+        # [Fix] 去重 key 加入 class_name，允許同學同日不同任務各別寫入
+        # 先檢查舊 schema（3欄）是否存在，若是則遷移至新 schema（4欄）
+        try:
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(service_issued)").fetchall()]
+            if cols and "class_name" not in cols:
+                # 舊 schema → 備份後重建
+                conn.execute("ALTER TABLE service_issued RENAME TO service_issued_old")
+                conn.execute("""CREATE TABLE service_issued (
+                    date TEXT, sid TEXT, category TEXT, class_name TEXT,
+                    PRIMARY KEY(date, sid, category, class_name))""")
+                conn.execute("""INSERT OR IGNORE INTO service_issued
+                    SELECT date, sid, category, '' FROM service_issued_old""")
+                conn.execute("DROP TABLE service_issued_old")
+                print("[db_migrate] service_issued 已從 3欄 key 遷移至 4欄 key")
+            elif not cols:
+                conn.execute("""CREATE TABLE IF NOT EXISTS service_issued (
+                    date TEXT, sid TEXT, category TEXT, class_name TEXT,
+                    PRIMARY KEY(date, sid, category, class_name))""")
+        except Exception as e:
+            print(f"[db_migrate] schema 遷移時發生錯誤，嘗試重建: {e}")
+            try:
+                conn.execute("DROP TABLE IF EXISTS service_issued")
+                conn.execute("""CREATE TABLE service_issued (
+                    date TEXT, sid TEXT, category TEXT, class_name TEXT,
+                    PRIMARY KEY(date, sid, category, class_name))""")
+            except Exception as e2:
+                print(f"[db_migrate] 重建失敗: {e2}")
         conn.execute("CREATE TABLE IF NOT EXISTS system_status (key TEXT PRIMARY KEY, val TEXT)")
         return conn
 
@@ -581,18 +608,19 @@ try:
         rows_to_write = []
         for task in tasks:
             payload = task["payload"]
-            t_date = payload.get("date", str(date.today()))
-            t_cat  = payload.get("category", "")
+            t_date     = payload.get("date", str(date.today()))
+            t_cat      = payload.get("category", "")
+            t_cls_name = payload.get("class_name", "")  # [Fix] 加入 class_name 作為去重 key 的一部分
             for sid in payload.get("student_list", []):
                 try:
                     with closing(open_local_db()) as conn:
                         conn.execute(
-                            "INSERT INTO service_issued VALUES (?, ?, ?)",
-                            (t_date, str(sid), t_cat)
+                            "INSERT INTO service_issued VALUES (?, ?, ?, ?)",
+                            (t_date, str(sid), t_cat, t_cls_name)
                         )
                     rows_to_write.append([
                         t_date, str(sid),
-                        payload.get("class_name", ""), t_cat,
+                        t_cls_name, t_cat,
                         str(payload.get("hours", 0.5)),
                         uuid.uuid4().hex[:8]
                     ])
@@ -627,15 +655,17 @@ try:
         execute_with_retry(_action)
     
     def _append_service_row_unique(entry):
-        t_date = str(entry.get("日期", ""))
-        t_sid = str(entry.get("學號", ""))
-        t_cat = str(entry.get("類別", ""))
+        t_date     = str(entry.get("日期", ""))
+        t_sid      = str(entry.get("學號", ""))
+        t_cat      = str(entry.get("類別", ""))
+        t_cls_name = str(entry.get("班級", ""))  # [Fix] 加入 class_name 至去重 key
         
         try:
             with closing(open_local_db()) as conn:
-                conn.execute("INSERT INTO service_issued VALUES (?, ?, ?)", (t_date, t_sid, t_cat))
+                conn.execute("INSERT INTO service_issued VALUES (?, ?, ?, ?)",
+                             (t_date, t_sid, t_cat, t_cls_name))
         except sqlite3.IntegrityError:
-            return 
+            return
             
         def _action():
             ws = get_worksheet(SHEET_TABS["service_hours"])
@@ -690,14 +720,16 @@ try:
                 if task_type == "volunteer_report":
                     # [Fix #3] volunteer_report 多名學生的時數改為批次寫入（1 次 append_rows）
                     svc_rows = []
-                    t_date = entry.get("日期", str(date.today()))
-                    t_cat  = payload.get("custom_category", "晨掃志工")
+                    t_date    = entry.get("日期", str(date.today()))
+                    t_cat     = payload.get("custom_category", "晨掃志工")
+                    t_cls_vol = entry.get("班級", "")  # [Fix] 加入 class_name 至去重 key
                     for sid in payload.get("student_list", []):
                         try:
                             with closing(open_local_db()) as conn:
-                                conn.execute("INSERT INTO service_issued VALUES (?, ?, ?)", (t_date, str(sid), t_cat))
+                                conn.execute("INSERT INTO service_issued VALUES (?, ?, ?, ?)",
+                                             (t_date, str(sid), t_cat, t_cls_vol))
                             svc_rows.append([
-                                t_date, str(sid), entry.get("班級", ""), t_cat,
+                                t_date, str(sid), t_cls_vol, t_cat,
                                 str(payload.get("custom_hours", 0.5)), uuid.uuid4().hex[:8]
                             ])
                         except sqlite3.IntegrityError:
@@ -976,7 +1008,8 @@ try:
 
     # [新增] 愛校服務 2.0：欠時資料存取函式 =====================
     def load_student_debts():
-        """讀取 student_debts 工作表，回傳 {學號: 未完成時數} 字典"""
+        """讀取 student_debts 工作表，回傳 {學號: 未完成時數} 字典。
+        同一學號若有多列（例如多次欠時分批登錄），時數自動加總，不會被後列覆蓋。"""
         ws = get_worksheet(SHEET_TABS["student_debts"])
         if not ws:
             return {}
@@ -984,8 +1017,18 @@ try:
             records = ws.get_all_records()
             if not records:
                 return {}
-            return {clean_id(str(r.get("學號", ""))): float(r.get("未完成時數", 0))
-                    for r in records if str(r.get("學號", "")).strip()}
+            result = {}
+            for r in records:
+                sid = clean_id(str(r.get("學號", "")).strip())
+                if not sid:
+                    continue
+                try:
+                    hours = float(r.get("未完成時數", 0))
+                except (ValueError, TypeError):
+                    hours = 0.0
+                # [Fix] 加總，避免重複學號後列覆蓋前列
+                result[sid] = round(result.get(sid, 0.0) + hours, 2)
+            return result
         except Exception as e:
             print(f"[load_student_debts] {e}")
             return {}
@@ -1009,25 +1052,31 @@ try:
             return pd.DataFrame(columns=cols)
 
     def load_student_debt_note(sid):
-        """讀取 student_debts 工作表的備註欄位，回傳該學號的備註字串"""
+        """讀取 student_debts 工作表的備註欄位。
+        同一學號若有多列，將所有備註合併顯示（以 ；分隔，去重）。"""
         ws = get_worksheet(SHEET_TABS["student_debts"])
         if not ws:
             return ""
         try:
             records = ws.get_all_records()
+            notes = []
             for r in records:
                 if clean_id(str(r.get("學號", ""))) == clean_id(str(sid)):
-                    return str(r.get("備註", "")).strip()
-            return ""
+                    note = str(r.get("備註", "")).strip()
+                    # [Fix] 收集全部備註並去重，不只抓第一筆
+                    if note and note not in notes:
+                        notes.append(note)
+            return "；".join(notes) if notes else ""
         except Exception as e:
             print(f"[load_student_debt_note] {e}")
             return ""
 
     def update_student_debt(sid, change_hours, reason):
-        """寫入 debt_history 一筆紀錄並同步更新 student_debts 中的未完成時數"""
+        """寫入 debt_history 一筆紀錄並同步更新 student_debts 中的未完成時數。
+        若同一學號在 student_debts 有多列，自動加總後合併為一列（刪除重複列）。"""
         sid = str(sid).strip()
         try:
-            debts = load_student_debts()
+            debts = load_student_debts()  # [Fix] 已加總所有同學號列
             current = debts.get(sid, 0.0)
             new_remaining = round(current + change_hours, 2)
             now_str = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -1043,209 +1092,273 @@ try:
                 if not ws_d:
                     raise Exception("無法取得 student_debts 工作表")
                 all_vals = ws_d.get_all_values()
-                found = False
-                for i, row in enumerate(all_vals):
-                    if i == 0:
-                        continue
-                    if clean_id(str(row[0]).strip()) == sid:
-                        ws_d.update_cell(i + 1, 2, new_remaining)
-                        found = True
-                        break
-                if not found:
+                # [Fix] 收集所有匹配列的行號（1-indexed，跳過標頭）
+                matching_rows = [
+                    i + 1
+                    for i, row in enumerate(all_vals)
+                    if i > 0 and clean_id(str(row[0]).strip()) == sid
+                ]
+                if not matching_rows:
+                    # 完全找不到 → 新增一列
                     ws_d.append_row([sid, new_remaining], value_input_option="RAW")
+                else:
+                    # 更新第一列為加總後的新值
+                    ws_d.update_cell(matching_rows[0], 2, new_remaining)
+                    if len(matching_rows) > 1:
+                        # [Fix] 從後往前刪除多餘的重複列，避免刪除時行號偏移
+                        print(f"[update_debt] 偵測到 {sid} 有 {len(matching_rows)} 列，合併中...")
+                        for row_idx in sorted(matching_rows[1:], reverse=True):
+                            ws_d.delete_rows(row_idx)
+                        print(f"[update_debt] 已合併 {len(matching_rows)-1} 列重複資料 → 剩餘時數 {new_remaining}h")
             execute_with_retry(_update_debts)
             return True
         except Exception as e:
             print(f"[update_student_debt] {e}")
             return False
 
+    # ── 愛校服務申請單 Excel 模板（base64 嵌入，避免外部檔案依賴）──
+    _APPEAL_FORM_TEMPLATE_B64 = (
+        "UEsDBBQABgAIAAAAIQBBN4LPbgEAAAQFAAATAAgCW0NvbnRlbnRfVHlwZXNdLnhtbCCiBAIooAACAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACsVMluwjAQvVfqP0S+Vomhh6qqCBy6HFsk6AeYeJJY"
+        "JLblGSj8fSdmUVWxCMElUWzPWybzPBit2iZZQkDjbC76WU8kYAunja1y8T39SJ9FgqSsVo2zkIs1oBgN"
+        "7+8G07UHTLjaYi5qIv8iJRY1tAoz58HyTulCq4g/QyW9KuaqAvnY6z3JwlkCSyl1GGI4eINSLRpK3le8"
+        "vFEyM1Ykr5tzHVUulPeNKRSxULm0+h9J6srSFKBdsWgZOkMfQGmsAahtMh8MM4YJELExFPIgZ4AGLyPd"
+        "usq4MgrD2nh8YOtHGLqd4662dV/8O4LRkIxVoE/Vsne5auSPC/OZc/PsNMilrYktylpl7E73Cf54GGV8"
+        "9W8spPMXgc/oIJ4xkPF5vYQIc4YQad0A3rrtEfQcc60C6Anx9FY3F/AX+5QOjtQ4OI+c2gCXd2EXka46"
+        "9QwEgQzsQ3Jo2PaMHPmr2w7dnaJBH+CW8Q4b/gIAAP//AwBQSwMEFAAGAAgAAAAhALVVMCP0AAAATAIA"
+        "AAsACAJfcmVscy8ucmVscyCiBAIooAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACskk1P"
+        "wzAMhu9I/IfI99XdkBBCS3dBSLshVH6ASdwPtY2jJBvdvyccEFQagwNHf71+/Mrb3TyN6sgh9uI0rIsS"
+        "FDsjtnethpf6cXUHKiZylkZxrOHEEXbV9dX2mUdKeSh2vY8qq7iooUvJ3yNG0/FEsRDPLlcaCROlHIYW"
+        "PZmBWsZNWd5i+K4B1UJT7a2GsLc3oOqTz5t/15am6Q0/iDlM7NKZFchzYmfZrnzIbCH1+RpVU2g5abBi"
+        "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"
+    )
+
     def generate_appeal_form_excel(student_id, cls_name, records):
-        """[愛校2.0] 生成消警告申請單 Excel 檔，格式比照學務處正式版本（桃園市立中壢家商）"""
-        from openpyxl import Workbook
-        from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+        """[愛校2.0] 生成消警告申請單 Excel，直接套用學校官方模板，100% 保留原版格式。"""
+        import base64
+        from openpyxl import load_workbook
 
-        wb = Workbook()
+        # 從嵌入模板載入（保留所有框線、合併、字型、列印設定）
+        tmpl_bytes = base64.b64decode(_APPEAL_FORM_TEMPLATE_B64)
+        wb = load_workbook(io.BytesIO(tmpl_bytes))
         ws = wb.active
-        ws.title = "愛校服務申請單"
 
-        # ── 頁面設定（A4 直印，自動縮放至單頁寬）──
-        ws.page_setup.paperSize  = ws.PAPERSIZE_A4
-        ws.page_setup.orientation = 'portrait'
-        ws.page_margins.left   = 0.7
-        ws.page_margins.right  = 0.7
-        ws.page_margins.top    = 0.6
-        ws.page_margins.bottom = 0.6
-        ws.page_setup.fitToPage   = True
-        ws.page_setup.fitToWidth  = 1
-        ws.page_setup.fitToHeight = 0
+        # ── Row 3：填入班級 / 學號（姓名欄留空，手寫）──
+        # A3='班　級'(label) B3=班級值  C3='姓　名'(label) D3=空  E3='學　號'(label) F3:G3=學號值
+        ws['B3'] = cls_name
+        ws['D3'] = ''
+        ws['F3'] = str(student_id)   # F3:G3 merged，填左上角
 
-        # ── 欄寬（5 欄：工作內容 / 起 / 迄 / 師長驗收簽章 / 累計時數）──
-        for col, w in {'A': 36, 'B': 12, 'C': 12, 'D': 18, 'E': 10}.items():
-            ws.column_dimensions[col].width = w
-
-        # ── 樣式定義 ──
-        _thin = Side(style='thin')
-        bd = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
-        bd_t = Border(top=_thin)   # 只有上框線（條文區分隔用）
-
-        f_title = Font(name='微軟正黑體', size=15, bold=True)
-        f_hd    = Font(name='微軟正黑體', size=11, bold=True)
-        f_info  = Font(name='微軟正黑體', size=11)
-        f_cell  = Font(name='微軟正黑體', size=10)
-        f_total = Font(name='微軟正黑體', size=12, bold=True)
-        f_note  = Font(name='微軟正黑體', size=9)
-        f_small = Font(name='微軟正黑體', size=8, color='606060')
-        hfill   = PatternFill(start_color='D6DCE4', end_color='D6DCE4', fill_type='solid')
-        ac = Alignment(horizontal='center', vertical='center', wrap_text=True)
-        al = Alignment(horizontal='left',   vertical='center', wrap_text=True)
-        ar = Alignment(horizontal='right',  vertical='center')
-
-        now_tw = datetime.now(TW_TZ)
-        roc_y  = now_tw.year - 1911
-
-        # ── 輔助函式 ──
-        def mc(r_range, value="", font=None, align=None, fill=None, border=None):
-            """合併儲存格並設定樣式"""
-            ws.merge_cells(r_range)
-            cell = ws[r_range.split(':')[0]]
-            cell.value = value
-            if font:   cell.font      = font
-            if align:  cell.alignment = align
-            if fill:   cell.fill      = fill
-            if border: cell.border    = border
-            return cell
-
-        def rc(row, col, value="", font=None, align=None, fill=None, border=None):
-            """單一儲存格設定"""
-            cell = ws.cell(row=row, column=col, value=value)
-            if font:   cell.font      = font
-            if align:  cell.alignment = align
-            if fill:   cell.fill      = fill
-            if border: cell.border    = border
-            return cell
-
-        def apply_border_range(r1, c1, r2, c2, border):
-            """對矩形範圍內每個儲存格套用 border"""
-            for r in range(r1, r2 + 1):
-                for c in range(c1, c2 + 1):
-                    ws.cell(row=r, column=c).border = border
-
-        # ── 行高 ──
-        row_heights = {
-            1: 40,   # 主標題
-            2: 6,    # 空行
-            3: 26,   # 班級/姓名/學號
-            4: 26,   # 愛校事由
-            5: 26,   # 獎懲缺 / 曠日期
-            6: 8,    # 空行
-            7: 28,   # 表頭
-        }
-        for r, h in row_heights.items():
-            ws.row_dimensions[r].height = h
-        for r in range(8, 16):   # 資料列 8 列
-            ws.row_dimensions[r].height = 26
-        for r, h in {16: 28, 17: 8, 18: 22, 19: 22, 20: 44, 21: 8, 22: 18, 23: 22, 24: 14}.items():
-            ws.row_dimensions[r].height = h
-
-        # ════════════════════════════════
-        # R1：主標題
-        # ════════════════════════════════
-        mc('A1:E1',
-           "桃園市立中壢家商學生銷過『愛校服務』申請表",
-           font=f_title, align=ac)
-
-        # ════════════════════════════════
-        # R3：班級 / 姓名 / 學號（三等分）
-        # ════════════════════════════════
-        mc('A3:B3', f'班　級：{cls_name}', font=f_info, align=al, border=bd)
-        rc(3, 3, '姓　名：', font=f_info, align=al, border=bd)
-        mc('D3:E3', f'學　號：{student_id}', font=f_info, align=al, border=bd)
-
-        # ════════════════════════════════
-        # R4：愛校事由（整行）
-        # ════════════════════════════════
-        mc('A4:E4', '愛校事由：', font=f_info, align=al, border=bd)
-
-        # ════════════════════════════════
-        # R5：獎懲缺 / 曠日期
-        # ════════════════════════════════
-        mc('A5:B5', '獎懲缺：□ 警告　□ 小過　□ 大過', font=f_info, align=al, border=bd)
-        mc('C5:E5',
-           f'曠日期（　　年　　月　　日）：',
-           font=f_info, align=al, border=bd)
-
-        # ════════════════════════════════
-        # R7：表頭（5 欄）
-        # ════════════════════════════════
-        for ci, h in enumerate(['工作內容', '愛校時間(起)', '愛校時間(迄)', '師長驗收簽章', '累計時數'], 1):
-            rc(7, ci, h, font=f_hd, align=ac, fill=hfill, border=bd)
-
-        # ════════════════════════════════
-        # R8-R15：資料列（共 8 列）
-        # ════════════════════════════════
+        # ── Row 5-12：填入服務紀錄（最多 8 列）──
+        # 欄對應：A=愛校事由, B=缺曠日期, C:D(merged)=工作內容, E=時間起迄, F=師長驗收(留空), G=累計時數
         total_hours = 0.0
         for i in range(8):
-            rn = 8 + i
+            r = 5 + i
             if i < len(records):
                 rec = records[i]
-                vals = [
-                    rec.get('work_content', ''),
-                    rec.get('start_time', ''),
-                    rec.get('end_time', ''),
-                    '',   # 師長驗收簽章（留空）
-                    rec.get('hours', '')
-                ]
-                try:
-                    total_hours += float(rec.get('hours', 0))
-                except (ValueError, TypeError):
-                    pass
+                h = 0.0
+                try: h = float(rec.get('hours', 0))
+                except (ValueError, TypeError): pass
+                st = rec.get('start_time', '')
+                et = rec.get('end_time', '')
+                time_str = f"{st}~{et}" if st and et else st
+                ws.cell(row=r, column=1).value = '消警告'
+                ws.cell(row=r, column=2).value = rec.get('date', '')
+                ws.cell(row=r, column=3).value = rec.get('work_content', '')  # C:D merged，填C
+                ws.cell(row=r, column=5).value = time_str
+                ws.cell(row=r, column=7).value = h if h else None
+                total_hours += h
             else:
-                vals = ['', '', '', '', '']
-            for ci, v in enumerate(vals, 1):
-                rc(rn, ci, v,
-                   font=f_cell,
-                   align=al if ci == 1 else ac,
-                   border=bd)
+                # 空白列：清除可能殘留的樣板文字
+                for col in (1, 2, 3, 5, 7):
+                    ws.cell(row=r, column=col).value = None
 
-        # ════════════════════════════════
-        # R16：合計愛校時數
-        # ════════════════════════════════
-        mc('A16:D16', '合計愛校時數', font=f_hd, align=ar, border=bd)
-        rc(16, 5, total_hours, font=f_total, align=ac, border=bd)
+        # ── Row 13：合計愛校時數 → F13（F13:G13 merged）──
+        ws['F13'] = round(total_hours, 2)
 
-        # ════════════════════════════════
-        # R18：審查簽核 標題列
-        # ════════════════════════════════
-        mc('A18:E18', '審　查　簽　核', font=f_hd, align=ac, fill=hfill, border=bd)
+        # ── Row 20：列印日期 ──
+        now_tw = datetime.now(TW_TZ)
+        roc_y  = now_tw.year - 1911
+        ws['A20'] = (
+            f'（本表由衛生組系統自動產製，僅供消警告使用，不得銷過。'
+            f'列印日期：民國 {roc_y} 年 {now_tw.month} 月 {now_tw.day} 日）'
+        )
 
-        # R19：職稱列
-        for ci, role in enumerate(['導師', '生輔組長', '主任教官', '學務主任', '校長'], 1):
-            rc(19, ci, role,
-               font=Font(name='微軟正黑體', size=10, bold=True),
-               align=ac, fill=hfill, border=bd)
-
-        # R20：簽章空白列（高度加大供蓋章）
-        for ci in range(1, 6):
-            rc(20, ci, '', border=bd)
-
-        # ════════════════════════════════
-        # R22-R24：官方條文 + 自動產製說明
-        # ════════════════════════════════
-        notes = [
-            ('A22:E22',
-             '1、愛校服務申請：銷警告 1 次需愛校服務累計 1 小時，銷小過 1 次需愛校服務累計 8 小時，銷大過 1 次需愛校服務累計 24 小時。',
-             f_note),
-            ('A23:E23',
-             '2、愛校服務需利用課餘時間，每日愛校不得超過 2 小時，由學務處分配擔任各處室師長公差勤務，並請師長驗收簽證。',
-             f_note),
-            ('A24:E24',
-             f'（本表由衛生組系統自動產製，列印日期：民國 {roc_y} 年 {now_tw.month} 月 {now_tw.day} 日）',
-             f_small),
-        ]
-        for r_range, text, font in notes:
-            mc(r_range, text, font=font, align=al)
-
-        # ── 輸出 ──
         buf = io.BytesIO()
         wb.save(buf)
         buf.seek(0)
@@ -3565,20 +3678,33 @@ try:
                                     st.rerun()
 
             # [Fix] 統一 tag 解析函式，同時支援半形 () 和全形（）括號
+            def _strip_notion_invisible(s):
+                """剝除 Notion rich_text 可能夾帶的所有 Unicode 格式/控制字元。
+                涵蓋 Cf（零寬空格、BOM、Word Joiner、ZWNJ、ZWJ 等所有格式字元）、
+                Cc（控制字元）、Cs（代理字元），並將各種 Unicode 空白統一壓縮為一般半形空格後 strip。
+                不針對特定 code point，一次清除到底。"""
+                # Step 1: 剝除所有格式/控制/代理字元
+                cleaned = ''.join(
+                    c for c in str(s)
+                    if unicodedata.category(c) not in ('Cf', 'Cc', 'Cs')
+                )
+                # Step 2: 將所有 Unicode 空白類（含全形空格 U+3000、各種空白分隔符）壓縮為半形空格
+                cleaned = re.sub(r'[\s\u3000\u2000-\u200a\u202f\u205f]+', ' ', cleaned)
+                return cleaned.strip()
+
             def _parse_claimant_tag(claimant_str):
                 """從認領學號字串解析出 (學號, 標籤)，支援半形/全形括號"""
-                claimant_str = str(claimant_str).strip()
+                claimant_str = _strip_notion_invisible(claimant_str)
                 sid_match = re.match(r"(\d+)", claimant_str)
                 sid = sid_match.group(1) if sid_match else None
                 # 同時匹配半形 () 和全形（）
                 tag_match = re.search(r"[\(\uff08](.*?)[\)\uff09]", claimant_str)
                 if tag_match:
-                    # [Fix] 正規化：去除零寬空格、不換行空格等 Notion 常見隱藏字元，防止 == 比對失敗
-                    raw_tag = tag_match.group(1)
-                    tag = raw_tag.strip().replace('\u200b', '').replace('\xa0', ' ').replace('\u3000', '').strip()
+                    # [Fix] 用 unicodedata 核彈版正規化，剝除 Notion 可能夾帶的任意隱藏字元
+                    tag = _strip_notion_invisible(tag_match.group(1))
                 else:
                     tag = "還時數"
-                # [Debug] 加 repr() 方便排查隱藏字元問題
+                # [Debug] 加 repr() 方便確認清除後的結果
                 print(f"[parse_tag] raw='{claimant_str}' → sid={sid}, tag='{tag}' repr={repr(tag)}")
                 return sid, tag
 
@@ -3649,8 +3775,8 @@ try:
                                         if _sid_val:
                                             _verify_log.append(f"{_sid_val}({_tag_val})")
                                             
-                                            # [Fix] 正規化標籤，防止 Notion 隱藏字元造成 == 比對失敗
-                                            _tag_norm = _tag_val.strip().replace('\u200b', '').replace('\xa0', ' ').replace('\u3000', '').strip()
+                                            # [Fix] unicodedata 核彈版正規化，與 _parse_claimant_tag 一致
+                                            _tag_norm = _strip_notion_invisible(_tag_val)
 
                                             if _tag_norm == "還時數":
                                                 if update_student_debt(_sid_val, -_task_hours, f"愛校驗收：{_ct['title']}"):
@@ -3665,8 +3791,8 @@ try:
                                                 _punish_sids_verify.append(_sid_val)
                                             
                                             else:
-                                                # [Fix] 防禦：若 tag 不是預期的三種值，視為還時數並輸出 repr 供排查
-                                                print(f"[verify] 未知 tag '{_tag_val}' repr={repr(_tag_val)} for {_sid_val}，視為還時數")
+                                                # [Fix] else 分支：輸出 repr 供排查剩餘未知字元
+                                                print(f"[verify] ⚠️ 未知 tag '{_tag_val}' repr={repr(_tag_val)} norm='{_tag_norm}' repr_norm={repr(_tag_norm)} for {_sid_val}，視為還時數")
                                                 if update_student_debt(_sid_val, -_task_hours, f"愛校驗收：{_ct['title']}"):
                                                     _debt_deducted_count += 1
                                                 _issued_sids.append(_sid_val)
