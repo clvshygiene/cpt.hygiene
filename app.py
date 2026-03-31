@@ -833,11 +833,14 @@ try:
             execute_with_retry(_action)
         except Exception as e:
             print(f"[mark_issued] 標記失敗: {e}")
+    def update_last_error_summary(err_msg):
+        """記錄最近一次 Worker 發生的錯誤摘要至 SQLite system_status。"""
         try:
             with closing(open_local_db()) as conn:
                 short_msg = str(err_msg)[:120]
                 conn.execute("INSERT OR REPLACE INTO system_status VALUES ('last_error_summary', ?)", (short_msg,))
-        except Exception as e: print(f"[error_summary] {e}")
+        except Exception as e:
+            print(f"[error_summary] {e}")
 
     def get_last_error_summary():
         try:
