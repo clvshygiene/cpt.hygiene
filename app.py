@@ -2460,7 +2460,7 @@ try:
     st.sidebar.markdown("📅 [衛生組行事曆](https://www.notion.so/312b7f229eea80c584a1e794c7b955a4)")
     st.sidebar.markdown("📸 [衛生組 Instagram](https://www.instagram.com/clvs_captain.h/)")
     st.sidebar.markdown("📂 [衛生組公開資料區](https://drive.google.com/drive/folders/14QcUILCmHKnKhDx2X1dIUl_6PNRndCub)")
-    st.sidebar.markdown("<div class='sidebar-footer'>衛生組長 林ㄊㄩ 製作 © 2025</div>", unsafe_allow_html=True)
+    st.sidebar.markdown("<div class='sidebar-footer'>衛生組長林ㄊㄩ製作@2025</div>", unsafe_allow_html=True)
 
     # --- Mode: 愛校任務認領 🤝 ---
     if app_mode == "愛校任務認領 🤝":
@@ -3389,17 +3389,23 @@ try:
             
         col4.metric("背景 Worker", f"{hb_status}", f"心跳: {int(hb_sec)}秒前 | 成功: {ls_text}")
         
-        # Worker 狀態與重啟按鈕
+        # Worker 狀態、重啟按鈕、診斷 Log
         _ws = _get_worker_state()
         _t = _ws.get("thread")
         _alive = _t.is_alive() if _t else False
         _started = _ws.get("started_at", "未知")
+        st.caption(f"Worker：{'🟢 alive' if _alive else '🔴 dead'}　啟動時間：{_started}")
         if not _alive:
-            st.warning(f"⚠️ Worker 執行緒未存活（啟動時間：{_started}）")
-            if st.button("🔄 重啟 Worker", type="primary"):
-                _start_fresh_worker()
-                st.success("✅ 新 Worker 已啟動！")
-                st.rerun()
+            st.warning("⚠️ Worker 執行緒未存活")
+        if st.button("🔄 強制重啟 Worker", type="primary"):
+            _start_fresh_worker()
+            st.success("✅ 新 Worker 已啟動！")
+            st.rerun()
+        if _WORKER_LOG:
+            st.subheader("📋 Worker Log")
+            st.code("\n".join(reversed(list(_WORKER_LOG))), language=None)
+        else:
+            st.warning("⚠️ Worker Log 是空的")
         st.divider()
 
         last_err = get_last_error_summary()
