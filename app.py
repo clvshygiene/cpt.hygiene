@@ -889,21 +889,8 @@ try:
     def process_task(task):
         task_type, payload = task["task_type"], task["payload"]
 
-        # [DIAG v2] 直接寫進 debt_history，確保不依賴 ws 狀態
         _task_id_diag = str(task.get("id", ""))
-        _diag_detail = f"type={task_type} payload_keys={list(payload.keys()) if payload else 'EMPTY'}"
-        try:
-            _dh_ws2 = get_worksheet(SHEET_TABS["debt_history"])
-            if _dh_ws2:
-                _dh_ws2.append_row(
-                    [datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S"),
-                     f"DIAG_{_task_id_diag[:8]}", 0, 0,
-                     f"[PROCESS_TASK_CALLED] {_diag_detail}"],
-                    value_input_option="RAW"
-                )
-        except Exception:
-            pass
-        
+
         is_dry_run = str(st.secrets.get("system_config", {}).get("dry_run", "false")).lower() in ["true", "1"]
         if is_dry_run:
             _write_worker_diag(_task_id_diag, task_type, "DRY_RUN")
@@ -970,19 +957,6 @@ try:
                 # [Patch B] task_id 為空時停用 dedup 保護（不應發生，但防禦極端情況）
                 _dedup_enabled = bool(_task_id_for_dedup)
 
-                # [DIAG v2] 把 payload 直接寫進 debt_history，永不消失，不依賴 ws 狀態
-                try:
-                    _dh_ws = get_worksheet(SHEET_TABS["debt_history"])
-                    if _dh_ws:
-                        _diag_now = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
-                        _diag_payload_str = str(payload)[:300]
-                        _dh_ws.append_row(
-                            [_diag_now, f"DIAG_{_task_id_for_dedup[:8]}", 0, 0,
-                             f"[WORKER_DIAG] claimants={claimants} | payload={_diag_payload_str}"],
-                            value_input_option="RAW"
-                        )
-                except Exception as _dh_e:
-                    pass  # 診斷失敗不影響主流程
                 print(f"[verify] ▶ 開始執行 task_id={_task_id_for_dedup[:8] if _task_id_for_dedup else '?'} "
                       f"claimants={claimants} area={task_area} date={task_date_str} hours={task_hours}")
 
