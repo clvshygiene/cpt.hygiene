@@ -314,7 +314,7 @@ try:
                     if tab_name == "office_areas": ws.append_row(["區域名稱", "負責班級"])
                     if tab_name == "published_results": ws.append_row(["週次", "排名", "年級", "班級", "總扣分", "優良次數", "總成績", "評等", "排名模式", "發布時間"])
                     if tab_name == "task_queue": ws.append_row(["id", "task_type", "created_ts", "payload_json", "status", "attempts", "last_error"])
-                    if tab_name == "student_debts": ws.append_row(["學號", "未完成時數"])  # [新增] 愛校服務 2.0
+                    if tab_name == "student_debts": ws.append_row(["學號", "未完成時數", "備註"])  # [Fix 3] 補上備註欄
                     if tab_name == "debt_history": ws.append_row(["時間", "學號", "異動時數", "剩餘時數", "事由"])  # [新增] 愛校服務 2.0
                     return ws
             except Exception as e:
@@ -398,6 +398,20 @@ try:
             except Exception as e2:
                 print(f"[db_migrate] 重建失敗: {e2}")
         conn.execute("CREATE TABLE IF NOT EXISTS system_status (key TEXT PRIMARY KEY, val TEXT)")
+        # [Fix 1] 防止 campus_service_verify 重試時重複扣時：以 (task_id, sid) 為主鍵記錄已完成的 debt 操作
+        conn.execute("""CREATE TABLE IF NOT EXISTS debt_processed (
+            task_id TEXT, sid TEXT, PRIMARY KEY(task_id, sid))""")
+        # [Patch C] 防止 update_student_debt 在 _write_history 成功、_update_debts 失敗時的重試重複寫入 debt_history
+        #           _write_history 成功後立即寫入此表，重試時偵測到已寫則跳過 _write_history，直接重試 _update_debts
+        conn.execute("""CREATE TABLE IF NOT EXISTS debt_history_written (
+            task_id TEXT, sid TEXT, PRIMARY KEY(task_id, sid))""")
+        # [Fix 4] enqueue_task_nb 的備援緩衝：當 Sheets append_row 在背景執行緒失敗時，
+        #         暫存至此，Worker 下一輪會自動排空推入 Sheets
+        conn.execute("""CREATE TABLE IF NOT EXISTS fallback_queue (
+            task_id   TEXT PRIMARY KEY,
+            task_type TEXT,
+            payload_json TEXT,
+            created_ts   TEXT)""")
         return conn
 
     def update_worker_heartbeat():
@@ -456,6 +470,49 @@ try:
             execute_with_retry(_action)
         except Exception as e:
             print(f"[enqueue] 加入佇列失敗: {e}")
+        return task_id
+
+    def enqueue_task_nb(task_type, payload):
+        """[Fix 4] 非阻塞版本的 enqueue_task。
+        Sheets append_row 移至背景執行緒，UI 層呼叫後立即返回，
+        不再等待 API 回應（約 1~3 秒），管理後台操作感受大幅改善。
+        若背景寫入失敗，自動存入 SQLite fallback_queue；
+        Worker 每輪開頭會呼叫 _drain_fallback_queue 將其推入 Sheets。"""
+        task_id = str(uuid.uuid4())
+        created_ts = datetime.now(timezone.utc).isoformat()
+        payload_json = json.dumps(payload, ensure_ascii=False)
+
+        def _push():
+            try:
+                def _action():
+                    ws = get_worksheet(SHEET_TABS["task_queue"])
+                    if not ws: raise Exception("無法取得 task_queue 工作表")
+                    ws.append_row([
+                        task_id, task_type, created_ts,
+                        payload_json, "PENDING", 0, ""
+                    ], value_input_option="RAW")
+                execute_with_retry(_action)
+            except Exception as e:
+                print(f"[enqueue_nb] Sheets 失敗，存入 fallback_queue: {e}")
+                try:
+                    with closing(open_local_db()) as _conn:
+                        _conn.execute(
+                            "INSERT OR IGNORE INTO fallback_queue VALUES (?, ?, ?, ?)",
+                            (task_id, task_type, payload_json, created_ts)
+                        )
+                except Exception as e2:
+                    print(f"[enqueue_nb] fallback_queue 也失敗: {e2}")
+
+        try:
+            ctx = get_script_run_ctx()
+            _t = threading.Thread(target=_push, daemon=True)
+            if ctx:
+                add_script_run_ctx(_t, ctx)
+            _t.start()
+        except Exception as e:
+            print(f"[enqueue_nb] 背景執行緒啟動失敗，改為同步執行: {e}")
+            enqueue_task(task_type, payload)  # fallback 到同步版本
+
         return task_id
 
     def get_pending_count():
@@ -822,13 +879,18 @@ try:
 
             # ── [愛校2.0 Async] 背景驗收愛校任務 ──────────────────────
             elif task_type == "campus_service_verify":
-                claimants     = payload.get("claimants", [])
-                task_title    = payload.get("task_title", "")
-                task_hours    = payload.get("task_hours", 1.0)
-                task_date_str = payload.get("task_date", str(date.today()))
+                claimants      = payload.get("claimants", [])
+                task_title     = payload.get("task_title", "")
+                task_hours     = payload.get("task_hours", 1.0)
+                task_date_str  = payload.get("task_date", str(date.today()))
                 notion_page_id = payload.get("notion_page_id", "")
-                task_area     = payload.get("task_area", "")
-                time_start_v  = payload.get("time_start", "")
+                task_area      = payload.get("task_area", "")
+                time_start_v   = payload.get("time_start", "")
+                # [Fix 1] 用 task_id 作為 debt_processed 的去重 key，
+                #         確保重試時不會對同一學生重複扣時。
+                _task_id_for_dedup = str(task.get("id", "")).strip()
+                # [Patch B] task_id 為空時停用 dedup 保護（不應發生，但防禦極端情況）
+                _dedup_enabled = bool(_task_id_for_dedup)
 
                 svc_debt_sids   = []  # 還時數
                 svc_appeal_sids = []  # 消警告
@@ -839,32 +901,96 @@ try:
                         continue
                     _tag_n = _strip_notion_invisible(_tag_w)
 
-                    if _tag_n == "還時數":
-                        update_student_debt(_sid_w, -task_hours, f"愛校驗收：{task_title}")
-                        svc_debt_sids.append(_sid_w)
-                        time.sleep(0.3)
-                    elif _tag_n == "消警告":
-                        svc_appeal_sids.append(_sid_w)
-                    elif _tag_n == "糾察懲罰":
-                        pass  # 不發時數、不消警告
-                    else:
-                        # 未知 tag → 視為還時數
-                        print(f"[worker verify] 未知 tag '{_tag_w}' for {_sid_w}，視為還時數")
-                        update_student_debt(_sid_w, -task_hours, f"愛校驗收：{task_title}")
+                    if _tag_n in ("還時數", ""):
+                        # [Fix 1] 先查 debt_processed，避免重試時重複扣時
+                        _already_debted = False
+                        if _dedup_enabled:
+                            try:
+                                with closing(open_local_db()) as _conn:
+                                    _already_debted = _conn.execute(
+                                        "SELECT 1 FROM debt_processed WHERE task_id=? AND sid=?",
+                                        (_task_id_for_dedup, _sid_w)
+                                    ).fetchone() is not None
+                            except Exception as _de:
+                                print(f"[verify] debt_processed 查詢失敗（將繼續執行）: {_de}")
+
+                        if not _already_debted:
+                            _debt_ok = update_student_debt(_sid_w, -task_hours, f"愛校驗收：{task_title}", _task_id=_task_id_for_dedup)
+                            if _debt_ok and _dedup_enabled:
+                                try:
+                                    with closing(open_local_db()) as _conn:
+                                        _conn.execute(
+                                            "INSERT OR IGNORE INTO debt_processed VALUES (?, ?)",
+                                            (_task_id_for_dedup, _sid_w)
+                                        )
+                                except Exception as _we:
+                                    print(f"[verify] debt_processed 寫入失敗（可忽略）: {_we}")
+                        else:
+                            print(f"[verify] {_sid_w} 已在前次嘗試中完成扣時，略過（dedup）")
+
                         svc_debt_sids.append(_sid_w)
                         time.sleep(0.3)
 
-                # 寫入 service_hours：還時數
+                    elif _tag_n == "消警告":
+                        svc_appeal_sids.append(_sid_w)
+
+                    elif _tag_n == "糾察懲罰":
+                        pass  # 不發時數、不消警告
+
+                    else:
+                        # 未知 tag → 視為還時數（同樣套用 dedup 保護）
+                        print(f"[worker verify] 未知 tag '{_tag_w}' for {_sid_w}，視為還時數")
+                        _already_debted = False
+                        if _dedup_enabled:
+                            try:
+                                with closing(open_local_db()) as _conn:
+                                    _already_debted = _conn.execute(
+                                        "SELECT 1 FROM debt_processed WHERE task_id=? AND sid=?",
+                                        (_task_id_for_dedup, _sid_w)
+                                    ).fetchone() is not None
+                            except Exception:
+                                pass
+
+                        if not _already_debted:
+                            _debt_ok = update_student_debt(_sid_w, -task_hours, f"愛校驗收：{task_title}", _task_id=_task_id_for_dedup)
+                            if _debt_ok and _dedup_enabled:
+                                try:
+                                    with closing(open_local_db()) as _conn:
+                                        _conn.execute(
+                                            "INSERT OR IGNORE INTO debt_processed VALUES (?, ?)",
+                                            (_task_id_for_dedup, _sid_w)
+                                        )
+                                except Exception:
+                                    pass
+                        else:
+                            print(f"[verify] {_sid_w}（未知tag）已在前次嘗試中完成扣時，略過")
+
+                        svc_debt_sids.append(_sid_w)
+                        time.sleep(0.3)
+
+                # 寫入 service_hours：還時數（直接寫，已有 SQLite dedup 保護）
                 if svc_debt_sids:
                     _write_service_hours_direct(
                         "愛校打掃", "返校打掃", task_hours, svc_debt_sids,
                         task_date_str if task_date_str != "未定" else str(date.today())
                     )
-                # 寫入 service_hours：消警告
+
+                # [Fix 2] 消警告不再直接呼叫 _write_service_hours_direct，
+                #         改為排入獨立的 service_hours_only 子任務，
+                #         讓它擁有自己的 6 次重試，與 debt 操作完全解耦，
+                #         避免前面流程成功後因 Sheets 超時導致整個 task 被 RETRY
+                #         再次重複執行 debt 扣時。
                 if svc_appeal_sids:
                     _cf = f"{task_area}|{time_start_v}" if time_start_v else task_area
                     _ad = task_date_str if task_date_str != "未定" else str(date.today())
-                    _write_service_hours_direct(_cf, "愛校服務(消警告)", task_hours, svc_appeal_sids, _ad)
+                    enqueue_task("service_hours_only", {
+                        "date":         _ad,
+                        "category":     "愛校服務(消警告)",
+                        "class_name":   _cf,
+                        "hours":        task_hours,
+                        "student_list": svc_appeal_sids
+                    })
+                    print(f"[worker] 消警告 service_hours 已排入子任務，共 {len(svc_appeal_sids)} 人：{svc_appeal_sids}")
 
                 # 更新 Notion 狀態
                 if notion_page_id:
@@ -984,6 +1110,32 @@ try:
                 if not ws:
                     time.sleep(5.0)
                     continue
+
+                # [Fix 4 / Patch A] 排空 fallback_queue：將 enqueue_task_nb 背景寫入失敗的任務推入 Sheets
+                # [Patch A] 改用 append_rows 一次批次寫入，避免逐筆 append_row 造成 429
+                try:
+                    with closing(open_local_db()) as _fb_conn:
+                        _fb_rows = _fb_conn.execute(
+                            "SELECT task_id, task_type, payload_json, created_ts FROM fallback_queue LIMIT 20"
+                        ).fetchall()
+                    if _fb_rows:
+                        _batch_rows = [
+                            [r[0], r[1], r[3], r[2], "PENDING", 0, ""]
+                            for r in _fb_rows
+                        ]
+                        try:
+                            ws.append_rows(_batch_rows, value_input_option="RAW")
+                            # 成功後才從 SQLite 刪除
+                            with closing(open_local_db()) as _fb_conn:
+                                _fb_conn.executemany(
+                                    "DELETE FROM fallback_queue WHERE task_id=?",
+                                    [(r[0],) for r in _fb_rows]
+                                )
+                            print(f"[drain_fallback] 已批次推送 {len(_fb_rows)} 筆 fallback 任務至 Sheets")
+                        except Exception as _fe:
+                            print(f"[drain_fallback] append_rows 失敗，下輪再試: {_fe}")
+                except Exception as _drain_e:
+                    print(f"[drain_fallback] 排空 fallback_queue 失敗（忽略）: {_drain_e}")
 
                 try:
                     records = ws.get_all_records()
@@ -1262,32 +1414,62 @@ try:
             print(f"[load_student_debt_note] {e}")
             return ""
 
-    def update_student_debt(sid, change_hours, reason):
+    def update_student_debt(sid, change_hours, reason, _task_id=""):
         """寫入 debt_history 一筆紀錄並同步更新 student_debts 中的未完成時數。
         [Fix] 不再合併多列！每列欠時保留各自的備註。
         正數 = 新增欠時（append 新列）。
-        負數 = 扣減欠時（FIFO，從最舊的列開始扣，扣完的列才刪除）。"""
+        負數 = 扣減欠時（FIFO，從最舊的列開始扣，扣完的列才刪除）。
+        [Patch C] _task_id：傳入 campus_service_verify 的 task id，用於 debt_history_written dedup，
+                  防止 _write_history 成功但 _update_debts 失敗重試時重複寫入 debt_history。"""
         sid = str(sid).strip()
+        _dedup_id = str(_task_id).strip()  # 空字串代表停用 history dedup（不由 task 驅動的直接呼叫）
         try:
             debts = load_student_debts()
             current = debts.get(sid, 0.0)
             new_remaining = round(current + change_hours, 2)
             now_str = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+            # [Patch C] 檢查 _write_history 是否已在前次嘗試中完成，避免重試時重複寫入 debt_history
+            _history_already_written = False
+            if _dedup_id:
+                try:
+                    with closing(open_local_db()) as _dc:
+                        _history_already_written = _dc.execute(
+                            "SELECT 1 FROM debt_history_written WHERE task_id=? AND sid=?",
+                            (_dedup_id, sid)
+                        ).fetchone() is not None
+                except Exception as _dce:
+                    print(f"[debt_history dedup] 查詢失敗（繼續執行）: {_dce}")
+
             def _write_history():
                 ws_h = get_worksheet(SHEET_TABS["debt_history"])
                 if not ws_h:
                     raise Exception("無法取得 debt_history 工作表")
                 ws_h.append_row([now_str, sid, change_hours, new_remaining, reason],
                                 value_input_option="RAW")
-            execute_with_retry(_write_history)
+
+            if not _history_already_written:
+                execute_with_retry(_write_history)
+                # [Patch C] _write_history 成功後立即寫入 dedup 標記
+                if _dedup_id:
+                    try:
+                        with closing(open_local_db()) as _dc:
+                            _dc.execute(
+                                "INSERT OR IGNORE INTO debt_history_written VALUES (?, ?)",
+                                (_dedup_id, sid)
+                            )
+                    except Exception as _dwe:
+                        print(f"[debt_history dedup] 標記寫入失敗（可忽略）: {_dwe}")
+            else:
+                print(f"[debt_history dedup] {sid} 已寫入 debt_history（task={_dedup_id[:8]}），略過重複寫入")
             def _update_debts():
                 ws_d = get_worksheet(SHEET_TABS["student_debts"])
                 if not ws_d:
                     raise Exception("無法取得 student_debts 工作表")
 
                 if change_hours >= 0:
-                    # [Fix] 新增欠時 → 直接 append 新列，保留既有列不動
-                    ws_d.append_row([sid, change_hours], value_input_option="RAW")
+                    # [Fix 3] 新增欠時 → append 新列，第三欄寫入 reason 作為備註，保留既有列不動
+                    ws_d.append_row([sid, change_hours, reason], value_input_option="RAW")
                 else:
                     # [Fix] FIFO 扣減：從最舊（最上面）的列開始扣
                     all_vals = ws_d.get_all_values()
@@ -3187,7 +3369,7 @@ try:
                             
                             col_btn1, col_btn2 = c1.columns(2)
                             if col_btn1.button("✅ 核可並撤銷扣分", key=f"ok_{i}"): 
-                                enqueue_task("appeal_review", {
+                                enqueue_task_nb("appeal_review", {
                                     "record_id": str(r["對應紀錄ID"]),
                                     "status": "已核可",
                                     "reply_text": reply_text
@@ -3195,7 +3377,7 @@ try:
                                 st.session_state.queued_appeal_ids.add(str(r["對應紀錄ID"]))
                                 c1.success("✅ 已排入佇列，系統將背景處理核可與撤銷扣分。")
                             if col_btn2.button("🚫 駁回維持原判", key=f"ng_{i}"): 
-                                enqueue_task("appeal_review", {
+                                enqueue_task_nb("appeal_review", {
                                     "record_id": str(r["對應紀錄ID"]),
                                     "status": "已駁回",
                                     "reply_text": reply_text
@@ -3629,13 +3811,13 @@ try:
                 else:
                     st.caption(f"共 {len(pending_df)} 筆待審核，審核後不會立刻跳頁，可以繼續審核其他筆。")
 
-                # [Fix Async] _do_approve_async：改為 enqueue，前台立即回應
+                # [Fix Async] _do_approve_async：改為 enqueue_task_nb，前台立即回應不阻塞
                 def _do_approve_async(record_id, s_val, note_text, reply, col_ref, cached_main_df):
                     """將晨掃審核排入佇列，前台立即回應，Worker 背景處理"""
                     matched = cached_main_df.loc[cached_main_df["紀錄ID"].astype(str) == str(record_id), "備註"]
                     old_note = str(matched.iloc[0]) if not matched.empty else ""
                     new_note = f"{old_note} \n組長回覆: {reply}" if reply else f"{old_note} \n組長核可: {note_text}"
-                    enqueue_task("morning_sweep_approve", {
+                    enqueue_task_nb("morning_sweep_approve", {
                         "record_id": str(record_id),
                         "action": "approve",
                         "score_val": s_val,
@@ -3707,11 +3889,11 @@ try:
                                             reply_msg, c1, main_df)
 
                         if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}_{i}"):
-                            # [Fix Async] 駁回也改為佇列處理
+                            # [Fix 4] 駁回改為非阻塞排隊
                             old_note = str(r['備註'])
                             rej_msg  = reply_msg if reply_msg else "未達標準，請見諒"
                             new_note = f"{old_note} \n組長駁回: {rej_msg}"
-                            enqueue_task("morning_sweep_approve", {
+                            enqueue_task_nb("morning_sweep_approve", {
                                 "record_id": str(r["紀錄ID"]),
                                 "action": "reject",
                                 "score_val": 0,
@@ -3983,7 +4165,7 @@ try:
                                     _hr_match = re.search(r"[\(\uff08]([\d.]+)\s*(?:hr|小時|h)[\)\uff09]", _ct["title"], re.IGNORECASE)
                                     _task_hours = float(_hr_match.group(1)) if _hr_match else 1.0
 
-                                    # [Fix Async] 改為一次 enqueue，Worker 背景處理所有操作
+                                    # [Fix 4] 改為非阻塞排隊，前台按下後立即返回
                                     _verify_payload = {
                                         "notion_page_id": _ct["id"],
                                         "task_title": _ct["title"],
@@ -3993,8 +4175,9 @@ try:
                                         "task_hours": _task_hours,
                                         "claimants": _ct["claimants"]  # Worker 會自行解析 tag
                                     }
-                                    enqueue_task("campus_service_verify", _verify_payload)
+                                    enqueue_task_nb("campus_service_verify", _verify_payload)
 
+                                    # [Fix 5] 移除 time.sleep(2) + st.rerun()，改用 st.toast 即時提示
                                     # 前台立即回應（用之前已解析的分類結果顯示摘要）
                                     msg_parts = ["✅ 已排入佇列！系統將背景完成以下操作："]
                                     if _debt_students:
@@ -4005,8 +4188,7 @@ try:
                                         msg_parts.append(f"⚫ 糾察懲罰 {len(_punish_students)} 人（不發時數）")
                                     msg_parts.append("📡 Notion 狀態將自動更新為「任務已驗收」")
                                     st.success("\n".join(msg_parts))
-                                    time.sleep(2)
-                                    st.rerun()
+                                    st.toast("✅ 驗收已排入佇列，背景處理中", icon="✅")
                                         
                 # ── 區塊 B：⚠️ 欠時懲處結算報表 ──
                 with st.expander("⚠️ 欠時懲處結算報表", expanded=True):
