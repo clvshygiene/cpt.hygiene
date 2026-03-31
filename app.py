@@ -2460,7 +2460,7 @@ try:
     st.sidebar.markdown("📅 [衛生組行事曆](https://www.notion.so/312b7f229eea80c584a1e794c7b955a4)")
     st.sidebar.markdown("📸 [衛生組 Instagram](https://www.instagram.com/clvs_captain.h/)")
     st.sidebar.markdown("📂 [衛生組公開資料區](https://drive.google.com/drive/folders/14QcUILCmHKnKhDx2X1dIUl_6PNRndCub)")
-    st.sidebar.markdown("<div class='sidebar-footer'>衛生組長林ㄊㄩ製作@2025</div>", unsafe_allow_html=True)
+    st.sidebar.markdown("<div class='sidebar-footer'>衛生組長 林ㄊㄩ 製作 © 2025</div>", unsafe_allow_html=True)
 
     # --- Mode: 愛校任務認領 🤝 ---
     if app_mode == "愛校任務認領 🤝":
