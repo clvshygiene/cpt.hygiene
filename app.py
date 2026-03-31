@@ -309,7 +309,7 @@ try:
                     init_rows = 2000 if tab_name == "task_queue" else 500
                     ws = sheet.add_worksheet(title=tab_name, rows=init_rows, cols=cols)
                     if tab_name == "appeals": ws.append_row(APPEAL_COLUMNS)
-                    if tab_name == "service_hours": ws.append_row(["日期", "學號", "班級", "類別", "時數", "紀錄ID"])
+                    if tab_name == "service_hours": ws.append_row(["日期", "學號", "班級", "類別", "時數", "紀錄ID", "核發狀態"])  # [方案A] 加入核發狀態欄
                     if tab_name == "holidays": ws.append_row(["日期", "說明"])
                     if tab_name == "office_areas": ws.append_row(["區域名稱", "負責班級"])
                     if tab_name == "published_results": ws.append_row(["週次", "排名", "年級", "班級", "總扣分", "優良次數", "總成績", "評等", "排名模式", "發布時間"])
@@ -663,7 +663,8 @@ try:
                         t_date, str(sid),
                         t_cls_name, t_cat,
                         str(payload.get("hours", 0.5)),
-                        uuid.uuid4().hex[:8]
+                        uuid.uuid4().hex[:8],
+                        ""   # [方案A] 核發狀態：空白 = 未核發
                     ])
                     dedup_keys.append((t_date, str(sid), t_cat, t_cls_name))
         if not rows_to_write:
@@ -717,7 +718,7 @@ try:
         def _action():
             ws = get_worksheet(SHEET_TABS["service_hours"])
             if not ws: return
-            new_row = [t_date, t_sid, str(entry.get("班級", "")), t_cat, str(entry.get("時數", "")), str(entry.get("紀錄ID", ""))]
+            new_row = [t_date, t_sid, str(entry.get("班級", "")), t_cat, str(entry.get("時數", "")), str(entry.get("紀錄ID", "")), ""]  # [方案A] 核發狀態空白
             ws.append_row(new_row)
         execute_with_retry(_action)
 
@@ -761,7 +762,7 @@ try:
             except Exception:
                 pass
             if not is_dup:
-                rows.append([svc_date, str(sid), class_name, category, str(hours), uuid.uuid4().hex[:8]])
+                rows.append([svc_date, str(sid), class_name, category, str(hours), uuid.uuid4().hex[:8], ""])  # [方案A] 核發狀態空白
                 dedup_keys.append((svc_date, str(sid), category, class_name))
         if not rows:
             return
@@ -778,7 +779,43 @@ try:
                 pass
 
 
-    def update_last_error_summary(err_msg):
+    def _mark_service_hours_issued(record_ids: list):
+        """[方案A] 將 service_hours 中指定紀錄ID的「核發狀態」欄標記為「已核發」。
+        record_ids：欲標記的紀錄ID清單（service_hours 第6欄）。"""
+        if not record_ids:
+            return
+        try:
+            def _action():
+                ws = get_worksheet(SHEET_TABS["service_hours"])
+                if not ws: raise Exception("無法取得 service_hours 工作表")
+                all_vals = ws.get_all_values()
+                if not all_vals:
+                    return
+                # 找出 header，確認欄位位置
+                header = all_vals[0]
+                try:
+                    rid_col  = header.index("紀錄ID") + 1       # 1-based
+                    stat_col = header.index("核發狀態") + 1      # 1-based
+                except ValueError:
+                    # header 找不到代表舊 Sheet 尚未加欄，直接用固定位置
+                    rid_col  = 6
+                    stat_col = 7
+                # 建立 紀錄ID → row_idx 映射（跳過 header）
+                id_set = set(str(i) for i in record_ids)
+                batch = []
+                for i, row in enumerate(all_vals[1:], start=2):  # 2-based
+                    rid_val = row[rid_col - 1] if len(row) >= rid_col else ""
+                    if str(rid_val).strip() in id_set:
+                        batch.append({
+                            "range": f"{chr(64 + stat_col)}{i}",
+                            "values": [["已核發"]]
+                        })
+                if batch:
+                    ws.batch_update(batch)
+                    print(f"[mark_issued] 標記 {len(batch)} 筆已核發")
+            execute_with_retry(_action)
+        except Exception as e:
+            print(f"[mark_issued] 標記失敗: {e}")
         try:
             with closing(open_local_db()) as conn:
                 short_msg = str(err_msg)[:120]
@@ -4221,6 +4258,14 @@ try:
                 with st.expander("🖨️ 銷過單核發 (消警告單)", expanded=True):
                     st.info("💡 系統自動查詢所有「愛校服務(消警告)」紀錄，一鍵產製所有學生的《愛校服務申請單》。")
 
+                    # [方案A] 顯示模式切換
+                    _show_all_issued = st.checkbox(
+                        "顯示全部紀錄（含已核發）",
+                        value=False,
+                        key="show_all_issued",
+                        help="勾選後可查看已核發的歷史紀錄，或重新下載補印。"
+                    )
+
                     # [Fix] 共用解析函式：將原始紀錄轉成申請單格式
                     def _parse_appeal_record(rec):
                         """解析 service_hours 中的消警告紀錄，回傳標準化 dict"""
@@ -4247,10 +4292,11 @@ try:
                             "date": _date_str,
                             "start_time": _start_time,
                             "end_time": _end_time,
-                            "hours": _hours
+                            "hours": _hours,
+                            "紀錄ID": str(rec.get("紀錄ID", ""))
                         }
 
-                    if st.button("🔎 查詢所有消警告紀錄", key="btn_fetch_all_appeals"):
+                    if st.button("🔎 查詢消警告紀錄", key="btn_fetch_all_appeals"):
                         try:
                             def _fetch_all_appeal_records():
                                 ws_svc = get_worksheet(SHEET_TABS["service_hours"])
@@ -4260,13 +4306,32 @@ try:
                                 _df_svc = pd.DataFrame(_svc_data)
                                 if _df_svc.empty or "類別" not in _df_svc.columns:
                                     return []
-                                return _df_svc[_df_svc["類別"] == "愛校服務(消警告)"].to_dict('records')
+                                # 確保核發狀態欄存在
+                                if "核發狀態" not in _df_svc.columns:
+                                    _df_svc["核發狀態"] = ""
+                                _mask = _df_svc["類別"] == "愛校服務(消警告)"
+                                return _df_svc[_mask].to_dict('records')
 
-                            with st.spinner("正在查詢所有消警告紀錄..."):
-                                _all_appeal_records = execute_with_retry(_fetch_all_appeal_records)
+                            with st.spinner("正在查詢消警告紀錄..."):
+                                _all_records = execute_with_retry(_fetch_all_appeal_records)
+
+                            # [方案A] 依核發狀態篩選
+                            if _show_all_issued:
+                                _all_appeal_records = _all_records
+                            else:
+                                _all_appeal_records = [
+                                    r for r in _all_records
+                                    if str(r.get("核發狀態", "")).strip() != "已核發"
+                                ]
+                                _issued_count = len(_all_records) - len(_all_appeal_records)
+                                if _issued_count > 0:
+                                    st.info(f"ℹ️ 已隱藏 {_issued_count} 筆已核發紀錄。勾選上方「顯示全部」可查看。")
 
                             if not _all_appeal_records:
-                                st.warning("⚠️ 目前找不到任何消警告服務紀錄。請確認是否已有消警告驗收完成。")
+                                if _show_all_issued:
+                                    st.warning("⚠️ 目前找不到任何消警告服務紀錄。請確認是否已有消警告驗收完成。")
+                                else:
+                                    st.success("✅ 所有消警告紀錄均已核發完畢！")
                             else:
                                 # 依學號分組
                                 _grouped = {}
@@ -4283,11 +4348,13 @@ try:
                                 for _sid, _recs in sorted(_grouped.items()):
                                     _cls_name = ROSTER_DICT.get(clean_id(_sid), "未知班級")
                                     _total_h = sum(float(r.get("時數", 0)) for r in _recs)
+                                    _issued_tag = "✅ 已核發" if all(str(r.get("核發狀態","")).strip() == "已核發" for r in _recs) else "⏳ 未核發"
                                     _summary_rows.append({
                                         "學號": _sid,
                                         "班級": _cls_name,
                                         "服務筆數": len(_recs),
-                                        "總時數": round(_total_h, 2)
+                                        "總時數": round(_total_h, 2),
+                                        "狀態": _issued_tag
                                     })
 
                                 st.success(f"✅ 共找到 **{len(_all_appeal_records)}** 筆消警告紀錄，涵蓋 **{len(_grouped)}** 位學生：")
@@ -4314,6 +4381,7 @@ try:
                             import zipfile as _zipfile
                             _zip_buf = io.BytesIO()
                             _gen_count = 0
+                            _all_rids_to_mark = []
                             with _zipfile.ZipFile(_zip_buf, 'w', _zipfile.ZIP_DEFLATED) as _zf:
                                 for _sid, _recs in sorted(_grouped.items()):
                                     _cls_name = ROSTER_DICT.get(clean_id(_sid), "未知班級")
@@ -4322,6 +4390,8 @@ try:
                                         _excel_bytes = generate_appeal_form_excel(clean_id(_sid), _cls_name, _parsed)
                                         _zf.writestr(f"愛校申請單_{_cls_name}_{_sid}.xlsx", _excel_bytes)
                                         _gen_count += 1
+                                        # [方案A] 收集本次產製的紀錄ID
+                                        _all_rids_to_mark += [p["紀錄ID"] for p in _parsed if p.get("紀錄ID")]
                             _zip_buf.seek(0)
                             st.download_button(
                                 label=f"📦 下載 ZIP（共 {_gen_count} 份申請單）",
@@ -4330,7 +4400,11 @@ try:
                                 mime="application/zip",
                                 key="dl_all_appeal_zip"
                             )
-                            st.success(f"✅ 已產製 {_gen_count} 份銷過單！")
+                            # [方案A] 下載後標記已核發
+                            if _all_rids_to_mark:
+                                with st.spinner("📝 標記核發狀態中..."):
+                                    _mark_service_hours_issued(_all_rids_to_mark)
+                            st.success(f"✅ 已產製 {_gen_count} 份銷過單，並標記為已核發！下次查詢將不再顯示這些紀錄。")
 
                         # ── 個別學生下載 ──
                         st.markdown("##### 或選擇單一學生下載")
@@ -4364,13 +4438,17 @@ try:
                                 _excel_bytes = generate_appeal_form_excel(
                                     clean_id(_sel_sid), _sel_cls, _parsed_recs
                                 )
-                                st.download_button(
+                                if st.download_button(
                                     label=f"📥 下載 {_sel_cls} {_sel_sid} 的銷過單",
                                     data=_excel_bytes,
                                     file_name=f"愛校申請單_{_sel_cls}_{_sel_sid}.xlsx",
                                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                     key="dl_single_appeal"
-                                )
+                                ):
+                                    # [方案A] 個別下載後標記已核發
+                                    _single_rids = [p["紀錄ID"] for p in _parsed_recs if p.get("紀錄ID")]
+                                    if _single_rids:
+                                        _mark_service_hours_issued(_single_rids)
 
                         st.caption("💡 下載後請用 Excel 開啟，確認格式無誤後列印 A4 紙張，再持表單至學務處完成後續流程。")
 
