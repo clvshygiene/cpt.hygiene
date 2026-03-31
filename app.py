@@ -472,7 +472,7 @@ try:
             print(f"[enqueue] 加入佇列失敗: {e}")
         return task_id
 
-    def enqueue_task_nb(task_type, payload):
+    def enqueue_task(task_type, payload):
         """[Fix 4] 非阻塞版本的 enqueue_task。
         Sheets append_row 移至背景執行緒，UI 層呼叫後立即返回，
         不再等待 API 回應（約 1~3 秒），管理後台操作感受大幅改善。
@@ -979,34 +979,14 @@ try:
                         task_date_str if task_date_str != "未定" else str(date.today())
                     )
 
-                # [Fix 2 / Debug Fix] 消警告改寫入 SQLite fallback_queue，不直接打 Sheets API。
-                # 原本 enqueue_task("service_hours_only") 是同步寫 task_queue_v3，
-                # 與後面 update_task_status 的 delete_rows 連續打同一個分頁，
-                # 任何一次 429/timeout 都會讓 delete_rows 靜默失敗，任務永遠卡 IN_PROGRESS。
-                # 改寫 SQLite 後 drain_fallback_queue 會在下輪推至 Sheets，完全解耦。
+                # [Fix 2] 消警告：直接呼叫 _write_service_hours_direct（有 execute_with_retry + SQLite dedup）
+                # ※ Worker 背景執行緒內同步寫入是安全的，不影響 UI
+                # ※ 之前改寫 SQLite fallback_queue 的做法在 Streamlit Cloud 不可靠（ephemeral storage）
                 if svc_appeal_sids:
                     _cf = f"{task_area}|{time_start_v}" if time_start_v else task_area
                     _ad = task_date_str if task_date_str != "未定" else str(date.today())
-                    _sub_task_id = str(uuid.uuid4())
-                    _sub_payload_json = json.dumps({
-                        "date":         _ad,
-                        "category":     "愛校服務(消警告)",
-                        "class_name":   _cf,
-                        "hours":        task_hours,
-                        "student_list": svc_appeal_sids
-                    }, ensure_ascii=False)
-                    try:
-                        with closing(open_local_db()) as _sq:
-                            _sq.execute(
-                                "INSERT OR IGNORE INTO fallback_queue VALUES (?, ?, ?, ?)",
-                                (_sub_task_id, "service_hours_only",
-                                 _sub_payload_json,
-                                 datetime.now(timezone.utc).isoformat())
-                            )
-                        print(f"[worker] 消警告 service_hours_only 已寫入 fallback_queue，"
-                              f"共 {len(svc_appeal_sids)} 人：{svc_appeal_sids}")
-                    except Exception as _fe:
-                        print(f"[worker] 消警告 fallback_queue 寫入失敗（下輪重試）: {_fe}")
+                    print(f"[worker] 消警告 service_hours 直接寫入，共 {len(svc_appeal_sids)} 人：{svc_appeal_sids}")
+                    _write_service_hours_direct(_cf, "愛校服務(消警告)", task_hours, svc_appeal_sids, _ad)
 
                 # 更新 Notion 狀態
                 if notion_page_id:
@@ -3389,7 +3369,7 @@ try:
                             
                             col_btn1, col_btn2 = c1.columns(2)
                             if col_btn1.button("✅ 核可並撤銷扣分", key=f"ok_{i}"): 
-                                enqueue_task_nb("appeal_review", {
+                                enqueue_task("appeal_review", {
                                     "record_id": str(r["對應紀錄ID"]),
                                     "status": "已核可",
                                     "reply_text": reply_text
@@ -3397,7 +3377,7 @@ try:
                                 st.session_state.queued_appeal_ids.add(str(r["對應紀錄ID"]))
                                 c1.success("✅ 已排入佇列，系統將背景處理核可與撤銷扣分。")
                             if col_btn2.button("🚫 駁回維持原判", key=f"ng_{i}"): 
-                                enqueue_task_nb("appeal_review", {
+                                enqueue_task("appeal_review", {
                                     "record_id": str(r["對應紀錄ID"]),
                                     "status": "已駁回",
                                     "reply_text": reply_text
@@ -3837,7 +3817,7 @@ try:
                     matched = cached_main_df.loc[cached_main_df["紀錄ID"].astype(str) == str(record_id), "備註"]
                     old_note = str(matched.iloc[0]) if not matched.empty else ""
                     new_note = f"{old_note} \n組長回覆: {reply}" if reply else f"{old_note} \n組長核可: {note_text}"
-                    enqueue_task_nb("morning_sweep_approve", {
+                    enqueue_task("morning_sweep_approve", {
                         "record_id": str(record_id),
                         "action": "approve",
                         "score_val": s_val,
@@ -3913,7 +3893,7 @@ try:
                             old_note = str(r['備註'])
                             rej_msg  = reply_msg if reply_msg else "未達標準，請見諒"
                             new_note = f"{old_note} \n組長駁回: {rej_msg}"
-                            enqueue_task_nb("morning_sweep_approve", {
+                            enqueue_task("morning_sweep_approve", {
                                 "record_id": str(r["紀錄ID"]),
                                 "action": "reject",
                                 "score_val": 0,
@@ -4195,7 +4175,7 @@ try:
                                         "task_hours": _task_hours,
                                         "claimants": _ct["claimants"]  # Worker 會自行解析 tag
                                     }
-                                    enqueue_task_nb("campus_service_verify", _verify_payload)
+                                    enqueue_task("campus_service_verify", _verify_payload)
 
                                     # [Fix 5] 移除 time.sleep(2) + st.rerun()，改用 st.toast 即時提示
                                     # 前台立即回應（用之前已解析的分類結果顯示摘要）
