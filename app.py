@@ -1323,12 +1323,19 @@ try:
         return {"stop_event": None, "thread": None, "started_at": None}
 
     def _start_fresh_worker():
-        """啟動新 Worker，記錄到 _get_worker_state()。"""
+        """啟動新 Worker，記錄到 _get_worker_state()。先等舊 thread 結束再啟動新的。"""
         state = _get_worker_state()
-        # 先停掉舊的（若存在）
-        if state["stop_event"] is not None:
+        old_t = state.get("thread")
+        # 送停止訊號給舊 Worker
+        if state.get("stop_event") is not None:
             state["stop_event"].set()
             _WORKER_LOG.append(f"[{datetime.now(TW_TZ).strftime('%H:%M:%S')}] 已送出停止訊號給舊 Worker")
+        # 等舊 thread 真的結束（最多等 35 秒，確保它從 sleep 醒來並看到 stop_event）
+        if old_t is not None and old_t.is_alive():
+            _WORKER_LOG.append(f"[{datetime.now(TW_TZ).strftime('%H:%M:%S')}] 等待舊 Worker 結束...")
+            old_t.join(timeout=35)
+            _WORKER_LOG.append(f"[{datetime.now(TW_TZ).strftime('%H:%M:%S')}] 舊 Worker 已結束: {not old_t.is_alive()}")
+        # 啟動新 Worker
         stop_event = threading.Event()
         t = threading.Thread(target=background_worker, args=(stop_event,), daemon=True)
         try:
@@ -1349,6 +1356,13 @@ try:
         if sys_env == "DEV":
             _WORKER_LOG.append("[ensure] DEV 環境，Worker 停用")
             return threading.Event()
+        # 若已有 alive thread（例如之前的呼叫已啟動），不重複啟動，避免競爭
+        state = _get_worker_state()
+        t = state.get("thread")
+        if t is not None and t.is_alive():
+            _WORKER_LOG.append(f"[ensure] Worker 已存活（{t.name}），跳過重複啟動")
+            return state.get("stop_event", threading.Event())
+        _WORKER_LOG.append("[ensure] 啟動全新 Worker...")
         return _start_fresh_worker()
     _ = ensure_worker_started()
 
