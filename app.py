@@ -51,7 +51,7 @@ if sys_env == "DEV":
     st.warning("🚧 **目前位於 DEV 測試環境！** 在這裡送出的資料僅供測試，不會影響正式成績。")
 else:
     st.set_page_config(page_title="中壢家商，衛愛而生", layout="wide", page_icon="🧹")
-    st.sidebar.caption("🔧 app version: v_DIAG_6")  # [DIAG] 確認部署版本用，修好後可刪除
+    st.sidebar.caption("🔧 app version: v_DIAG_7")  # [DIAG] 確認部署版本用，修好後可刪除
 
 
 # --- 2. 核心參數與全域設定 ---
@@ -1075,6 +1075,14 @@ try:
                         svc_debt_sids.append(_sid_w)
                         time.sleep(0.3)
 
+                # [DIAG v6] 迴圈結束，印出解析結果
+                _WORKER_LOG.append(
+                    f"[{datetime.now(TW_TZ).strftime('%H:%M:%S')}] "
+                    f"PARSE_DONE: debt_sids={svc_debt_sids} appeal_sids={svc_appeal_sids} "
+                    f"punish={_punish_students if '_punish_students' in dir() else 'N/A'} "
+                    f"debt_failures={debt_failures}"
+                )
+
                 # [Fix] 若有 update_student_debt 失敗，先拋例外讓 Worker RETRY，
                 #       不繼續執行 service_hours 寫入，避免資料半成功
                 if debt_failures:
@@ -1088,6 +1096,7 @@ try:
                     )
                     # [Fix] dedup 空轉（0筆）印出警告，但不 RETRY
                     # （service_issued 有記錄代表上一輪已成功寫入，不需重試）
+                    _WORKER_LOG.append(f"[{datetime.now(TW_TZ).strftime('%H:%M:%S')}] _write_service_hours_direct(debt) 回傳: {_written_debt} 筆")
                     if _written_debt == 0:
                         print(f"[verify] ⚠️ 還時數 service_hours 寫入 0 筆（dedup 判定已存在），不重試。sids={svc_debt_sids}")
 
@@ -1099,12 +1108,14 @@ try:
                     _ad = task_date_str if task_date_str != "未定" else str(date.today())
                     print(f"[worker] 消警告 service_hours 直接寫入，共 {len(svc_appeal_sids)} 人：{svc_appeal_sids}")
                     _written_appeal = _write_service_hours_direct(_cf, "愛校服務(消警告)", task_hours, svc_appeal_sids, _ad)
+                    _WORKER_LOG.append(f"[{datetime.now(TW_TZ).strftime('%H:%M:%S')}] _write_service_hours_direct(appeal) 回傳: {_written_appeal} 筆")
                     if _written_appeal == 0:
                         print(f"[verify] ⚠️ 消警告 service_hours 寫入 0 筆（dedup 判定已存在），不重試。sids={svc_appeal_sids}")
 
                 # 更新 Notion 狀態
                 if notion_page_id:
                     _notion_ok = update_notion_task_status(notion_page_id, "任務已驗收")
+                    _WORKER_LOG.append(f"[{datetime.now(TW_TZ).strftime('%H:%M:%S')}] Notion 更新: {'✅成功' if _notion_ok else '❌失敗'}")
                     print(f"[worker] Notion 狀態更新：{'成功' if _notion_ok else '失敗（已記錄，不影響任務完成）'} "
                           f"page_id={notion_page_id[:8] if notion_page_id else 'None'}")
                 else:
@@ -1307,6 +1318,9 @@ try:
                 _payload_log = str(task.get('payload', {}))[:200]
                 _WORKER_LOG.append(f"[{_now_str}] BEFORE_PROCESS task_id={_tid_short} type={_task_type_log}")
                 _WORKER_LOG.append(f"[{_now_str}] PAYLOAD={_payload_log}")
+                # 特別把 claimants 完整列出，不截斷
+                _claimants_full = task.get('payload', {}).get('claimants', 'KEY_NOT_FOUND')
+                _WORKER_LOG.append(f"[{_now_str}] CLAIMANTS_FULL={_claimants_full}")
                 ok, err = process_task(task)
                 _WORKER_LOG.append(f"[{datetime.now(TW_TZ).strftime('%H:%M:%S')}] AFTER_PROCESS ok={ok} err={str(err)[:100]}")
                 if ok: update_last_success_time()
