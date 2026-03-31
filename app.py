@@ -747,7 +747,11 @@ try:
         return sid, tag
 
     def _write_service_hours_direct(class_name, category, hours, student_list, svc_date):
-        """直接寫入 service_hours 工作表（Worker 用，不經由佇列），含 dedup。"""
+        """直接寫入 service_hours 工作表（Worker 用，不經由佇列），含 dedup。
+        [Fix] 回傳實際寫入筆數（int）：
+              > 0 = 成功寫入幾筆
+              = 0 = 全部被 dedup 過濾（不拋例外，由呼叫端決定如何處理）
+        """
         rows = []
         dedup_keys = []
         for sid in student_list:
@@ -767,11 +771,12 @@ try:
                 rows.append([svc_date, str(sid), class_name, category, str(hours), uuid.uuid4().hex[:8], ""])
                 dedup_keys.append((svc_date, str(sid), category, class_name))
 
-        print(f"[service_hours] 準備寫入 {len(rows)} 筆，student_list={student_list}，category={category}，date={svc_date}，class={class_name}")
+        print(f"[service_hours] 準備寫入 {len(rows)} 筆（共{len(student_list)}人），"
+              f"category={category}，date={svc_date}，class={class_name}")
 
         if not rows:
             print(f"[service_hours] ⚠️ 全部被 dedup 過濾，不寫入。student_list={student_list}")
-            return
+            return 0  # [Fix] 改回傳 0，不再是 None，讓呼叫端可以判斷
 
         def _action():
             ws = get_worksheet(SHEET_TABS["service_hours"])
@@ -787,6 +792,8 @@ try:
                     conn.execute("INSERT OR IGNORE INTO service_issued VALUES (?, ?, ?, ?)", key)
             except Exception:
                 pass
+
+        return len(rows)  # [Fix] 回傳實際寫入筆數
 
 
     def _mark_service_hours_issued(record_ids: list):
@@ -911,14 +918,21 @@ try:
                 # [Patch B] task_id 為空時停用 dedup 保護（不應發生，但防禦極端情況）
                 _dedup_enabled = bool(_task_id_for_dedup)
 
+                # [Fix] 診斷 log：執行前先印出完整 payload，讓 log 可追蹤
+                print(f"[verify] ▶ 開始執行 task_id={_task_id_for_dedup[:8] if _task_id_for_dedup else '?'} "
+                      f"claimants={claimants} area={task_area} date={task_date_str} hours={task_hours}")
+
                 svc_debt_sids   = []  # 還時數
                 svc_appeal_sids = []  # 消警告
+                debt_failures   = []  # [Fix] 追蹤 update_student_debt 失敗的學號
 
                 for clm in claimants:
                     _sid_w, _tag_w = _parse_claimant_tag(clm)
                     if not _sid_w:
+                        print(f"[verify] ⚠️ 無法解析 sid，跳過: '{clm}'")
                         continue
                     _tag_n = _strip_notion_invisible(_tag_w)
+                    print(f"[verify] 解析: '{clm}' → sid={_sid_w}, tag='{_tag_n}'")
 
                     if _tag_n in ("還時數", ""):
                         # [Fix 1] 先查 debt_processed，避免重試時重複扣時
@@ -935,15 +949,20 @@ try:
 
                         if not _already_debted:
                             _debt_ok = update_student_debt(_sid_w, -task_hours, f"愛校驗收：{task_title}", _task_id=_task_id_for_dedup)
-                            if _debt_ok and _dedup_enabled:
-                                try:
-                                    with closing(open_local_db()) as _conn:
-                                        _conn.execute(
-                                            "INSERT OR IGNORE INTO debt_processed VALUES (?, ?)",
-                                            (_task_id_for_dedup, _sid_w)
-                                        )
-                                except Exception as _we:
-                                    print(f"[verify] debt_processed 寫入失敗（可忽略）: {_we}")
+                            if _debt_ok:
+                                if _dedup_enabled:
+                                    try:
+                                        with closing(open_local_db()) as _conn:
+                                            _conn.execute(
+                                                "INSERT OR IGNORE INTO debt_processed VALUES (?, ?)",
+                                                (_task_id_for_dedup, _sid_w)
+                                            )
+                                    except Exception as _we:
+                                        print(f"[verify] debt_processed 寫入失敗（可忽略）: {_we}")
+                            else:
+                                # [Fix] 失敗要記錄，之後拋例外讓 Worker RETRY
+                                print(f"[verify] ❌ update_student_debt 失敗 sid={_sid_w}")
+                                debt_failures.append(_sid_w)
                         else:
                             print(f"[verify] {_sid_w} 已在前次嘗試中完成扣時，略過（dedup）")
 
@@ -972,27 +991,40 @@ try:
 
                         if not _already_debted:
                             _debt_ok = update_student_debt(_sid_w, -task_hours, f"愛校驗收：{task_title}", _task_id=_task_id_for_dedup)
-                            if _debt_ok and _dedup_enabled:
-                                try:
-                                    with closing(open_local_db()) as _conn:
-                                        _conn.execute(
-                                            "INSERT OR IGNORE INTO debt_processed VALUES (?, ?)",
-                                            (_task_id_for_dedup, _sid_w)
-                                        )
-                                except Exception:
-                                    pass
+                            if _debt_ok:
+                                if _dedup_enabled:
+                                    try:
+                                        with closing(open_local_db()) as _conn:
+                                            _conn.execute(
+                                                "INSERT OR IGNORE INTO debt_processed VALUES (?, ?)",
+                                                (_task_id_for_dedup, _sid_w)
+                                            )
+                                    except Exception:
+                                        pass
+                            else:
+                                print(f"[verify] ❌ update_student_debt 失敗（未知tag）sid={_sid_w}")
+                                debt_failures.append(_sid_w)
                         else:
                             print(f"[verify] {_sid_w}（未知tag）已在前次嘗試中完成扣時，略過")
 
                         svc_debt_sids.append(_sid_w)
                         time.sleep(0.3)
 
+                # [Fix] 若有 update_student_debt 失敗，先拋例外讓 Worker RETRY，
+                #       不繼續執行 service_hours 寫入，避免資料半成功
+                if debt_failures:
+                    raise Exception(f"[verify] update_student_debt 失敗，待 RETRY：sids={debt_failures}")
+
                 # 寫入 service_hours：還時數（直接寫，已有 SQLite dedup 保護）
                 if svc_debt_sids:
-                    _write_service_hours_direct(
+                    _written_debt = _write_service_hours_direct(
                         "愛校打掃", "返校打掃", task_hours, svc_debt_sids,
                         task_date_str if task_date_str != "未定" else str(date.today())
                     )
+                    # [Fix] dedup 空轉（0筆）印出警告，但不 RETRY
+                    # （service_issued 有記錄代表上一輪已成功寫入，不需重試）
+                    if _written_debt == 0:
+                        print(f"[verify] ⚠️ 還時數 service_hours 寫入 0 筆（dedup 判定已存在），不重試。sids={svc_debt_sids}")
 
                 # [Fix 2] 消警告：直接呼叫 _write_service_hours_direct（有 execute_with_retry + SQLite dedup）
                 # ※ Worker 背景執行緒內同步寫入是安全的，不影響 UI
@@ -1001,7 +1033,9 @@ try:
                     _cf = f"{task_area}|{time_start_v}" if time_start_v else task_area
                     _ad = task_date_str if task_date_str != "未定" else str(date.today())
                     print(f"[worker] 消警告 service_hours 直接寫入，共 {len(svc_appeal_sids)} 人：{svc_appeal_sids}")
-                    _write_service_hours_direct(_cf, "愛校服務(消警告)", task_hours, svc_appeal_sids, _ad)
+                    _written_appeal = _write_service_hours_direct(_cf, "愛校服務(消警告)", task_hours, svc_appeal_sids, _ad)
+                    if _written_appeal == 0:
+                        print(f"[verify] ⚠️ 消警告 service_hours 寫入 0 筆（dedup 判定已存在），不重試。sids={svc_appeal_sids}")
 
                 # 更新 Notion 狀態
                 if notion_page_id:
@@ -1010,7 +1044,7 @@ try:
                           f"page_id={notion_page_id[:8] if notion_page_id else 'None'}")
                 else:
                     print("[worker] notion_page_id 為空，跳過 Notion 更新")
-                print(f"[worker] campus_service_verify 完成：debt={svc_debt_sids} appeal={svc_appeal_sids}")
+                print(f"[worker] ✅ campus_service_verify 完成：debt={svc_debt_sids} appeal={svc_appeal_sids}")
 
             # ── [愛校2.0 Async] 背景晨掃審核 ──────────────────────────
             elif task_type == "morning_sweep_approve":
