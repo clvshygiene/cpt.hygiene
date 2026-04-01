@@ -2877,50 +2877,60 @@ try:
                             files = st.file_uploader("選取照片", accept_multiple_files=True, type=['jpg','png','jpeg'])
 
                             if st.form_submit_button("送出"):
-                                if time.time() - st.session_state.last_action_time < 5:
+                                # [Patch 11] 三層防重複提交：
+                                #   Layer 1: session_state submit_key（最快，防 Streamlit 重複 rerun）
+                                #   Layer 2: last_action_time 5秒防抖（防手動連點）
+                                #   Layer 3: Worker 端 _append_main_entry_row dedup（最終防線）
+                                _submit_key = f"{input_date}__{inspector_name}__{sel_cls}"
+                                if _submit_key in st.session_state.submitted_inspections:
+                                    st.warning("⚠️ 此筆已送出，請勿重複提交！若需修正請使用修正單。")
+                                elif time.time() - st.session_state.last_action_time < 5:
                                     st.warning("⚠️ 系統處理中，請稍候 5 秒再試！")
                                 elif not files:
                                     st.error("❌ 請先上傳現場照片才能送出！（優良/普通也需要附照）")
                                 else:
+                                    # [關鍵] 先標記、再執行 — 防止 Streamlit 雙重 rerun 競爭
+                                    st.session_state.submitted_inspections.add(_submit_key)
                                     st.session_state.last_action_time = time.time()
-                                    _submit_key = f"{input_date}__{inspector_name}__{sel_cls}"
+
+                                    _save_ok = False
                                     if check_result == "⭐ 優良":
-                                        # [需求3] 存為「待審優良」，組長審核後才正式升為優良
-                                        # 從 form 內的變數讀取（避免 session_state key error）
                                         try:
                                             _exc_note = excellent_note_form.strip() if excellent_note_form else ""
                                         except Exception:
                                             _exc_note = ""
                                         _note_text = f"優良原因：{_exc_note}" if _exc_note else "本次檢查表現優良，無扣分項目（待組長審核）"
-                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(待審優良)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": _note_text}, uploaded_files=files, award_inspector_hours=is_last_task):
-                                            st.session_state.submitted_inspections.add(_submit_key)
-                                            st.success("⭐ 優良紀錄已送出！等待組長審核中..."); time.sleep(1.5); st.rerun()
+                                        _save_ok = save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(待審優良)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": _note_text}, uploaded_files=files, award_inspector_hours=is_last_task)
                                     elif check_result == "✅ 普通":
                                         try:
                                             _norm_note = normal_note_form.strip() if normal_note_form else ""
                                         except Exception:
                                             _norm_note = ""
                                         _norm_note_text = _norm_note if _norm_note else "本次檢查無扣分，表現普通"
-                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(普通)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": _norm_note_text}, uploaded_files=files, award_inspector_hours=is_last_task):
-                                            st.session_state.submitted_inspections.add(_submit_key)
-                                            st.success("✅ 普通紀錄已登記！"); time.sleep(1.5); st.rerun()
+                                        _save_ok = save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(普通)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": _norm_note_text}, uploaded_files=files, award_inspector_hours=is_last_task)
                                     elif check_result == "❌ 違規(需扣分)":
-                                        # [需求1] 允許扣0分：備註自動加【警告】標記，計分面板顯示紅色但不計入成績
                                         _deduct_note = (f"【警告，扣0分】{note}".strip()) if (in_s + out_s) == 0 else note
-                                        if save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": _deduct_note, "違規細項": "、".join(sel_violations) if sel_violations else ""}, uploaded_files=files, award_inspector_hours=is_last_task):
-                                                st.session_state.submitted_inspections.add(_submit_key)
-                                                if assigned_classes:
-                                                    if is_last_task:
-                                                        st.success("✅ 送出成功！今日任務已全數完成，系統將自動核發 0.25 小時！")
-                                                        st.caption("📡 若送出後畫面沒有反應，請稍候 30 秒再試一次，不要連續按多次。")
-                                                    else:
-                                                        st.success(f"✅ 送出成功！尚缺 {len(pending_classes)-1} 個班級，請繼續努力！")
-                                                        st.caption("📡 若送出後畫面沒有反應，請稍候 30 秒再試一次，不要連續按多次。")
+                                        _save_ok = save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": _deduct_note, "違規細項": "、".join(sel_violations) if sel_violations else ""}, uploaded_files=files, award_inspector_hours=is_last_task)
+
+                                    if _save_ok:
+                                        if check_result == "⭐ 優良":
+                                            st.success("⭐ 優良紀錄已送出！等待組長審核中...")
+                                        elif check_result == "✅ 普通":
+                                            st.success("✅ 普通紀錄已登記！")
+                                        elif check_result == "❌ 違規(需扣分)":
+                                            if assigned_classes:
+                                                if is_last_task:
+                                                    st.success("✅ 送出成功！今日任務已全數完成，系統將自動核發 0.25 小時！")
                                                 else:
-                                                    st.success("✅ 送出成功！系統將自動排程發放本日 0.25 小時。")
-                                                    st.caption("📡 若送出後畫面沒有反應，請稍候 30 秒再試一次，不要連續按多次。")
-                                                time.sleep(1.5)
-                                                st.rerun()
+                                                    st.success(f"✅ 送出成功！尚缺 {len(pending_classes)-1} 個班級，請繼續努力！")
+                                            else:
+                                                st.success("✅ 送出成功！系統將自動排程發放本日 0.25 小時。")
+                                            st.caption("📡 若送出後畫面沒有反應，請稍候 30 秒再試一次，不要連續按多次。")
+                                        time.sleep(1.5)
+                                        st.rerun()
+                                    else:
+                                        # 送出失敗 → 移除標記，允許重試
+                                        st.session_state.submitted_inspections.discard(_submit_key)
 
     # --- Mode 2: 班級負責人 ---
     elif app_mode == "班級負責人🥸":
@@ -3353,9 +3363,15 @@ try:
                         btn_text = "🚀 我們完成補打掃了喔" if is_makeup else "🚀 確認送出全部回報"
                         
                         if st.form_submit_button(btn_text):
-                            if time.time() - st.session_state.last_action_time < 3:
+                            # [Patch 12] 晨掃也套用「先標記再執行」防重複提交
+                            _morning_key = f"{today_tw}_{my_cls}"
+                            if _morning_key in st.session_state.just_submitted_morning:
+                                st.warning("⚠️ 此筆已送出，請勿重複提交！")
+                            elif time.time() - st.session_state.last_action_time < 3:
                                 st.warning("⚠️ 系統處理中，請勿連續點擊！")
                             else:
+                                # 先標記，再執行
+                                st.session_state.just_submitted_morning.append(_morning_key)
                                 st.session_state.last_action_time = time.time()
                                 
                                 all_present = []
@@ -3374,6 +3390,8 @@ try:
                                 
                                 if not all_present or not all_files:
                                     st.error("❌ 請至少選擇一位打掃同學，並上傳至少一張照片！")
+                                    # 驗證失敗 → 移除標記允許重試
+                                    st.session_state.just_submitted_morning.remove(_morning_key)
                                 else:
                                     # 依據 is_makeup 變更存入的任務名稱
                                     task_name = "晨間打掃(補掃)" if is_makeup else "晨間打掃"
@@ -3397,11 +3415,12 @@ try:
                                         custom_category="晨掃志工"
                                     )
                                     if ok:
-                                    # [新增防呆] 送出成功後，立刻把今天和班級記在手機瀏覽器裡
-                                        st.session_state.just_submitted_morning.append(f"{today_tw}_{my_cls}")
                                         st.success("✅ 回報成功！所有區域皆已記錄，辛苦了！")
                                         time.sleep(1.5)
                                         st.rerun()
+                                    else:
+                                        # 送出失敗 → 移除標記允許重試
+                                        st.session_state.just_submitted_morning.remove(_morning_key)
     # --- Mode 4: 組長後台 ---
     elif app_mode == "組長ㄉ窩💃":
         st.title("⚙️ 管理後台")
