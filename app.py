@@ -360,11 +360,25 @@ try:
                 media_body=MediaIoBaseUpload(file_obj, mimetype='image/jpeg', resumable=False), 
                 fields='id', supportsAllDrives=True
             ).execute()
-            try: service.permissions().create(fileId=file.get('id'), body={'role': 'reader', 'type': 'anyone'}).execute()
-            except Exception as perm_e:
-                # [Patch 6] 記錄警告，不再完全靜默；公開權限失敗 = 照片連結可能打不開
-                print(f"[Drive] ⚠️ 照片 {filename} 上傳成功但設定公開權限失敗: {perm_e}")
-            return f"https://drive.google.com/thumbnail?id={file.get('id')}&sz=w1000"
+            file_id = file.get('id')
+            # [Fix] Drive 傳播延遲：剛建立的檔案可能需要幾秒才能被其他 API 找到
+            # 加入重試機制，避免 404 "File not found" 導致所有照片無法公開
+            for perm_attempt in range(3):
+                try:
+                    if perm_attempt > 0:
+                        time.sleep(1.0 + perm_attempt)  # 第2次等2秒，第3次等3秒
+                    service.permissions().create(
+                        fileId=file_id,
+                        body={'role': 'reader', 'type': 'anyone'},
+                        supportsAllDrives=True
+                    ).execute()
+                    break  # 成功就跳出
+                except Exception as perm_e:
+                    if perm_attempt < 2 and '404' in str(perm_e):
+                        print(f"[Drive] 權限設定 404，{perm_attempt+1}/3 次重試中: {filename}")
+                    else:
+                        print(f"[Drive] ⚠️ 照片 {filename} 設定公開權限失敗（已重試{perm_attempt+1}次）: {perm_e}")
+            return f"https://drive.google.com/thumbnail?id={file_id}&sz=w1000"
         return execute_with_retry(_upload_action)
 
     def clean_id(val):
