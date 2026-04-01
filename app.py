@@ -250,25 +250,25 @@ try:
     # SRE Utils: 重試機制
     # ==========================================
     def execute_with_retry(func, max_retries=5, base_delay=1.0, timeout=30):
+        # [Patch 1] 首次呼叫零延遲；僅重試時 exponential backoff
         for attempt in range(max_retries):
             try:
-                time.sleep(0.3 + random.uniform(0, 0.2)) 
+                if attempt > 0:
+                    # 重試才加延遲：exponential backoff + jitter
+                    sleep_time = (base_delay * (2 ** (attempt - 1))) + random.uniform(0, 1)
+                    time.sleep(sleep_time)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(func)
                     return future.result(timeout=timeout)
             except concurrent.futures.TimeoutError:
                 print(f"API Hard Timeout on attempt {attempt+1}")
-                if attempt < max_retries - 1:
-                    sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0, 1)
-                    time.sleep(sleep_time)
-                else: 
+                if attempt >= max_retries - 1: 
                     raise Exception("API 連線超時，請稍後再試")
             except Exception as e:
                 error_str = str(e).lower()
                 is_retryable = any(x in error_str for x in ['429', '500', '503', 'quota', 'rate limit', 'timed out', 'connection'])
                 if is_retryable and attempt < max_retries - 1:
-                    sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0, 1)
-                    time.sleep(sleep_time)
+                    pass  # backoff 在下一輪 loop 頭部執行
                 else: raise e
 
     # ==========================================
@@ -361,7 +361,9 @@ try:
                 fields='id', supportsAllDrives=True
             ).execute()
             try: service.permissions().create(fileId=file.get('id'), body={'role': 'reader', 'type': 'anyone'}).execute()
-            except Exception: pass  # 設公開權限失敗可忽略，不影響上傳
+            except Exception as perm_e:
+                # [Patch 6] 記錄警告，不再完全靜默；公開權限失敗 = 照片連結可能打不開
+                print(f"[Drive] ⚠️ 照片 {filename} 上傳成功但設定公開權限失敗: {perm_e}")
             return f"https://drive.google.com/thumbnail?id={file.get('id')}&sz=w1000"
         return execute_with_retry(_upload_action)
 
@@ -704,20 +706,33 @@ try:
         except Exception as e:
             return False, str(e)
 
+    # [Patch 5] Worker 記憶體級去重快取，避免每筆任務都讀整欄紀錄ID
+    @st.cache_resource
+    def _get_written_ids_cache():
+        return set()
+    _WRITTEN_IDS_CACHE = _get_written_ids_cache()
+
     def _append_main_entry_row(entry):
+        _rid = str(entry.get("紀錄ID", ""))
         def _action():
             ws = get_worksheet(SHEET_TABS["main"])
             if not ws: return
-            # [防重複寫入] 先比對紀錄ID，若已存在則跳過，避免連續上傳兩筆
+            # [Patch 5] 先查記憶體快取（O(1)），命中即跳過，不打 Sheets API
+            if _rid and _rid in _WRITTEN_IDS_CACHE:
+                print(f"[DEDUP-MEM] 紀錄ID {_rid} 在記憶體快取中，跳過寫入")
+                return
+            # 快取 miss → 才讀 Sheets 確認（防 Worker 重啟後重複）
             try:
                 existing_ids = ws.col_values(EXPECTED_COLUMNS.index("紀錄ID") + 1)
-                if str(entry.get("紀錄ID", "")) in existing_ids:
-                    print(f"[DEDUP] 紀錄ID {entry.get('紀錄ID')} 已存在，跳過寫入")
+                if _rid in existing_ids:
+                    print(f"[DEDUP-SHEET] 紀錄ID {_rid} 已存在，跳過寫入")
+                    if _rid: _WRITTEN_IDS_CACHE.add(_rid)
                     return
             except Exception as e:
                 print(f"[DEDUP] 防重複檢查失敗，繼續寫入: {e}")
             row = [str(entry.get(col, "")).upper() if isinstance(entry.get(col, ""), bool) else str(entry.get(col, "")) for col in EXPECTED_COLUMNS]
             ws.append_row(row)
+            if _rid: _WRITTEN_IDS_CACHE.add(_rid)
         execute_with_retry(_action)
     
     def _append_service_row_unique(entry):
@@ -872,19 +887,11 @@ try:
             return "無紀錄"
 
     def _write_worker_diag(task_id, task_type, stage, detail=""):
-        """直接寫入 task_queue 分頁的 last_error 欄做診斷（不依賴 print/log）。
-        寫入一筆特殊診斷列：id=DIAG_xxx，status=DIAG，方便查詢。"""
-        try:
-            ws = get_worksheet(SHEET_TABS["task_queue"])
-            if not ws: return
-            now = datetime.now(TW_TZ).strftime("%H:%M:%S")
-            diag_id = f"DIAG_{task_id[:8] if task_id else 'unk'}_{stage}"
-            ws.append_row(
-                [diag_id, task_type, now, detail, "DIAG", 0, stage],
-                value_input_option="RAW"
-            )
-        except Exception as _de:
-            pass  # 診斷本身不能干擾主流程
+        """[Patch 10] 改為純記憶體 + print 診斷，不再寫入 Sheets 浪費配額。"""
+        now = datetime.now(TW_TZ).strftime("%H:%M:%S")
+        diag_msg = f"[{now}] DIAG task={task_id[:8] if task_id else 'unk'} type={task_type} stage={stage} {detail}"
+        print(diag_msg)
+        _WORKER_LOG.append(diag_msg)
 
     def process_task(task):
         task_type, payload = task["task_type"], task["payload"]
@@ -1173,18 +1180,25 @@ try:
         STUCK_THRESHOLD_SEC = 300  # IN_PROGRESS 超過 5 分鐘視為卡住
 
         def _recover_stuck_tasks(ws, records):
-            """將超過 5 分鐘仍為 IN_PROGRESS 的任務重置為 RETRY"""
+            """將超過 5 分鐘仍為 IN_PROGRESS 的任務重置為 RETRY，並清理 DIAG/DONE 歷史行"""
             now_utc = datetime.now(pytz.utc)
             batch_updates = []
             recovered = 0
+            # [Patch 8] 同時收集需要刪除的 DIAG 行（從後往前刪，避免行號偏移）
+            rows_to_delete = []
             for i, r in enumerate(records):
-                if r.get("status") != "IN_PROGRESS": continue
+                row_idx = i + 2
+                status = r.get("status", "")
+                # 清理 DIAG 行和已完成的 DONE 行（不應該殘留）
+                if status in ("DIAG", "DONE"):
+                    rows_to_delete.append(row_idx)
+                    continue
+                if status != "IN_PROGRESS": continue
                 ts_raw = r.get("created_ts", "")
                 if not ts_raw: continue
                 try:
                     created = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
                     if (now_utc - created).total_seconds() > STUCK_THRESHOLD_SEC:
-                        row_idx = i + 2
                         attempts_new = int(r.get("attempts", 0))
                         batch_updates.append({"range": f"E{row_idx}", "values": [["RETRY"]]})
                         batch_updates.append({"range": f"F{row_idx}", "values": [[attempts_new]]})
@@ -1197,6 +1211,14 @@ try:
                     print(f"[recovery] 重置了 {recovered} 個卡住的 IN_PROGRESS 任務")
                 except Exception as e:
                     print(f"[recovery] batch_update 失敗: {e}")
+            # 從後往前刪除 DIAG/DONE 行，避免行號偏移
+            if rows_to_delete:
+                try:
+                    for ridx in sorted(rows_to_delete, reverse=True):
+                        ws.delete_rows(ridx)
+                    print(f"[cleanup] 清理了 {len(rows_to_delete)} 個 DIAG/DONE 殘留行")
+                except Exception as e:
+                    print(f"[cleanup] 清理 DIAG 行失敗（可忽略）: {e}")
             return recovered
 
         _WORKER_LOG.append(f"[BW] Worker 執行緒啟動")
@@ -1273,13 +1295,16 @@ try:
                     final_status = "DONE" if ok else "FAILED"
                     for t in svc_tasks:
                         update_task_status(t["id"], final_status, t["attempts"], err, _row_idx=t.get("_row_idx"))
-                    time.sleep(2.0)
+                    # [Patch 9] 尖峰時段也縮短批次後等待
+                    time.sleep(0.5 if _is_peak_hour(datetime.now(TW_TZ)) else 2.0)
                     continue
 
                 # 處理含照片的任務（同一批 records，不重複讀）
                 task = _extract_next_task(ws, records)
                 if not task:
-                    time.sleep(30.0)
+                    # [Patch 7] 尖峰時段縮短空轉等待，讓新任務更快被接手
+                    _idle_sleep = 5.0 if _is_peak_hour(datetime.now(TW_TZ)) else 30.0
+                    time.sleep(_idle_sleep)
                     continue
 
                 _idle_loops = 0
@@ -1299,20 +1324,13 @@ try:
                 else:
                     if err and "DRY_RUN" not in err: update_last_error_summary(err)
 
-                # [DIAG] process_task 結果
-                try:
-                    _bw_result_id = f"DIAG_{str(task.get('id',''))[:8]}_AFTER_PROCESS"
-                    ws.append_row(
-                        [_bw_result_id, task.get("task_type","?"),
-                         datetime.now(TW_TZ).strftime("%H:%M:%S"),
-                         f"ok={ok} err={str(err)[:150]}", "DIAG", task.get("attempts",0), "BW_AFTER_PROCESS"],
-                        value_input_option="RAW"
-                    )
-                except Exception:
-                    pass
+                # [DIAG → print] 不再寫入 Sheets，節省尖峰時段配額
+                print(f"[DIAG] task_id={str(task.get('id',''))[:8]} type={task.get('task_type','?')} ok={ok} err={str(err)[:150]}")
                 if not ok and err and "FILE_NOT_FOUND" in str(err): task["attempts"] = 999
                 update_task_status(task["id"], "DONE" if ok else ("FAILED" if task["attempts"] >= 6 else "RETRY"), task["attempts"], err, _row_idx=task.get("_row_idx"))
-                time.sleep(2.0)
+                # [Patch 4] 尖峰時段縮短等待，加快佇列消化速度
+                _worker_sleep = 0.5 if _is_peak_hour(datetime.now(TW_TZ)) else 2.0
+                time.sleep(_worker_sleep)
             except Exception as e:
                 print(f"[worker] 未預期例外: {e}")
                 time.sleep(5.0)
@@ -2190,7 +2208,11 @@ try:
             "custom_category": custom_category,
             "award_inspector_hours": award_inspector_hours
         }
-        enqueue_task("volunteer_report" if student_list is not None else "main_entry", payload)
+        # [Patch 2] 檢查 enqueue 回傳值，防止靜默丟失資料
+        task_id = enqueue_task("volunteer_report" if student_list is not None else "main_entry", payload)
+        if not task_id:
+            st.error("❌ 系統繁忙，資料未送出！請等待 10 秒後重新點擊送出。")
+            return False
         return True
 
     def load_full_semester_data_for_export():
