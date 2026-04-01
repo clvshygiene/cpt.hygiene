@@ -3716,6 +3716,13 @@ try:
                 st.subheader("📊 成績總表")
                 full = load_full_semester_data_for_export()
 
+                # [DEBUG] 臨時診斷：查看 load_main_data 讀到的資料筆數和週次分佈
+                if not full.empty:
+                    _week_counts = full["週次"].value_counts().sort_index().to_dict()
+                    st.caption(f"🔍 診斷：共 {len(full)} 筆資料　|　週次分佈：{_week_counts}")
+                else:
+                    st.caption("🔍 診斷：full 為空 DataFrame")
+
                 # ── 共用計算函式 ──────────────────────────────────────────
                 def calc_scores(df_raw):
                     """回傳含結算欄位的 DataFrame（已排除優良/普通紀錄，以及申訴核可的修正紀錄）"""
