@@ -4218,58 +4218,160 @@ try:
                     if not mems:
                         st.warning("⚠️ 此班級在 Roster 中找不到成員，請確認 Google Sheet。")
                     else:
-                        with st.form("svc_class_form"):
-                            absent = st.multiselect(f"❌ 缺席名單（共 {len(mems)} 人，扣除法）", mems, key="svc_absent")
-                            pool = [m for m in mems if m not in absent]
-                            st.caption(f"✅ 一般組：{len(pool)} 人")
-                            base_h = st.number_input("基礎時數", value=2.0, step=0.5, min_value=0.0, key="svc_base_h")
+                        _is_return_clean = base_category in ("返校打掃",)  # 返校打掃啟用三類歸類
 
-                            st.markdown("---")
-                            spec = st.multiselect("⭐ 加強組（從一般組挑選，另給不同時數）", pool, key="svc_spec")
-                            spec_h = st.number_input("加強組時數", value=3.0, step=0.5, min_value=0.0, key="svc_spec_h")
-                            st.caption("（若無加強組，此欄留空即可，不影響結果）")
+                        if _is_return_clean:
+                            # ── [Patch 13] 返校打掃：三類歸類法 ──
+                            st.info(f"📋 全班 {len(mems)} 人，請標記「免除」和「未到」的同學，其餘預設為出席。")
 
-                            pf = st.file_uploader("📸 照片（選填）", type=['jpg', 'png', 'jpeg'], key="svc_pf_cls")
+                            with st.form("svc_class_form"):
+                                exempt = st.multiselect(
+                                    f"🏃 免除名單（體育生等不需打掃的同學）",
+                                    mems, key="svc_exempt"
+                                )
+                                remaining_after_exempt = [m for m in mems if m not in exempt]
+                                absent_absent = st.multiselect(
+                                    f"❌ 未到名單（需補時數 2hr 的同學）",
+                                    remaining_after_exempt, key="svc_absent_debt"
+                                )
+                                pool = [m for m in remaining_after_exempt if m not in absent_absent]
 
-                            if st.form_submit_button("🚀 發放"):
-                                if time.time() - st.session_state.last_action_time < 3:
-                                    st.warning("⚠️ 系統處理中，請勿連續點擊！")
-                                elif not pool:
-                                    st.error("❌ 發放名單為空，請確認名單設定！")
-                                else:
-                                    st.session_state.last_action_time = time.time()
-                                    norm = [m for m in pool if m not in spec]
-                                    ok_norm, ok_spec = True, True
+                                _c1, _c2, _c3 = st.columns(3)
+                                _c1.metric("✅ 出席", f"{len(pool)} 人")
+                                _c2.metric("🏃 免除", f"{len(exempt)} 人")
+                                _c3.metric("❌ 未到", f"{len(absent_absent)} 人")
 
-                                    fb = None
-                                    if pf:
-                                        pf.seek(0)
-                                        fb = pf.read()
+                                st.markdown("---")
+                                base_h = st.number_input("出席者時數", value=2.0, step=0.5, min_value=0.0, key="svc_base_h")
+                                debt_h = st.number_input("未到者欠時數", value=2.0, step=0.5, min_value=0.0, key="svc_debt_h")
 
-                                    if norm:
-                                        files_norm = [io.BytesIO(fb)] if fb else None
-                                        if files_norm: files_norm[0].name = "p.jpg"
-                                        ok_norm = save_entry(
-                                            {"日期": str(rd), "班級": rc, "評分項目": "服務時數發放",
-                                             "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")},
-                                            files_norm, norm, base_h, final_category
-                                        )
-                                    if spec:
-                                        files_spec = [io.BytesIO(fb)] if fb else None
-                                        if files_spec: files_spec[0].name = "p.jpg"
-                                        ok_spec = save_entry(
-                                            {"日期": str(rd), "班級": rc, "評分項目": "服務時數發放",
-                                             "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")},
-                                            files_spec, spec, spec_h, f"{final_category}(加強)"
-                                        )
+                                st.markdown("---")
+                                spec = st.multiselect("⭐ 加強組（從出席者挑選，另給不同時數）", pool, key="svc_spec")
+                                spec_h = st.number_input("加強組時數", value=3.0, step=0.5, min_value=0.0, key="svc_spec_h")
+                                st.caption("（若無加強組，此欄留空即可，不影響結果）")
 
-                                    if ok_norm and ok_spec:
-                                        result_msg = f"✅ 已發放！一般組 {len(norm)} 人 ({base_h}h)"
+                                pf = st.file_uploader("📸 照片（選填）", type=['jpg', 'png', 'jpeg'], key="svc_pf_cls")
+
+                                if st.form_submit_button("🚀 發放時數 + 登記未到欠時"):
+                                    if time.time() - st.session_state.last_action_time < 3:
+                                        st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                                    elif not pool and not absent_absent:
+                                        st.error("❌ 出席和未到名單皆為空，請確認！")
+                                    else:
+                                        st.session_state.last_action_time = time.time()
+                                        norm = [m for m in pool if m not in spec]
+                                        ok_norm, ok_spec = True, True
+
+                                        fb = None
+                                        if pf:
+                                            pf.seek(0)
+                                            fb = pf.read()
+
+                                        # 發放出席者時數
+                                        if norm:
+                                            files_norm = [io.BytesIO(fb)] if fb else None
+                                            if files_norm: files_norm[0].name = "p.jpg"
+                                            ok_norm = save_entry(
+                                                {"日期": str(rd), "班級": rc, "評分項目": "服務時數發放",
+                                                 "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")},
+                                                files_norm, norm, base_h, final_category
+                                            )
                                         if spec:
-                                            result_msg += f"，加強組 {len(spec)} 人 ({spec_h}h)"
-                                        st.success(result_msg)
+                                            files_spec = [io.BytesIO(fb)] if fb else None
+                                            if files_spec: files_spec[0].name = "p.jpg"
+                                            ok_spec = save_entry(
+                                                {"日期": str(rd), "班級": rc, "評分項目": "服務時數發放",
+                                                 "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")},
+                                                files_spec, spec, spec_h, f"{final_category}(加強)"
+                                            )
+
+                                        # 自動寫入未到者欠時數
+                                        debt_ok_count = 0
+                                        debt_fail_sids = []
+                                        if absent_absent and debt_h > 0:
+                                            _debt_date_str = str(rd)
+                                            _debt_reason = f"{_debt_date_str} 返校打掃未到"
+                                            for _ab_sid in absent_absent:
+                                                try:
+                                                    _dok = update_student_debt(_ab_sid, debt_h, _debt_reason)
+                                                    if _dok:
+                                                        debt_ok_count += 1
+                                                    else:
+                                                        debt_fail_sids.append(_ab_sid)
+                                                except Exception as _de:
+                                                    print(f"[返校打掃欠時] {_ab_sid} 失敗: {_de}")
+                                                    debt_fail_sids.append(_ab_sid)
+
+                                        # 結果彙報
+                                        result_parts = []
+                                        if ok_norm and ok_spec:
+                                            result_parts.append(f"✅ 已發放！出席 {len(norm)} 人 ({base_h}h)")
+                                            if spec:
+                                                result_parts.append(f"加強組 {len(spec)} 人 ({spec_h}h)")
+                                        if exempt:
+                                            result_parts.append(f"🏃 免除 {len(exempt)} 人（不處理）")
+                                        if debt_ok_count > 0:
+                                            result_parts.append(f"❌ 未到 {debt_ok_count} 人已登記欠時 {debt_h}hr")
+                                        if debt_fail_sids:
+                                            st.error(f"⚠️ 以下學號欠時寫入失敗，請手動處理：{', '.join(debt_fail_sids)}")
+                                        st.success("　|　".join(result_parts))
                                         time.sleep(1.5)
                                         st.rerun()
+
+                        else:
+                            # ── 非返校打掃：保留原有的排除法 ──
+                            with st.form("svc_class_form"):
+                                absent = st.multiselect(f"❌ 缺席名單（共 {len(mems)} 人，扣除法）", mems, key="svc_absent")
+                                pool = [m for m in mems if m not in absent]
+                                st.caption(f"✅ 一般組：{len(pool)} 人")
+                                base_h = st.number_input("基礎時數", value=2.0, step=0.5, min_value=0.0, key="svc_base_h")
+
+                                st.markdown("---")
+                                spec = st.multiselect("⭐ 加強組（從一般組挑選，另給不同時數）", pool, key="svc_spec")
+                                spec_h = st.number_input("加強組時數", value=3.0, step=0.5, min_value=0.0, key="svc_spec_h")
+                                st.caption("（若無加強組，此欄留空即可，不影響結果）")
+
+                                pf = st.file_uploader("📸 照片（選填）", type=['jpg', 'png', 'jpeg'], key="svc_pf_cls")
+
+                                if st.form_submit_button("🚀 發放"):
+                                    if time.time() - st.session_state.last_action_time < 3:
+                                        st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                                    elif not pool:
+                                        st.error("❌ 發放名單為空，請確認名單設定！")
+                                    else:
+                                        st.session_state.last_action_time = time.time()
+                                        norm = [m for m in pool if m not in spec]
+                                        ok_norm, ok_spec = True, True
+
+                                        fb = None
+                                        if pf:
+                                            pf.seek(0)
+                                            fb = pf.read()
+
+                                        if norm:
+                                            files_norm = [io.BytesIO(fb)] if fb else None
+                                            if files_norm: files_norm[0].name = "p.jpg"
+                                            ok_norm = save_entry(
+                                                {"日期": str(rd), "班級": rc, "評分項目": "服務時數發放",
+                                                 "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")},
+                                                files_norm, norm, base_h, final_category
+                                            )
+                                        if spec:
+                                            files_spec = [io.BytesIO(fb)] if fb else None
+                                            if files_spec: files_spec[0].name = "p.jpg"
+                                            ok_spec = save_entry(
+                                                {"日期": str(rd), "班級": rc, "評分項目": "服務時數發放",
+                                                 "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S")},
+                                                files_spec, spec, spec_h, f"{final_category}(加強)"
+                                            )
+
+                                        if ok_norm and ok_spec:
+                                            result_msg = f"✅ 已發放！一般組 {len(norm)} 人 ({base_h}h)"
+                                            if spec:
+                                                result_msg += f"，加強組 {len(spec)} 人 ({spec_h}h)"
+                                            st.success(result_msg)
+                                            time.sleep(1.5)
+                                            st.rerun()
 
                 # ── 直接輸入學號模式 ──
                 else:
@@ -4465,6 +4567,74 @@ try:
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                 key="debt_excel_dl"
                             )
+
+                # ── 區塊 B2：🔓 快速銷帳（補打掃完成） ── [Patch 14]
+                with st.expander("🔓 快速銷帳（補打掃完成）", expanded=True):
+                    st.info("💡 學生完成補打掃後，可在此直接銷帳扣減欠時數。不需繞 Notion 愛校任務。")
+
+                    _all_debts_for_clear = load_student_debts()
+                    if not _all_debts_for_clear:
+                        st.success("🎉 目前沒有學生有欠時數！")
+                    else:
+                        # 顯示目前有欠時的學生清單
+                        _debt_display = []
+                        for _dsid, _dhours in sorted(_all_debts_for_clear.items()):
+                            if _dhours > 0:
+                                _cls = ROSTER_DICT.get(_dsid, "未知")
+                                _note = load_student_debt_note(_dsid)
+                                _debt_display.append({
+                                    "學號": _dsid, "班級": _cls,
+                                    "欠時數": _dhours, "欠時原因": _note
+                                })
+
+                        if not _debt_display:
+                            st.success("🎉 目前沒有學生有欠時數！")
+                        else:
+                            st.caption(f"共 {len(_debt_display)} 位學生有未完成時數")
+                            _debt_ref_df = pd.DataFrame(_debt_display)
+                            st.dataframe(_debt_ref_df, hide_index=True, use_container_width=True)
+
+                            with st.form("quick_clear_form"):
+                                st.markdown("##### 選擇要銷帳的學生")
+                                _clearable_sids = [f"{d['學號']} ({d['班級']}, 欠{d['欠時數']}hr)" for d in _debt_display]
+                                _sel_clear = st.multiselect("選擇學生（可多選）", _clearable_sids, key="clear_sids")
+
+                                _c_c1, _c_c2 = st.columns(2)
+                                _clear_hours = _c_c1.number_input("銷帳時數", value=2.0, step=0.5, min_value=0.5, key="clear_hours")
+                                _clear_date = _c_c2.date_input("完成日期", today_tw, key="clear_date")
+                                _clear_reason = st.text_input(
+                                    "銷帳原因", key="clear_reason",
+                                    value=f"{str(today_tw)} 補打掃完成",
+                                    placeholder="例如：2/1 返校補掃完成"
+                                )
+
+                                if st.form_submit_button("🔓 確認銷帳"):
+                                    if not _sel_clear:
+                                        st.error("❌ 請先選擇要銷帳的學生！")
+                                    elif time.time() - st.session_state.last_action_time < 3:
+                                        st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                                    else:
+                                        st.session_state.last_action_time = time.time()
+                                        _clear_ok = 0
+                                        _clear_fail = []
+                                        for _sel_item in _sel_clear:
+                                            _c_sid = _sel_item.split(" ")[0]
+                                            try:
+                                                _cok = update_student_debt(_c_sid, -_clear_hours, _clear_reason)
+                                                if _cok:
+                                                    _clear_ok += 1
+                                                else:
+                                                    _clear_fail.append(_c_sid)
+                                            except Exception as _ce:
+                                                print(f"[銷帳] {_c_sid} 失敗: {_ce}")
+                                                _clear_fail.append(_c_sid)
+                                        if _clear_ok > 0:
+                                            st.success(f"✅ 已為 {_clear_ok} 位學生銷帳 {_clear_hours}hr！")
+                                        if _clear_fail:
+                                            st.error(f"⚠️ 以下學號銷帳失敗：{', '.join(_clear_fail)}")
+                                        if _clear_ok > 0:
+                                            time.sleep(1.5)
+                                            st.rerun()
 
                 # ── 區塊 C：🖨️ 銷過單核發 (一鍵批次) ──
                 with st.expander("🖨️ 銷過單核發 (消警告單)", expanded=True):
