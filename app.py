@@ -4576,12 +4576,27 @@ try:
                     if not _all_debts_for_clear:
                         st.success("🎉 目前沒有學生有欠時數！")
                     else:
-                        # 顯示目前有欠時的學生清單
+                        # [Fix] 一次讀取所有備註，不逐筆呼叫 load_student_debt_note（省 N-1 次 API 讀取）
+                        _all_notes_map = {}
+                        try:
+                            _ws_debts = get_worksheet(SHEET_TABS["student_debts"])
+                            if _ws_debts:
+                                for _r in _ws_debts.get_all_records():
+                                    _nsid = clean_id(str(_r.get("學號", "")))
+                                    _nnote = str(_r.get("備註", "")).strip()
+                                    if _nsid and _nnote:
+                                        if _nsid not in _all_notes_map:
+                                            _all_notes_map[_nsid] = []
+                                        if _nnote not in _all_notes_map[_nsid]:
+                                            _all_notes_map[_nsid].append(_nnote)
+                        except Exception as _ne:
+                            print(f"[quick_clear] 讀取備註失敗: {_ne}")
+
                         _debt_display = []
                         for _dsid, _dhours in sorted(_all_debts_for_clear.items()):
                             if _dhours > 0:
                                 _cls = ROSTER_DICT.get(_dsid, "未知")
-                                _note = load_student_debt_note(_dsid)
+                                _note = "；".join(_all_notes_map.get(_dsid, []))
                                 _debt_display.append({
                                     "學號": _dsid, "班級": _cls,
                                     "欠時數": _dhours, "欠時原因": _note
