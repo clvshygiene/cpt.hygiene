@@ -4569,87 +4569,95 @@ try:
                             )
 
                 # ── 區塊 B2：🔓 快速銷帳（補打掃完成） ── [Patch 14]
-                with st.expander("🔓 快速銷帳（補打掃完成）", expanded=True):
+                with st.expander("🔓 快速銷帳（補打掃完成）", expanded=False):
                     st.info("💡 學生完成補打掃後，可在此直接銷帳扣減欠時數。不需繞 Notion 愛校任務。")
 
-                    _all_debts_for_clear = load_student_debts()
-                    if not _all_debts_for_clear:
-                        st.success("🎉 目前沒有學生有欠時數！")
-                    else:
-                        # [Fix] 一次讀取所有備註，不逐筆呼叫 load_student_debt_note（省 N-1 次 API 讀取）
-                        _all_notes_map = {}
-                        try:
-                            _ws_debts = get_worksheet(SHEET_TABS["student_debts"])
-                            if _ws_debts:
-                                for _r in _ws_debts.get_all_records():
-                                    _nsid = clean_id(str(_r.get("學號", "")))
-                                    _nnote = str(_r.get("備註", "")).strip()
-                                    if _nsid and _nnote:
-                                        if _nsid not in _all_notes_map:
-                                            _all_notes_map[_nsid] = []
-                                        if _nnote not in _all_notes_map[_nsid]:
-                                            _all_notes_map[_nsid].append(_nnote)
-                        except Exception as _ne:
-                            print(f"[quick_clear] 讀取備註失敗: {_ne}")
-
-                        _debt_display = []
-                        for _dsid, _dhours in sorted(_all_debts_for_clear.items()):
-                            if _dhours > 0:
-                                _cls = ROSTER_DICT.get(_dsid, "未知")
-                                _note = "；".join(_all_notes_map.get(_dsid, []))
-                                _debt_display.append({
-                                    "學號": _dsid, "班級": _cls,
-                                    "欠時數": _dhours, "欠時原因": _note
-                                })
-
-                        if not _debt_display:
+                    if st.button("🔎 載入欠時數名單", key="btn_load_debts"):
+                        _all_debts_for_clear = load_student_debts()
+                        if not _all_debts_for_clear:
                             st.success("🎉 目前沒有學生有欠時數！")
                         else:
-                            st.caption(f"共 {len(_debt_display)} 位學生有未完成時數")
-                            _debt_ref_df = pd.DataFrame(_debt_display)
-                            st.dataframe(_debt_ref_df, hide_index=True, use_container_width=True)
+                            # [Fix] 一次讀取所有備註，不逐筆呼叫 load_student_debt_note
+                            _all_notes_map = {}
+                            try:
+                                _ws_debts = get_worksheet(SHEET_TABS["student_debts"])
+                                if _ws_debts:
+                                    for _r in _ws_debts.get_all_records():
+                                        _nsid = clean_id(str(_r.get("學號", "")))
+                                        _nnote = str(_r.get("備註", "")).strip()
+                                        if _nsid and _nnote:
+                                            if _nsid not in _all_notes_map:
+                                                _all_notes_map[_nsid] = []
+                                            if _nnote not in _all_notes_map[_nsid]:
+                                                _all_notes_map[_nsid].append(_nnote)
+                            except Exception as _ne:
+                                print(f"[quick_clear] 讀取備註失敗: {_ne}")
 
-                            with st.form("quick_clear_form"):
-                                st.markdown("##### 選擇要銷帳的學生")
-                                _clearable_sids = [f"{d['學號']} ({d['班級']}, 欠{d['欠時數']}hr)" for d in _debt_display]
-                                _sel_clear = st.multiselect("選擇學生（可多選）", _clearable_sids, key="clear_sids")
+                            _debt_display = []
+                            for _dsid, _dhours in sorted(_all_debts_for_clear.items()):
+                                if _dhours > 0:
+                                    _cls = ROSTER_DICT.get(_dsid, "未知")
+                                    _note = "；".join(_all_notes_map.get(_dsid, []))
+                                    _debt_display.append({
+                                        "學號": _dsid, "班級": _cls,
+                                        "欠時數": _dhours, "欠時原因": _note
+                                    })
 
-                                _c_c1, _c_c2 = st.columns(2)
-                                _clear_hours = _c_c1.number_input("銷帳時數", value=2.0, step=0.5, min_value=0.5, key="clear_hours")
-                                _clear_date = _c_c2.date_input("完成日期", today_tw, key="clear_date")
-                                _clear_reason = st.text_input(
-                                    "銷帳原因", key="clear_reason",
-                                    value=f"{str(today_tw)} 補打掃完成",
-                                    placeholder="例如：2/1 返校補掃完成"
-                                )
+                            if not _debt_display:
+                                st.success("🎉 目前沒有學生有欠時數！")
+                            else:
+                                st.session_state["_debt_display_cache"] = _debt_display
 
-                                if st.form_submit_button("🔓 確認銷帳"):
-                                    if not _sel_clear:
-                                        st.error("❌ 請先選擇要銷帳的學生！")
-                                    elif time.time() - st.session_state.last_action_time < 3:
-                                        st.warning("⚠️ 系統處理中，請勿連續點擊！")
-                                    else:
-                                        st.session_state.last_action_time = time.time()
-                                        _clear_ok = 0
-                                        _clear_fail = []
-                                        for _sel_item in _sel_clear:
-                                            _c_sid = _sel_item.split(" ")[0]
-                                            try:
-                                                _cok = update_student_debt(_c_sid, -_clear_hours, _clear_reason)
-                                                if _cok:
-                                                    _clear_ok += 1
-                                                else:
-                                                    _clear_fail.append(_c_sid)
-                                            except Exception as _ce:
-                                                print(f"[銷帳] {_c_sid} 失敗: {_ce}")
+                    # 從 session_state 讀取快取資料（按鈕點擊後才有）
+                    _debt_display = st.session_state.get("_debt_display_cache", [])
+                    if _debt_display:
+                        st.caption(f"共 {len(_debt_display)} 位學生有未完成時數")
+                        _debt_ref_df = pd.DataFrame(_debt_display)
+                        st.dataframe(_debt_ref_df, hide_index=True, use_container_width=True)
+
+                        with st.form("quick_clear_form"):
+                            st.markdown("##### 選擇要銷帳的學生")
+                            _clearable_sids = [f"{d['學號']} ({d['班級']}, 欠{d['欠時數']}hr)" for d in _debt_display]
+                            _sel_clear = st.multiselect("選擇學生（可多選）", _clearable_sids, key="clear_sids")
+
+                            _c_c1, _c_c2 = st.columns(2)
+                            _clear_hours = _c_c1.number_input("銷帳時數", value=2.0, step=0.5, min_value=0.5, key="clear_hours")
+                            _clear_date = _c_c2.date_input("完成日期", today_tw, key="clear_date")
+                            _clear_reason = st.text_input(
+                                "銷帳原因", key="clear_reason",
+                                value=f"{str(today_tw)} 補打掃完成",
+                                placeholder="例如：2/1 返校補掃完成"
+                            )
+
+                            if st.form_submit_button("🔓 確認銷帳"):
+                                if not _sel_clear:
+                                    st.error("❌ 請先選擇要銷帳的學生！")
+                                elif time.time() - st.session_state.last_action_time < 3:
+                                    st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                                else:
+                                    st.session_state.last_action_time = time.time()
+                                    _clear_ok = 0
+                                    _clear_fail = []
+                                    for _sel_item in _sel_clear:
+                                        _c_sid = _sel_item.split(" ")[0]
+                                        try:
+                                            _cok = update_student_debt(_c_sid, -_clear_hours, _clear_reason)
+                                            if _cok:
+                                                _clear_ok += 1
+                                            else:
                                                 _clear_fail.append(_c_sid)
-                                        if _clear_ok > 0:
-                                            st.success(f"✅ 已為 {_clear_ok} 位學生銷帳 {_clear_hours}hr！")
-                                        if _clear_fail:
-                                            st.error(f"⚠️ 以下學號銷帳失敗：{', '.join(_clear_fail)}")
-                                        if _clear_ok > 0:
-                                            time.sleep(1.5)
-                                            st.rerun()
+                                        except Exception as _ce:
+                                            print(f"[銷帳] {_c_sid} 失敗: {_ce}")
+                                            _clear_fail.append(_c_sid)
+                                    if _clear_ok > 0:
+                                        st.success(f"✅ 已為 {_clear_ok} 位學生銷帳 {_clear_hours}hr！")
+                                        # 清除快取，下次載入會重新讀取
+                                        st.session_state.pop("_debt_display_cache", None)
+                                    if _clear_fail:
+                                        st.error(f"⚠️ 以下學號銷帳失敗：{', '.join(_clear_fail)}")
+                                    if _clear_ok > 0:
+                                        time.sleep(1.5)
+                                        st.rerun()
 
                 # ── 區塊 C：🖨️ 銷過單核發 (一鍵批次) ──
                 with st.expander("🖨️ 銷過單核發 (消警告單)", expanded=True):
