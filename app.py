@@ -3833,7 +3833,6 @@ try:
                             
                             col_calc, col_refresh = st.columns([3, 1])
                             if col_refresh.button("🔄 重新讀取資料", key="refresh_export", help="若有申訴剛核可，請先點此確保資料是最新的"):
-                                load_full_semester_data_for_export.clear()
                                 load_main_data.clear()
                                 st.success("✅ 資料已刷新！")
                                 st.rerun()
