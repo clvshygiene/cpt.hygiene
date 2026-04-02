@@ -4673,6 +4673,77 @@ try:
                                         time.sleep(1.5)
                                         st.rerun()
 
+                # ── 區塊 B3：📢 欠時數提醒通知 ──
+                with st.expander("📢 欠時數提醒通知", expanded=False):
+                    st.info("💡 一鍵產生通知文字，直接複製貼到 LINE 群組。")
+
+                    if st.button("📢 產生提醒訊息", key="btn_gen_notify"):
+                        _notify_debts = load_student_debts()
+                        if not _notify_debts:
+                            st.success("🎉 目前沒有學生有欠時數！")
+                        else:
+                            # 一次讀取備註
+                            _notify_notes = {}
+                            try:
+                                _ws_nd = get_worksheet(SHEET_TABS["student_debts"])
+                                if _ws_nd:
+                                    for _r in _ws_nd.get_all_records():
+                                        _nsid = clean_id(str(_r.get("學號", "")))
+                                        _nnote = str(_r.get("備註", "")).strip()
+                                        if _nsid and _nnote:
+                                            if _nsid not in _notify_notes:
+                                                _notify_notes[_nsid] = []
+                                            if _nnote not in _notify_notes[_nsid]:
+                                                _notify_notes[_nsid].append(_nnote)
+                            except Exception:
+                                pass
+
+                            # 按班級分組
+                            _cls_groups = {}
+                            for _sid, _hrs in sorted(_notify_debts.items()):
+                                if _hrs <= 0:
+                                    continue
+                                _cls = ROSTER_DICT.get(_sid, "未知班級")
+                                if _cls not in _cls_groups:
+                                    _cls_groups[_cls] = []
+                                _note_str = "；".join(_notify_notes.get(_sid, []))
+                                _cls_groups[_cls].append((_sid, _hrs, _note_str))
+
+                            if not _cls_groups:
+                                st.success("🎉 目前沒有學生有欠時數！")
+                            else:
+                                # 產生 LINE 通知文字
+                                _lines = ["⚠️ 返校打掃欠時數提醒", ""]
+                                _total_students = 0
+                                for _cls_name in sorted(_cls_groups.keys()):
+                                    _students = _cls_groups[_cls_name]
+                                    _lines.append(f"📌 {_cls_name}")
+                                    for _sid, _hrs, _note in _students:
+                                        _note_part = f"　{_note}" if _note else ""
+                                        _lines.append(f"  • {_sid}（{_hrs:g}hr）{_note_part}")
+                                        _total_students += 1
+                                    _lines.append("")
+                                _lines.append(f"共 {_total_students} 位同學，請盡速安排補打掃。")
+                                _lines.append("逾期未完成將依規定記警告處分。")
+
+                                _notify_text = "\n".join(_lines)
+                                st.text_area("📋 複製以下文字貼到 LINE 群組", _notify_text, height=300, key="notify_text")
+                                st.caption("💡 點進文字框 → 全選 (Ctrl+A) → 複製 (Ctrl+C) → 貼到 LINE")
+
+                                # 同時產生 email 清單（供 Apps Script 使用）
+                                _email_lines = ["學號,班級,欠時數,原因"]
+                                for _cls_name in sorted(_cls_groups.keys()):
+                                    for _sid, _hrs, _note in _cls_groups[_cls_name]:
+                                        _email_lines.append(f"{_sid},{_cls_name},{_hrs:g},{_note}")
+                                _csv_text = "\n".join(_email_lines)
+                                st.download_button(
+                                    "📥 下載欠時名單 CSV（可搭配 Apps Script 寄信）",
+                                    _csv_text.encode("utf-8-sig"),
+                                    f"欠時提醒名單_{datetime.now(TW_TZ).strftime('%Y%m%d')}.csv",
+                                    "text/csv",
+                                    key="dl_notify_csv"
+                                )
+
                 # ── 區塊 C：🖨️ 銷過單核發 (一鍵批次) ──
                 with st.expander("🖨️ 銷過單核發 (消警告單)", expanded=True):
                     st.info("💡 系統自動查詢所有「愛校服務(消警告)」紀錄，一鍵產製所有學生的《愛校服務申請單》。")
