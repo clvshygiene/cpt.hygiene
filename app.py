@@ -4634,20 +4634,38 @@ try:
                                     st.session_state.last_action_time = time.time()
                                     _clear_ok = 0
                                     _clear_fail = []
+                                    _cleared_sids = []  # 收集成功銷帳的學號，用於補發服務時數
                                     for _sel_item in _sel_clear:
                                         _c_sid = _sel_item.split(" ")[0]
                                         try:
                                             _cok = update_student_debt(_c_sid, -_clear_hours, _clear_reason)
                                             if _cok:
                                                 _clear_ok += 1
+                                                _cleared_sids.append(_c_sid)
                                             else:
                                                 _clear_fail.append(_c_sid)
                                         except Exception as _ce:
                                             print(f"[銷帳] {_c_sid} 失敗: {_ce}")
                                             _clear_fail.append(_c_sid)
+
+                                    # 銷帳成功的學生同時補發服務時數
+                                    _svc_written = 0
+                                    if _cleared_sids:
+                                        try:
+                                            _svc_date = str(_clear_date)
+                                            _svc_written = _write_service_hours_direct(
+                                                "補打掃", "返校打掃(補打掃)",
+                                                _clear_hours, _cleared_sids, _svc_date
+                                            )
+                                        except Exception as _se:
+                                            print(f"[銷帳→補發時數] 失敗: {_se}")
+                                            st.warning(f"⚠️ 欠時已銷帳，但補發服務時數失敗，請手動到「服務時數發放」補發。")
+
                                     if _clear_ok > 0:
-                                        st.success(f"✅ 已為 {_clear_ok} 位學生銷帳 {_clear_hours}hr！")
-                                        # 清除快取，下次載入會重新讀取
+                                        _msg = f"✅ 已為 {_clear_ok} 位學生銷帳 {_clear_hours}hr"
+                                        if _svc_written and _svc_written > 0:
+                                            _msg += f"，並補發 {_svc_written} 筆服務時數（返校打掃(補打掃) {_clear_hours}hr）"
+                                        st.success(_msg)
                                         st.session_state.pop("_debt_display_cache", None)
                                     if _clear_fail:
                                         st.error(f"⚠️ 以下學號銷帳失敗：{', '.join(_clear_fail)}")
