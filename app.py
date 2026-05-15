@@ -67,13 +67,14 @@ try:
         "appeals": "appeals", "holidays": "holidays", "service_hours": "service_hours",
         "office_areas": "office_areas", "published_results": "published_results",
         "task_queue": "task_queue_v3",  # [Fix #3-B] 雲端佇列分頁，取代本機 SQLite task_queue 表
-        "student_debts": "student_debts", "debt_history": "debt_history"  # [新增] 愛校服務 2.0
+        "student_debts": "student_debts", "debt_history": "debt_history",  # [新增] 愛校服務 2.0
+        "class_areas": "class_areas"  # [新增] 班級 → 外掃區域 對照表
     }
 
     EXPECTED_COLUMNS = [
         "日期", "週次", "班級", "評分項目", "檢查人員",
         "內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數",
-        "備註", "違規細項", "照片路徑", "登錄時間", "修正", "晨掃未到者", "紀錄ID"
+        "備註", "違規細項", "照片路徑", "登錄時間", "修正", "紀錄ID"
     ]
     APPEAL_COLUMNS = ["申訴日期", "班級", "違規日期", "違規項目", "原始扣分", "申訴理由", "佐證照片", "處理狀態", "登錄時間", "對應紀錄ID", "審核回覆"]
 
@@ -325,6 +326,7 @@ try:
                     if tab_name == "task_queue": ws.append_row(["id", "task_type", "created_ts", "payload_json", "status", "attempts", "last_error"])
                     if tab_name == "student_debts": ws.append_row(["學號", "未完成時數", "備註"])  # [Fix 3] 補上備註欄
                     if tab_name == "debt_history": ws.append_row(["時間", "學號", "異動時數", "剩餘時數", "事由"])  # [新增] 愛校服務 2.0
+                    if tab_name == "class_areas": ws.append_row(["班級", "外掃區域"])  # [新增] 班級 → 外掃區域 對照表
                     return ws
             except Exception as e:
                 if "429" in str(e):
@@ -1484,6 +1486,26 @@ try:
         try: return {str(r.get("區域名稱", "")).strip(): str(r.get("負責班級", "")).strip() for r in ws.get_all_records() if str(r.get("區域名稱", "")).strip()}
         except Exception as e:
             print(f"[load_office_area_map] {e}")
+            return {}
+
+    # [新增] 班級 → 外掃區域 對照表 (cache 1 小時，學期內幾乎不會改)
+    @st.cache_data(ttl=3600)
+    def load_class_outer_area_map():
+        """回傳 {班級: 外掃區域} 字典。空字串或缺欄都會被略過。"""
+        ws = get_worksheet(SHEET_TABS["class_areas"])
+        if not ws:
+            return {}
+        try:
+            records = ws.get_all_records()
+            result = {}
+            for r in records:
+                cls = str(r.get("班級", "")).strip()
+                area = str(r.get("外掃區域", "")).strip()
+                if cls and area:
+                    result[cls] = area
+            return result
+        except Exception as e:
+            print(f"[load_class_outer_area_map] {e}")
             return {}
 
     @st.cache_data(ttl=21600)
@@ -2772,7 +2794,34 @@ try:
                             progress_text += "　|　✅ 今日任務全數完成！"
                         st.info(progress_text)
 
+                        # [新增] 外掃模式：顯示「班級 → 外掃區域」對照表
+                        _class_area_map = {}
+                        if role == "外掃檢查":
+                            _class_area_map = load_class_outer_area_map()
+                            _table_rows = []
+                            for _c in assigned_classes:
+                                _done = _c in completed_class_names
+                                _area = _class_area_map.get(_c, "（未設定區域，請通知管理員）")
+                                _table_rows.append({
+                                    "狀態": "✅ 已檢查" if _done else "⏳ 待檢查",
+                                    "班級": _c,
+                                    "外掃區域": _area,
+                                })
+                            if _table_rows:
+                                with st.expander("📋 今日待檢查班級 + 外掃區域", expanded=True):
+                                    st.dataframe(
+                                        pd.DataFrame(_table_rows),
+                                        hide_index=True,
+                                        width="stretch"
+                                    )
+                                    st.caption("💡 若區域顯示「未設定」，請通知管理員到 Google Sheet 的 class_areas 分頁補資料。")
+
                         sel_cls = st.radio("選擇負責班級", assigned_classes, key="m1_cls_assigned")
+
+                        # [新增] 外掃模式：點選班級後，再次提示該班外掃區域
+                        if role == "外掃檢查" and sel_cls:
+                            _sel_area = _class_area_map.get(sel_cls, "（未設定區域）")
+                            st.info(f"📍 **{sel_cls}** 外掃區域：**{_sel_area}**")
 
                         # 判斷這是不是最後一個缺少的班級
                         if sel_cls in pending_classes and len(pending_classes) == 1:
