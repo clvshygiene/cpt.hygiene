@@ -97,9 +97,9 @@ try:
     # ==========================================
     def safe_cached(ttl, default_factory):
         def decorator(inner):
-            @st.cache_data(ttl=ttl)
-            def cached(*args, **kwargs):
-                return inner(*args, **kwargs)
+            # [Fix] 直接把 @st.cache_data 套在 inner 身上，保留每個 loader 的唯一 qualname。
+            # 之前用中間 wrapper "cached" 會讓 12 個 loader 共用同一個 cache key → 災難。
+            cached = st.cache_data(ttl=ttl)(inner)
 
             def wrapper(*args, **kwargs):
                 try:
