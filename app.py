@@ -79,6 +79,41 @@ try:
     APPEAL_COLUMNS = ["申訴日期", "班級", "違規日期", "違規項目", "原始扣分", "申訴理由", "佐證照片", "處理狀態", "登錄時間", "對應紀錄ID", "審核回覆"]
 
     # ==========================================
+    # [V5.34] safe_cached：像 @st.cache_data 但「失敗結果不被 cache」
+    # ----------------------------------------------------------------
+    # 修掉「重新部署時尖峰流量打爆 API → 預設值被 cache 數小時」的雷。
+    # 規則：
+    #   - 成功（含資料 / 合法的空資料）→ 正常 cache，遵守 TTL
+    #   - 函式 raise 例外 → 不會 cache → 下次呼叫會重試
+    #   - 例外被本 wrapper 接住 → 印 log + 回傳 default_factory() 給呼叫端
+    #
+    # 用法：
+    #   @safe_cached(ttl=300, default_factory=lambda: pd.DataFrame())
+    #   def load_foo():
+    #       ws = get_worksheet(...)
+    #       if not ws: raise RuntimeError("worksheet unavailable")
+    #       # 正常邏輯，例外就讓它往外丟，不要 catch 後 return default
+    #       return result
+    # ==========================================
+    def safe_cached(ttl, default_factory):
+        def decorator(inner):
+            @st.cache_data(ttl=ttl)
+            def cached(*args, **kwargs):
+                return inner(*args, **kwargs)
+
+            def wrapper(*args, **kwargs):
+                try:
+                    return cached(*args, **kwargs)
+                except Exception as e:
+                    print(f"[safe_cached][{inner.__name__}] fallback to default: {e}")
+                    return default_factory()
+
+            wrapper.clear = cached.clear  # 保留 .clear() 介面與舊用法相容
+            wrapper.__name__ = inner.__name__
+            return wrapper
+        return decorator
+
+    # ==========================================
     # Notion API 輔助函式 
     # ==========================================
     @st.cache_resource
@@ -503,28 +538,27 @@ try:
             print(f"[pending_count] {e}")
             return 0
 
-    @st.cache_data(ttl=15)  # 15秒快取，避免管理後台每次重繪都打 Sheets API
+    @safe_cached(ttl=15, default_factory=lambda: {"pending": 0, "retry": 0, "failed": 0, "oldest_pending_sec": 0, "recent_errors": []})  # 15秒快取，避免管理後台每次重繪都打 Sheets API
     def get_queue_metrics():
         metrics = {"pending": 0, "retry": 0, "failed": 0, "oldest_pending_sec": 0, "recent_errors": []}
-        try:
-            ws = get_worksheet(SHEET_TABS["task_queue"])
-            if not ws: return metrics
-            records = ws.get_all_records()
-            for r in records:
-                s = r.get("status", "")
-                if s == "PENDING":  metrics["pending"]  += 1
-                elif s == "RETRY":  metrics["retry"]    += 1
-                elif s == "FAILED": metrics["failed"]   += 1
-            pending_recs = [r for r in records if r.get("status") in ("PENDING", "RETRY") and r.get("created_ts")]
-            if pending_recs:
-                try:
-                    oldest = min(r["created_ts"] for r in pending_recs)
-                    metrics["oldest_pending_sec"] = (datetime.now(pytz.utc) - datetime.fromisoformat(oldest.replace("Z", "+00:00"))).total_seconds()
-                except Exception: pass
-            err_recs = sorted([r for r in records if r.get("status") in ("FAILED", "RETRY") and r.get("last_error")],
-                              key=lambda x: x.get("created_ts", ""), reverse=True)[:5]
-            metrics["recent_errors"] = [(r.get("last_error"), r.get("created_ts")) for r in err_recs]
-        except Exception as e: print(f"[queue_metrics] {e}")
+        ws = get_worksheet(SHEET_TABS["task_queue"])
+        if not ws:
+            raise RuntimeError("task_queue worksheet unavailable")
+        records = ws.get_all_records()
+        for r in records:
+            s = r.get("status", "")
+            if s == "PENDING":  metrics["pending"]  += 1
+            elif s == "RETRY":  metrics["retry"]    += 1
+            elif s == "FAILED": metrics["failed"]   += 1
+        pending_recs = [r for r in records if r.get("status") in ("PENDING", "RETRY") and r.get("created_ts")]
+        if pending_recs:
+            try:
+                oldest = min(r["created_ts"] for r in pending_recs)
+                metrics["oldest_pending_sec"] = (datetime.now(pytz.utc) - datetime.fromisoformat(oldest.replace("Z", "+00:00"))).total_seconds()
+            except Exception: pass
+        err_recs = sorted([r for r in records if r.get("status") in ("FAILED", "RETRY") and r.get("last_error")],
+                          key=lambda x: x.get("created_ts", ""), reverse=True)[:5]
+        metrics["recent_errors"] = [(r.get("last_error"), r.get("created_ts")) for r in err_recs]
         return metrics
 
     def fetch_next_task(max_attempts=6):
@@ -1386,14 +1420,13 @@ try:
     # ==========================================
     # 前端資料讀取 
     # ==========================================
-    @st.cache_data(ttl=21600)
+    @safe_cached(ttl=21600, default_factory=list)
     def load_holidays():
         ws = get_worksheet(SHEET_TABS["holidays"])
-        if not ws: return []
-        try: return [pd.to_datetime(str(r.get("日期", "")).strip()).date() for r in ws.get_all_records() if str(r.get("日期", "")).strip()]
-        except Exception as e:
-            print(f"[load_holidays] {e}")
-            return []
+        if not ws:
+            raise RuntimeError("holidays worksheet unavailable")
+        # ws.get_all_records() 失敗會直接 raise，safe_cached 會接住、不快取失敗結果
+        return [pd.to_datetime(str(r.get("日期", "")).strip()).date() for r in ws.get_all_records() if str(r.get("日期", "")).strip()]
 
     def is_within_appeal_period(violation_date, appeal_days=3):
         vd = pd.to_datetime(violation_date).date() if isinstance(violation_date, str) else violation_date
@@ -1404,119 +1437,103 @@ try:
             if current_date.weekday() < 5 and current_date not in holidays: workdays += 1
         return today <= current_date
 
-    @st.cache_data(ttl=300)   # [V5.32] 5分鐘快取；尖峰時段觀看者共享同一份，TTL 到期才重讀
+    @safe_cached(ttl=300, default_factory=lambda: pd.DataFrame(columns=EXPECTED_COLUMNS))
     def load_main_data():
         # 讀取整學期 main_data，統一快取一份。
         # 需要近兩週過濾的地方在 UI 層自己用 df[df["週次"] >= now_week-2] 處理。
+        # [V5.34] 改用 safe_cached：基礎建設失敗 (worksheet None / API 失敗) 會 raise 不被快取
         ws = get_worksheet(SHEET_TABS["main"])
-        if not ws: return pd.DataFrame(columns=EXPECTED_COLUMNS)
-        try:
-            df = pd.DataFrame(ws.get_all_records())
-            if df.empty: return pd.DataFrame(columns=EXPECTED_COLUMNS)
-            if "班級" in df.columns: df["班級"] = df["班級"].astype(str).str.strip()
-            for col in EXPECTED_COLUMNS:
-                if col not in df.columns: df[col] = ""
-            if "紀錄ID" not in df.columns: df["紀錄ID"] = df.index.astype(str)
-            for col in ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數", "週次"]:
-                if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
-            if "修正" in df.columns: df["修正"] = df["修正"].astype(str).apply(lambda x: True if x.upper() == "TRUE" else False)
-            return df[EXPECTED_COLUMNS]
-        except Exception as e:
-            print(f"[load_main_data] {e}")
+        if not ws:
+            raise RuntimeError("main worksheet unavailable")
+        df = pd.DataFrame(ws.get_all_records())  # API 失敗會 raise，由 safe_cached 接手
+        if df.empty:
+            # 合法的空狀態（新學期、剛開站），允許快取
             return pd.DataFrame(columns=EXPECTED_COLUMNS)
+        if "班級" in df.columns: df["班級"] = df["班級"].astype(str).str.strip()
+        for col in EXPECTED_COLUMNS:
+            if col not in df.columns: df[col] = ""
+        if "紀錄ID" not in df.columns: df["紀錄ID"] = df.index.astype(str)
+        for col in ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分", "手機人數", "週次"]:
+            if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
+        if "修正" in df.columns: df["修正"] = df["修正"].astype(str).apply(lambda x: True if x.upper() == "TRUE" else False)
+        return df[EXPECTED_COLUMNS]
 
-    @st.cache_data(ttl=21600)
+    @safe_cached(ttl=21600, default_factory=dict)
     def load_roster_dict():
         ws = get_worksheet(SHEET_TABS["roster"])
-        if not ws: return {}
-        try:
-            df = pd.DataFrame(ws.get_all_records())
-            id_c, cls_c = next((c for c in df.columns if "學號" in c), None), next((c for c in df.columns if "班級" in c), None)
-            return {clean_id(row[id_c]): str(row[cls_c]).strip() for _, row in df.iterrows()} if id_c and cls_c else {}
-        except Exception as e:
-            print(f"[load_roster_dict] {e}")
-            return {}
+        if not ws:
+            raise RuntimeError("roster worksheet unavailable")
+        df = pd.DataFrame(ws.get_all_records())
+        id_c, cls_c = next((c for c in df.columns if "學號" in c), None), next((c for c in df.columns if "班級" in c), None)
+        return {clean_id(row[id_c]): str(row[cls_c]).strip() for _, row in df.iterrows()} if id_c and cls_c else {}
     
-    @st.cache_data(ttl=3600)
+    @safe_cached(ttl=3600, default_factory=lambda: ([], []))
     def load_sorted_classes():
         ws = get_worksheet(SHEET_TABS["roster"])
-        if not ws: return [], []
-        try:
-            records = ws.get_all_records()
-            if not records:
-                all_vals = ws.get_all_values()
-                if len(all_vals) > 1: records = [dict(zip(all_vals[0], row)) for row in all_vals[1:]]
-            df = pd.DataFrame(records)
-            class_col = next((c for c in df.columns if "班級" in str(c).strip()), None)
-            if not class_col: return [], []
-            unique = [c for c in df[class_col].astype(str).str.strip().unique().tolist() if c]
-            dept_order = {"商": 1, "英": 2, "資": 3, "家": 4, "服": 5}
-            cls_order  = {"甲": 1, "乙": 2, "丙": 3, "丁": 4}
-            def get_sort_key(n):
-                g   = 1 if "一" in n or "1" in n else (2 if "二" in n or "2" in n else (3 if "三" in n or "3" in n else 99))
-                dep = next((v for k, v in dept_order.items() if k in n), 99)
-                cls = next((v for k, v in cls_order.items()  if k in n), 99)
-                return (g, dep, cls)
-            sorted_all = sorted(unique, key=get_sort_key)
-            return sorted_all, [{"grade": f"{get_sort_key(c)[0]}年級" if get_sort_key(c)[0]!=99 else "其他", "name": c} for c in sorted_all]
-        except Exception as e:
-            print(f"[load_sorted_classes] {e}")
-            return [], []
+        if not ws:
+            raise RuntimeError("roster worksheet unavailable")
+        records = ws.get_all_records()
+        if not records:
+            all_vals = ws.get_all_values()
+            if len(all_vals) > 1: records = [dict(zip(all_vals[0], row)) for row in all_vals[1:]]
+        df = pd.DataFrame(records)
+        class_col = next((c for c in df.columns if "班級" in str(c).strip()), None)
+        if not class_col: return [], []
+        unique = [c for c in df[class_col].astype(str).str.strip().unique().tolist() if c]
+        dept_order = {"商": 1, "英": 2, "資": 3, "家": 4, "服": 5}
+        cls_order  = {"甲": 1, "乙": 2, "丙": 3, "丁": 4}
+        def get_sort_key(n):
+            g   = 1 if "一" in n or "1" in n else (2 if "二" in n or "2" in n else (3 if "三" in n or "3" in n else 99))
+            dep = next((v for k, v in dept_order.items() if k in n), 99)
+            cls = next((v for k, v in cls_order.items()  if k in n), 99)
+            return (g, dep, cls)
+        sorted_all = sorted(unique, key=get_sort_key)
+        return sorted_all, [{"grade": f"{get_sort_key(c)[0]}年級" if get_sort_key(c)[0]!=99 else "其他", "name": c} for c in sorted_all]
 
-    @st.cache_data(ttl=300)   # [效能] 5分鐘，尖峰時段不必每分鐘重打
+    @safe_cached(ttl=300, default_factory=lambda: (pd.DataFrame(), "error"))   # [效能] 5分鐘，尖峰時段不必每分鐘重打
     def get_daily_duty(target_date):
         ws = get_worksheet(SHEET_TABS["duty"])
-        if not ws: return pd.DataFrame(), "error"
-        try:
-            df = pd.DataFrame(ws.get_all_records())
-            if df.empty: return pd.DataFrame(), "no_data"
-            date_col = next((c for c in df.columns if "日期" in c), None)
-            if date_col:
-                df[date_col] = pd.to_datetime(df[date_col], errors='coerce').dt.date
-                return df[df[date_col] == (target_date if isinstance(target_date, date) else target_date.date())], "success"
-            return pd.DataFrame(), "missing_cols"
-        except Exception as e:
-            print(f"[get_daily_duty] {e}")
-            return pd.DataFrame(), "error"
+        if not ws:
+            raise RuntimeError("duty worksheet unavailable")
+        df = pd.DataFrame(ws.get_all_records())
+        if df.empty: return pd.DataFrame(), "no_data"
+        date_col = next((c for c in df.columns if "日期" in c), None)
+        if date_col:
+            df[date_col] = pd.to_datetime(df[date_col], errors='coerce').dt.date
+            return df[df[date_col] == (target_date if isinstance(target_date, date) else target_date.date())], "success"
+        return pd.DataFrame(), "missing_cols"
 
-    @st.cache_data(ttl=3600)
+    @safe_cached(ttl=3600, default_factory=dict)
     def load_office_area_map():
         ws = get_worksheet(SHEET_TABS["office_areas"])
-        if not ws: return {}
-        try: return {str(r.get("區域名稱", "")).strip(): str(r.get("負責班級", "")).strip() for r in ws.get_all_records() if str(r.get("區域名稱", "")).strip()}
-        except Exception as e:
-            print(f"[load_office_area_map] {e}")
-            return {}
+        if not ws:
+            raise RuntimeError("office_areas worksheet unavailable")
+        return {str(r.get("區域名稱", "")).strip(): str(r.get("負責班級", "")).strip() for r in ws.get_all_records() if str(r.get("區域名稱", "")).strip()}
 
     # [新增] 班級 → 外掃區域 對照表 (cache 1 小時，學期內幾乎不會改)
-    @st.cache_data(ttl=3600)
+    @safe_cached(ttl=3600, default_factory=dict)
     def load_class_outer_area_map():
         """回傳 {班級: 外掃區域} 字典。空字串或缺欄都會被略過。"""
         ws = get_worksheet(SHEET_TABS["class_areas"])
         if not ws:
-            return {}
-        try:
-            records = ws.get_all_records()
-            result = {}
-            for r in records:
-                cls = str(r.get("班級", "")).strip()
-                area = str(r.get("外掃區域", "")).strip()
-                if cls and area:
-                    result[cls] = area
-            return result
-        except Exception as e:
-            print(f"[load_class_outer_area_map] {e}")
-            return {}
+            raise RuntimeError("class_areas worksheet unavailable")
+        records = ws.get_all_records()
+        result = {}
+        for r in records:
+            cls = str(r.get("班級", "")).strip()
+            area = str(r.get("外掃區域", "")).strip()
+            if cls and area:
+                result[cls] = area
+        return result
 
-    @st.cache_data(ttl=21600)
+    @safe_cached(ttl=21600, default_factory=lambda: {"semester_start": "2025-08-25", "standard_n": 4})
     def load_settings():
         ws = get_worksheet(SHEET_TABS["settings"])
+        if not ws:
+            raise RuntimeError("settings worksheet unavailable")
         config = {"semester_start": "2025-08-25", "standard_n": 4}
-        if ws:
-            try:
-                for row in ws.get_all_values():
-                    if len(row)>=2: config[row[0]] = int(row[1]) if row[0] == "standard_n" else row[1]
-            except Exception as e: print(f"[load_settings] {e}")
+        for row in ws.get_all_values():
+            if len(row)>=2: config[row[0]] = int(row[1]) if row[0] == "standard_n" else row[1]
         return config
 
     def save_setting(key, val):
@@ -1535,18 +1552,15 @@ try:
                 return False
         return False
 
-    @st.cache_data(ttl=300)   # [效能] 5分鐘，申訴資料不需秒級更新
+    @safe_cached(ttl=300, default_factory=lambda: pd.DataFrame(columns=APPEAL_COLUMNS))   # [效能] 5分鐘，申訴資料不需秒級更新
     def load_appeals():
         ws = get_worksheet(SHEET_TABS["appeals"])
-        if not ws: return pd.DataFrame(columns=APPEAL_COLUMNS)
-        try:
-            df = pd.DataFrame(ws.get_all_records())
-            for col in APPEAL_COLUMNS:
-                if col not in df.columns: df[col] = "待處理" if col == "處理狀態" else ""
-            return df[APPEAL_COLUMNS]
-        except Exception as e:
-            print(f"[load_appeals] {e}")
-            return pd.DataFrame(columns=APPEAL_COLUMNS)
+        if not ws:
+            raise RuntimeError("appeals worksheet unavailable")
+        df = pd.DataFrame(ws.get_all_records())
+        for col in APPEAL_COLUMNS:
+            if col not in df.columns: df[col] = "待處理" if col == "處理狀態" else ""
+        return df[APPEAL_COLUMNS]
 
     # [新增] 愛校服務 2.0：欠時資料存取函式 =====================
     def load_student_debts():
@@ -1977,21 +1991,18 @@ try:
 
     PUBLISHED_COLS = ["週次", "排名", "年級", "班級", "總扣分", "優良次數", "總成績", "評等", "排名模式", "發布時間"]
 
-    @st.cache_data(ttl=300)   # [效能] 5分鐘快取，發布後學生很快就看得到
+    @safe_cached(ttl=300, default_factory=lambda: pd.DataFrame(columns=PUBLISHED_COLS))   # [效能] 5分鐘快取，發布後學生很快就看得到
     def load_published_results():
         ws = get_worksheet(SHEET_TABS["published_results"])
-        if not ws: return pd.DataFrame(columns=PUBLISHED_COLS)
-        try:
-            df = pd.DataFrame(ws.get_all_records())
-            if df.empty: return pd.DataFrame(columns=PUBLISHED_COLS)
-            for col in PUBLISHED_COLS:
-                if col not in df.columns: df[col] = ""
-            for col in ["週次", "排名", "總扣分", "優良次數", "總成績"]:
-                if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-            return df
-        except Exception as e:
-            print(f"[load_published_results] {e}")
-            return pd.DataFrame(columns=PUBLISHED_COLS)
+        if not ws:
+            raise RuntimeError("published_results worksheet unavailable")
+        df = pd.DataFrame(ws.get_all_records())
+        if df.empty: return pd.DataFrame(columns=PUBLISHED_COLS)
+        for col in PUBLISHED_COLS:
+            if col not in df.columns: df[col] = ""
+        for col in ["週次", "排名", "總扣分", "優良次數", "總成績"]:
+            if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+        return df
 
     def publish_week_results(week_num, fin_ranked_df, rank_mode="全校"):
         """將計算好的週次排名寫入 published_results sheet，同一週再發布會覆蓋舊資料"""
@@ -2085,48 +2096,46 @@ try:
             return True
         except Exception as e: st.error(f"刪除失敗: {e}"); return False
 
-    @st.cache_data(ttl=21600)
+    _INSPECTOR_DEFAULT = [{"label": "測試人員", "allowed_roles": ["內掃檢查"], "assigned_classes": [], "id_prefix": "測", "raw_role": "內掃"}]
+
+    @safe_cached(ttl=21600, default_factory=lambda: list(_INSPECTOR_DEFAULT))
     def load_inspector_list():
         ws = get_worksheet(SHEET_TABS["inspectors"])
-        default = [{"label": "測試人員", "allowed_roles": ["內掃檢查"], "assigned_classes": [], "id_prefix": "測", "raw_role": "內掃"}]
-        if not ws: return default
-        try:
-            df = pd.DataFrame(ws.get_all_records())
-            if df.empty: return default
-            inspectors, id_c, r_c, s_c = [], next((c for c in df.columns if "學號" in c or "編號" in c), None), next((c for c in df.columns if "負責" in c or "項目" in c), None), next((c for c in df.columns if "班級" in c or "範圍" in c), None)
-            if id_c:
-                for _, row in df.iterrows():
-                    sid, s_role = clean_id(row[id_c]), str(row[r_c]).strip() if r_c else ""
+        if not ws:
+            raise RuntimeError("inspectors worksheet unavailable")
+        df = pd.DataFrame(ws.get_all_records())
+        if df.empty: return list(_INSPECTOR_DEFAULT)
+        inspectors, id_c, r_c, s_c = [], next((c for c in df.columns if "學號" in c or "編號" in c), None), next((c for c in df.columns if "負責" in c or "項目" in c), None), next((c for c in df.columns if "班級" in c or "範圍" in c), None)
+        if id_c:
+            for _, row in df.iterrows():
+                sid, s_role = clean_id(row[id_c]), str(row[r_c]).strip() if r_c else ""
+                
+                allowed = []
+                if "組長" in s_role:
+                    allowed = ["內掃檢查", "外掃檢查", "垃圾/回收檢查", "晨間打掃"]
+                else:
+                    if "外掃" in s_role: allowed.append("外掃檢查")
+                    if "垃圾" in s_role or "回收" in s_role: allowed.append("垃圾/回收檢查")
+                    if "晨" in s_role: allowed.append("晨間打掃")
+                    if "內掃" in s_role: allowed.append("內掃檢查")
                     
-                    allowed = []
-                    if "組長" in s_role:
-                        allowed = ["內掃檢查", "外掃檢查", "垃圾/回收檢查", "晨間打掃"]
-                    else:
-                        if "外掃" in s_role: allowed.append("外掃檢查")
-                        if "垃圾" in s_role or "回收" in s_role: allowed.append("垃圾/回收檢查")
-                        if "晨" in s_role: allowed.append("晨間打掃")
-                        if "內掃" in s_role: allowed.append("內掃檢查")
+                    if "衛生糾察隊長" in s_role or "機動" in s_role:
+                        allowed = [r for r in allowed if r != "垃圾/回收檢查"]
+                        if not allowed: allowed = ["內掃檢查", "外掃檢查"]
+                    elif "環保糾察隊長" in s_role:
+                        allowed = [r for r in allowed if r not in ["內掃檢查", "外掃檢查"]]
+                        if "垃圾/回收檢查" not in allowed: allowed.append("垃圾/回收檢查")
                         
-                        if "衛生糾察隊長" in s_role or "機動" in s_role:
-                            allowed = [r for r in allowed if r != "垃圾/回收檢查"]
-                            if not allowed: allowed = ["內掃檢查", "外掃檢查"]
-                        elif "環保糾察隊長" in s_role:
-                            allowed = [r for r in allowed if r not in ["內掃檢查", "外掃檢查"]]
-                            if "垃圾/回收檢查" not in allowed: allowed.append("垃圾/回收檢查")
-                            
-                        if not allowed: allowed = ["內掃檢查"]
+                    if not allowed: allowed = ["內掃檢查"]
 
-                    s_classes = [c.strip() for c in str(row[s_c]).replace("、", ";").replace(",", ";").split(";") if c.strip()] if s_c and str(row[s_c]) else []
-                    
-                    inspectors.append({
-                        "label": f"學號: {sid}", "allowed_roles": allowed, 
-                        "assigned_classes": s_classes, "id_prefix": sid[0] if sid else "X",
-                        "raw_role": s_role
-                    })
-            return inspectors or default
-        except Exception as e:
-            print(f"[load_inspector_list] {e}")
-            return default
+                s_classes = [c.strip() for c in str(row[s_c]).replace("、", ";").replace(",", ";").split(";") if c.strip()] if s_c and str(row[s_c]) else []
+                
+                inspectors.append({
+                    "label": f"學號: {sid}", "allowed_roles": allowed, 
+                    "assigned_classes": s_classes, "id_prefix": sid[0] if sid else "X",
+                    "raw_role": s_role
+                })
+        return inspectors or list(_INSPECTOR_DEFAULT)
 
     def check_duplicate_record(df, check_date, inspector, role, target_class=None):
         if df.empty: return False
