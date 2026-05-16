@@ -952,7 +952,7 @@ try:
                 # [V5.28] 根據參數決定是否發放時數 (預設發放，以防其他地方使用)
                 if "學號:" in inspector_name and payload.get("award_inspector_hours", True):
                     sid = inspector_name.split("學號:")[1].strip()
-                    _append_service_row_unique({"日期": entry.get("日期"), "學號": sid, "班級": "", "類別": "整潔評分糾察", "時數": 0.25, "紀錄ID": uuid.uuid4().hex[:8]})
+                    _append_service_row_unique({"日期": entry.get("日期"), "學號": sid, "班級": "糾察隊", "類別": "整潔評分糾察", "時數": 0.25, "紀錄ID": uuid.uuid4().hex[:8]})
 
                 if task_type == "volunteer_report":
                     # [Fix #3] volunteer_report 多名學生的時數改為批次寫入（1 次 append_rows）
@@ -2252,7 +2252,18 @@ try:
     # ==========================================
     now_tw = datetime.now(TW_TZ)
     today_tw = now_tw.date()
-    
+
+    # [V5.35] 未來日期防呆 helper
+    # 解決 Streamlit date_input + key 會把選過的日期記在 session_state，
+    # 導致使用者下次回到該頁時，畫面上日期還停在舊值（可能是未來日期）就送出 → 寫入錯誤日期
+    def _block_future_date(d, label="日期"):
+        """檢查 d 是否大於今天（台灣時區）。是 → st.error + 回傳 True；否 → 回傳 False。
+        呼叫端用 `if _block_future_date(d, '出勤日期'): return` 來阻擋送出。"""
+        if d and d > today_tw:
+            st.error(f"⛔ 「{label}」不能是未來日期（{d}）！請改回今天（{today_tw}）或更早，否則無法送出。")
+            return True
+        return False
+
     if "last_action_time" not in st.session_state:
         st.session_state.last_action_time = 0
     
@@ -2670,6 +2681,8 @@ try:
                 st.markdown("---")
                 c_d, c_r = st.columns(2)
                 input_date = c_d.date_input("檢查日期", today_tw)
+                if _block_future_date(input_date, "檢查日期"):
+                    st.stop()
                 role = c_r.radio("檢查項目", allowed_roles, horizontal=True, key="m1_role_radio") if len(allowed_roles)>1 else allowed_roles[0]
                 week_num = get_week_num(input_date)
                 main_df = load_main_data()
@@ -3589,7 +3602,9 @@ try:
                         st.write(f"✅ 預計發放對象：共 {len(present_insps)} 人 (每人 0.25 小時)")
                         
                         if st.form_submit_button("🚀 發放環保糾察時數"):
-                            if time.time() - st.session_state.last_action_time < 3:
+                            if _block_future_date(rc_date, "出勤日期"):
+                                pass  # 未來日期被擋下，不繼續
+                            elif time.time() - st.session_state.last_action_time < 3:
                                 st.warning("⚠️ 系統處理中，請勿連續點擊！")
                             else:
                                 st.session_state.last_action_time = time.time()
@@ -4248,6 +4263,8 @@ try:
                 SVC_CATEGORIES = ["返校打掃", "校外服務", "社區服務", "班級義工", "其他（手動輸入）"]
                 c_s1, c_s2 = st.columns(2)
                 rd = c_s1.date_input("日期", today_tw, key="svc_date")
+                if _block_future_date(rd, "服務時數發放日期"):
+                    st.stop()
                 sel_cat = c_s2.selectbox("活動類別", SVC_CATEGORIES, key="svc_cat")
 
                 if sel_cat == "其他（手動輸入）":
@@ -4261,7 +4278,11 @@ try:
                 final_category = f"{base_category}｜{remark_input.strip()}" if remark_input.strip() else base_category
 
                 st.markdown("---")
-                target_mode = st.radio("發放對象模式", ["🏫 班級模式", "🔢 直接輸入學號"], horizontal=True, key="svc_mode")
+                target_mode = st.radio(
+                    "發放對象模式",
+                    ["🏫 班級模式", "🔢 直接輸入學號", "👮 衛生糾察隊全員", "🗑️ 資源回收糾察隊全員"],
+                    horizontal=True, key="svc_mode"
+                )
                 st.markdown("")
 
                 # ── 班級模式 ──
@@ -4428,7 +4449,7 @@ try:
                                             st.rerun()
 
                 # ── 直接輸入學號模式 ──
-                else:
+                elif target_mode == "🔢 直接輸入學號":
                     raw_sid_input = st.text_area(
                         "輸入學號（每行一個，或用逗號分隔）",
                         key="svc_sid_raw",
@@ -4498,6 +4519,89 @@ try:
                                     st.success(f"✅ 已為 {len(valid_ids)} 位同學發放 {hours_sid}h 服務時數！")
                                     time.sleep(1.5)
                                     st.rerun()
+
+                # ── [V5.35] 衛生糾察隊全員 / 資源回收糾察隊全員 模式 ──
+                elif target_mode in ("👮 衛生糾察隊全員", "🗑️ 資源回收糾察隊全員"):
+                    _is_trash_team = (target_mode == "🗑️ 資源回收糾察隊全員")
+                    _team_label = "資源回收糾察" if _is_trash_team else "衛生糾察"
+                    _team_emoji = "🗑️" if _is_trash_team else "👮"
+                    _key_suffix = "trash" if _is_trash_team else "clean"
+
+                    # 篩選名單（參照第 3578 行環保點名同樣邏輯）
+                    if _is_trash_team:
+                        _team_inspectors = [
+                            p for p in INSPECTOR_LIST
+                            if any(k in p.get("raw_role", "") for k in ["垃圾", "回收", "環保"])
+                        ]
+                    else:
+                        _team_inspectors = [
+                            p for p in INSPECTOR_LIST
+                            if any(k in p.get("raw_role", "") for k in ["內掃", "外掃", "組長", "機動", "衛生糾察"])
+                        ]
+
+                    _team_labels = [p["label"] for p in _team_inspectors]
+
+                    if not _team_labels:
+                        st.warning(f"⚠️ 目前 inspectors 名單中沒有「{_team_label}」的人員，無法發放。")
+                    else:
+                        st.info(
+                            f"📋 {_team_emoji} **{_team_label}隊**共 **{len(_team_labels)}** 人。"
+                            f"請勾選**未到 / 請假**的同學，其餘預設視為出席。"
+                        )
+
+                        with st.form(f"svc_team_form_{_key_suffix}"):
+                            _absent_team = st.multiselect(
+                                "❌ 未到 / 請假名單（扣除法）",
+                                _team_labels,
+                                key=f"svc_team_absent_{_key_suffix}"
+                            )
+                            _present_team = [n for n in _team_labels if n not in _absent_team]
+
+                            st.markdown(f"✅ **預計發放對象：共 {len(_present_team)} 人**")
+                            if _present_team:
+                                with st.expander("查看預計發放對象名單", expanded=False):
+                                    st.write("、".join(_present_team))
+
+                            _team_hours = st.number_input(
+                                "時數（全體統一）", value=2.0, step=0.5, min_value=0.0,
+                                key=f"svc_team_h_{_key_suffix}"
+                            )
+
+                            st.caption(
+                                f"💡 將寫入 service_hours：班級＝「糾察隊」、類別＝「**{final_category}**」（沿用上方類別設定）。"
+                                f"系統會自動阻擋同一天同類別的重複發放。"
+                            )
+
+                            if st.form_submit_button(f"🚀 發放 {_team_emoji} {_team_label}隊時數"):
+                                if _block_future_date(rd, "服務時數發放日期"):
+                                    pass  # 未來日期被擋
+                                elif time.time() - st.session_state.last_action_time < 3:
+                                    st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                                elif not _present_team:
+                                    st.error("❌ 發放名單為空，請確認名單設定！")
+                                else:
+                                    st.session_state.last_action_time = time.time()
+                                    _present_ids = [
+                                        n.split("學號:")[1].strip()
+                                        for n in _present_team if "學號:" in n
+                                    ]
+                                    if _present_ids:
+                                        _payload = {
+                                            "student_list": _present_ids,
+                                            "date": str(rd),
+                                            "class_name": "糾察隊",
+                                            "category": final_category,
+                                            "hours": _team_hours,
+                                        }
+                                        enqueue_task("service_hours_only", _payload)
+                                        st.success(
+                                            f"✅ 已排程發放 {len(_present_ids)} 位 {_team_label} 各 {_team_hours}h 時數！"
+                                            f"（類別：{final_category}）"
+                                        )
+                                        time.sleep(1.5)
+                                        st.rerun()
+                                    else:
+                                        st.warning("沒有可發放時數的對象")
 
             # [Fix] _strip_notion_invisible / _parse_claimant_tag 已移至全域定義（約 line 674），
             # Worker 與 Admin UI 共用，不再重複定義。
@@ -4684,7 +4788,9 @@ try:
                             )
 
                             if st.form_submit_button("🔓 確認銷帳"):
-                                if not _sel_clear:
+                                if _block_future_date(_clear_date, "完成日期"):
+                                    pass  # 未來日期被擋下
+                                elif not _sel_clear:
                                     st.error("❌ 請先選擇要銷帳的學生！")
                                 elif time.time() - st.session_state.last_action_time < 3:
                                     st.warning("⚠️ 系統處理中，請勿連續點擊！")
@@ -5006,6 +5112,8 @@ try:
 
                     _rc1, _rc2 = st.columns(2)
                     _rc_date = _rc1.date_input("服務日期", today_tw, key="rc_fix_date")
+                    if _block_future_date(_rc_date, "服務日期"):
+                        st.stop()
                     _rc_hours = _rc2.number_input("服務時數", value=1.0, step=0.5, min_value=0.5, key="rc_fix_hours")
                     _rc_work = st.text_input("工作內容", key="rc_fix_work", placeholder="例如：校園清潔、廁所打掃")
                     _rc_time_start = st.text_input("起始時間（選填，格式 HH:MM）", key="rc_fix_time", placeholder="例如: 15:50")
