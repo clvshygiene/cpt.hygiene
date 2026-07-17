@@ -3537,9 +3537,9 @@ try:
                     st.code("\n".join(reversed(list(_WORKER_LOG))), language=None)
             st.divider()
 
-            t_mon, t_rollcall, t4, t_appeal, t_excellent, t2, t1, t_settings, t3, t_debt = st.tabs([
-                "👀 衛生糾察", "👮 環保糾察", "📝 扣分明細", "📣 申訴", "⭐ 優良審核", "📊 成績總表", 
-                "🧹 晨掃審核", "⚙️ 設定", "🎖️ 服務時數發放", "🤝 愛校與欠時管理"  # [新增] 愛校服務 2.0
+            t_mon, t_hyg_rc, t_rollcall, t4, t_appeal, t_excellent, t2, t1, t_settings, t3, t_debt = st.tabs([
+                "👀 衛生糾察", "🙋 衛生點名", "👮 環保糾察", "📝 扣分明細", "📣 申訴", "⭐ 優良審核", "📊 成績總表", 
+                "🧹 晨掃審核", "⚙️ 設定", "🎖️ 服務時數發放", "🤝 愛校與欠時管理"  # [新增] 愛校服務 2.0 / [V6] 衛生點名
             ])
             
             with t_mon:
@@ -3582,13 +3582,80 @@ try:
                         for p in missing_mob: st.warning(f"⚠️ {p['name']} \n ({p['role_desc']})")
                     else: st.success("🎉 全員完成！")
 
+            with t_hyg_rc:
+                # [V6 新增] 衛生糾察出勤點名：出勤與評分紀錄脫鉤，以現場點名為準
+                st.subheader("🙋 衛生糾察出勤點名")
+                st.info("💡 說明：衛生糾察每天全員應勤（機動人員除外）。一般糾察採【扣除法】勾缺席者；機動人員採【加入法】勾有到者。送出即發放當日時數。")
+
+                hyg_rc_date = st.date_input("出勤日期", today_tw, key="hyg_rc_date")
+                hyg_rc_hours = st.number_input("每人發放時數 (小時)", min_value=0.0, max_value=8.0, value=0.25, step=0.25, key="hyg_rc_hours")
+
+                def _is_hyg_member(p):
+                    r = p.get("raw_role", "")
+                    if "組長" in r or "環保" in r:
+                        return False
+                    return any(x in r for x in ["內掃", "外掃", "機動", "隊長"])
+
+                _hyg_all = [p for p in INSPECTOR_LIST if _is_hyg_member(p)]
+                _hyg_regular = [p for p in _hyg_all if "機動" not in p.get("raw_role", "")]
+                _hyg_mobile = [p for p in _hyg_all if "機動" in p.get("raw_role", "")]
+                reg_names = [p["label"] for p in _hyg_regular]
+                mob_names = [p["label"] for p in _hyg_mobile]
+
+                if not reg_names and not mob_names:
+                    st.warning("⚠️ 目前名單中沒有衛生糾察成員，請確認 inspectors 分頁的「負責項目」欄位。")
+                else:
+                    with st.form("hyg_rc_form"):
+                        st.write(f"📋 每日應勤名單共 {len(reg_names)} 人")
+                        hyg_absent = st.multiselect("❌ 勾選【請假 / 未到】的糾察 (扣除法)", reg_names)
+                        hyg_present_reg = [n for n in reg_names if n not in hyg_absent]
+
+                        hyg_present_mob = []
+                        if mob_names:
+                            hyg_present_mob = st.multiselect("🟠 機動人員【今日有出勤】者 (加入法)", mob_names)
+
+                        _hyg_final = hyg_present_reg + hyg_present_mob
+                        st.write(f"✅ 預計發放對象：共 {len(_hyg_final)} 人 (每人 {hyg_rc_hours} 小時)")
+
+                        if st.form_submit_button("🚀 發放衛生糾察時數"):
+                            if _block_future_date(hyg_rc_date, "出勤日期"):
+                                pass  # 未來日期被擋下，不繼續
+                            elif time.time() - st.session_state.last_action_time < 3:
+                                st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                            else:
+                                st.session_state.last_action_time = time.time()
+                                hyg_ids = [name.split("學號:")[1].strip() for name in _hyg_final if "學號:" in name]
+                                if hyg_ids:
+                                    payload = {
+                                        "student_list": hyg_ids,
+                                        "date": str(hyg_rc_date),
+                                        "class_name": "糾察隊",
+                                        "category": "衛生糾察值勤",
+                                        "hours": float(hyg_rc_hours)
+                                    }
+                                    enqueue_task("service_hours_only", payload)
+                                    st.success(f"✅ 已排程發放 {len(hyg_ids)} 人的出勤時數！(系統會自動阻擋同一天的重複發放)")
+                                    time.sleep(1.5)
+                                    st.rerun()
+                                else:
+                                    st.warning("沒有可發放時數的對象")
+
             with t_rollcall:
                 st.subheader("👮 環保糾察 (資收場) 出勤點名")
-                st.info("💡 說明：此區專為資收場的環保糾察設計。勾選沒來的人，系統會自動幫有來的人發放 0.25 小時。")
+                st.info("💡 說明：此區專為資收場的環保糾察設計。先選班別，再勾選沒來的人，系統會自動幫有來的人發放時數。")
                 
                 rc_date = st.date_input("出勤日期", today_tw, key="insp_rc_date")
+                # [V6 新增] 環保糾察拆分中午班 / 下午班，兩班人員不同、分別點名
+                rc_shift = st.radio("點名班別", ["🕛 中午班 (資收場整理)", "🕒 下午班 (垃圾管制)"], horizontal=True, key="insp_rc_shift")
+                shift_tag = "中午" if "中午" in rc_shift else "下午"
+                rc_hours = st.number_input("每人發放時數 (小時)", min_value=0.0, max_value=8.0, value=0.25, step=0.25, key="insp_rc_hours")
                 
                 trash_inspectors = [p for p in INSPECTOR_LIST if "垃圾" in p.get("raw_role", "") or "回收" in p.get("raw_role", "") or "環保" in p.get("raw_role", "")]
+                _shift_tagged = [p for p in trash_inspectors if shift_tag in p.get("raw_role", "")]
+                if _shift_tagged:
+                    trash_inspectors = _shift_tagged
+                else:
+                    st.warning(f"⚠️ 名單中沒有人標註「{shift_tag}」班別，目前顯示全部環保糾察。建議至 Google Sheet 的 inspectors 分頁，在「負責項目」欄加註「中午」或「下午」，即可自動分班。")
                 insp_names = [p["label"] for p in trash_inspectors]
                 
                 if not insp_names:
@@ -3599,7 +3666,7 @@ try:
                         absent_insps = st.multiselect("❌ 勾選【請假 / 未到】的糾察 (扣除法)", insp_names)
                         present_insps = [n for n in insp_names if n not in absent_insps]
                         
-                        st.write(f"✅ 預計發放對象：共 {len(present_insps)} 人 (每人 0.25 小時)")
+                        st.write(f"✅ 預計發放對象：共 {len(present_insps)} 人 (每人 {rc_hours} 小時)")
                         
                         if st.form_submit_button("🚀 發放環保糾察時數"):
                             if _block_future_date(rc_date, "出勤日期"):
@@ -3614,8 +3681,8 @@ try:
                                         "student_list": present_ids,
                                         "date": str(rc_date),
                                         "class_name": "糾察隊",
-                                        "category": "資源回收糾察",
-                                        "hours": 0.25
+                                        "category": f"資源回收糾察({shift_tag})",  # [V6] 班別入類別，同日兩班可各自發放
+                                        "hours": float(rc_hours)
                                     }
                                     enqueue_task("service_hours_only", payload)
                                     st.success(f"✅ 已排程發放 {len(present_ids)} 人的出勤時數！(系統會自動阻擋同一天的重複發放)")
