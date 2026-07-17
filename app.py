@@ -2940,9 +2940,9 @@ try:
                             elif check_result == "✅ 普通":
                                 st.markdown("**📝 備註（選填）**")
                                 normal_note_form = st.text_input("可填寫備註，例如：掃得不夠乾淨但未達扣分標準，下次請加強", key="m1_normal_note_form")
-                            # [照片強制上傳] 三種結果都需附照，防止隨意亂評
-                            st.info("📸 請先用手機相機拍好照片存到相簿，再從下方選取上傳。（優良/普通/違規均需附照）")
-                            files = st.file_uploader("選取照片", accept_multiple_files=True, type=['jpg','png','jpeg'])
+                            # [V6 照片脫鉤] 照片改上傳至糾察社群群組，系統端不再收照片，送出秒完成
+                            st.info("📸 照片請上傳至【糾察社群群組】：無論髒或乾淨都要拍照（註明掃區＋日期），以示負責。系統端不需附照，送出更快！")
+                            files = None  # [V6] 系統端不再上傳照片，save_entry 收到 None 即略過 Drive 上傳
 
                             if st.form_submit_button("送出"):
                                 # [Patch 11] 三層防重複提交：
@@ -2954,8 +2954,6 @@ try:
                                     st.warning("⚠️ 此筆已送出，請勿重複提交！若需修正請使用修正單。")
                                 elif time.time() - st.session_state.last_action_time < 5:
                                     st.warning("⚠️ 系統處理中，請稍候 5 秒再試！")
-                                elif not files:
-                                    st.error("❌ 請先上傳現場照片才能送出！（優良/普通也需要附照）")
                                 else:
                                     # [關鍵] 先標記、再執行 — 防止 Streamlit 雙重 rerun 競爭
                                     st.session_state.submitted_inspections.add(_submit_key)
@@ -2968,17 +2966,17 @@ try:
                                         except Exception:
                                             _exc_note = ""
                                         _note_text = f"優良原因：{_exc_note}" if _exc_note else "本次檢查表現優良，無扣分項目（待組長審核）"
-                                        _save_ok = save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(待審優良)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": _note_text}, uploaded_files=files, award_inspector_hours=is_last_task)
+                                        _save_ok = save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(待審優良)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": _note_text}, uploaded_files=files, award_inspector_hours=False)  # [V6] 時數改由「衛生點名」發放，評分不再自動給時數
                                     elif check_result == "✅ 普通":
                                         try:
                                             _norm_note = normal_note_form.strip() if normal_note_form else ""
                                         except Exception:
                                             _norm_note = ""
                                         _norm_note_text = _norm_note if _norm_note else "本次檢查無扣分，表現普通"
-                                        _save_ok = save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(普通)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": _norm_note_text}, uploaded_files=files, award_inspector_hours=is_last_task)
+                                        _save_ok = save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role + "(普通)", "內掃原始分": 0, "外掃原始分": 0, "垃圾原始分": 0, "垃圾內掃原始分": 0, "垃圾外掃原始分": 0, "手機人數": 0, "備註": _norm_note_text}, uploaded_files=files, award_inspector_hours=False)  # [V6] 時數改由「衛生點名」發放，評分不再自動給時數
                                     elif check_result == "❌ 違規(需扣分)":
                                         _deduct_note = (f"【警告，扣0分】{note}".strip()) if (in_s + out_s) == 0 else note
-                                        _save_ok = save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": _deduct_note, "違規細項": "、".join(sel_violations) if sel_violations else ""}, uploaded_files=files, award_inspector_hours=is_last_task)
+                                        _save_ok = save_entry({"日期": input_date, "週次": week_num, "檢查人員": inspector_name, "登錄時間": now_tw.strftime("%Y-%m-%d %H:%M:%S"), "修正": is_fix, "班級": sel_cls, "評分項目": role, "內掃原始分": in_s, "外掃原始分": out_s, "手機人數": ph_c, "備註": _deduct_note, "違規細項": "、".join(sel_violations) if sel_violations else ""}, uploaded_files=files, award_inspector_hours=False)  # [V6] 時數改由「衛生點名」發放，評分不再自動給時數
 
                                     if _save_ok:
                                         if check_result == "⭐ 優良":
@@ -3537,11 +3535,83 @@ try:
                     st.code("\n".join(reversed(list(_WORKER_LOG))), language=None)
             st.divider()
 
-            t_mon, t_hyg_rc, t_rollcall, t4, t_appeal, t_excellent, t2, t1, t_settings, t3, t_debt = st.tabs([
-                "👀 衛生糾察", "🙋 衛生點名", "👮 環保糾察", "📝 扣分明細", "📣 申訴", "⭐ 優良審核", "📊 成績總表", 
-                "🧹 晨掃審核", "⚙️ 設定", "🎖️ 服務時數發放", "🤝 愛校與欠時管理"  # [新增] 愛校服務 2.0 / [V6] 衛生點名
+            t_dash, t_mon, t_hyg_rc, t_rollcall, t4, t_appeal, t_excellent, t2, t1, t_settings, t3, t_debt = st.tabs([
+                "📈 儀表板", "👀 衛生糾察", "🙋 衛生點名", "👮 環保糾察", "📝 扣分明細", "📣 申訴", "⭐ 優良審核", "📊 成績總表", 
+                "🧹 晨掃審核", "⚙️ 設定", "🎖️ 服務時數發放", "🤝 愛校與欠時管理"  # [新增] 愛校服務 2.0 / [V6] 衛生點名+儀表板
             ])
             
+            with t_dash:
+                # [V6 新增] 扣分儀表板：每天開起來掃一眼，問題當天浮現，不用等週三結報
+                st.subheader("📈 扣分儀表板")
+                st.caption("💡 即時概況（含待審核與修正前的原始資料），正式成績仍以「📊 成績總表」的結算為準。")
+                df_dash = load_main_data()
+                if df_dash.empty:
+                    st.info("目前尚無評分資料。")
+                else:
+                    d = df_dash.copy()
+                    _score_cols = ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分"]
+                    for _c in _score_cols:
+                        d[_c] = pd.to_numeric(d[_c], errors="coerce").fillna(0) if _c in d.columns else 0
+                    d["扣分合計"] = d[_score_cols].sum(axis=1)
+                    d["週次"] = pd.to_numeric(d.get("週次"), errors="coerce").fillna(0).astype(int)
+                    _cur_w = get_week_num(today_tw)
+                    _weeks = sorted([int(w) for w in d["週次"].unique() if w > 0], reverse=True)
+                    if not _weeks:
+                        st.info("目前尚無有效週次資料。")
+                    else:
+                        _sel_w = st.selectbox("檢視週次", _weeks, index=_weeks.index(_cur_w) if _cur_w in _weeks else 0, key="dash_week")
+                        dw = d[(d["週次"] == _sel_w) & (d["扣分合計"] > 0)]
+                        d4 = d[(d["週次"] >= max(1, _sel_w - 3)) & (d["週次"] <= _sel_w) & (d["扣分合計"] > 0)]
+
+                        m1, m2, m3 = st.columns(3)
+                        m1.metric(f"第 {_sel_w} 週扣分筆數", len(dw))
+                        m2.metric(f"第 {_sel_w} 週扣分總點數", int(dw["扣分合計"].sum()))
+                        m3.metric("被扣分班級數", int(dw["班級"].nunique()))
+
+                        col_rank, col_item = st.columns(2)
+                        with col_rank:
+                            st.markdown(f"#### 🔻 各班扣分排行（第 {_sel_w} 週）")
+                            if dw.empty:
+                                st.success("🎉 本週目前無扣分紀錄！")
+                            else:
+                                _rank = dw.groupby("班級")["扣分合計"].sum().sort_values(ascending=False)
+                                st.bar_chart(_rank)
+                        with col_item:
+                            st.markdown("#### 🧾 常見違規細項 Top 10（近四週）")
+                            _items = []
+                            for _v in d4.get("違規細項", pd.Series(dtype=str)).fillna(""):
+                                _items += [x.strip() for x in str(_v).replace(",", "、").split("、") if x.strip()]
+                            if _items:
+                                _icnt = pd.Series(_items).value_counts().head(10)
+                                st.bar_chart(_icnt)
+                                st.caption("👉 從這裡看出全校最常發生的問題：是該「教方法」，還是該「加強盯場」。")
+                            else:
+                                st.info("近四週沒有違規細項紀錄。")
+
+                        st.markdown("#### 📉 近四週各班扣分趨勢")
+                        if d4.empty:
+                            st.info("近四週沒有扣分紀錄。")
+                        else:
+                            _trend = d4.pivot_table(index="週次", columns="班級", values="扣分合計", aggfunc="sum").fillna(0)
+                            _trend = _trend[_trend.sum().sort_values(ascending=False).head(8).index]
+                            st.line_chart(_trend)
+                            st.caption("僅顯示近四週扣分最多的前 8 個班級，避免線條過多。")
+
+                        # 連續上榜警示：連續兩週進入扣分前五名
+                        _warn_cls = []
+                        try:
+                            _w_list = [w for w in sorted(d["週次"].unique()) if 0 < w <= _sel_w][-2:]
+                            if len(_w_list) == 2:
+                                _tops = []
+                                for _w in _w_list:
+                                    _t = d[(d["週次"] == _w) & (d["扣分合計"] > 0)].groupby("班級")["扣分合計"].sum().sort_values(ascending=False).head(5)
+                                    _tops.append(set(_t.index))
+                                _warn_cls = sorted(_tops[0] & _tops[1])
+                        except Exception:
+                            _warn_cls = []
+                        if _warn_cls:
+                            st.warning("🚨 **連續兩週進入扣分前五名：** " + "、".join(_warn_cls) + "　→ 建議私下與導師聊聊，或安排糾察示範正確打掃方法。")
+
             with t_mon:
                 st.subheader("🕵️ 今日「衛生糾察」進度監控")
                 monitor_date = st.date_input("監控日期", today_tw, key="monitor_date")
@@ -3695,6 +3765,65 @@ try:
                 df = load_main_data()
                 if not df.empty:
                     st.dataframe(df[["登錄時間", "日期", "班級", "評分項目", "檢查人員", "備註", "違規細項", "紀錄ID"]].sort_values("登錄時間", ascending=False))
+
+                # [V6 新增] 督核單批次列印：選日期 → 產出可列印 HTML（純讀取，不寫入任何資料）
+                st.markdown("---")
+                with st.expander("🖨️ 督核單批次列印", expanded=False):
+                    st.caption("選擇日期後，系統將該日所有扣分紀錄依班級彙整，每班一張督核單（A4 一頁兩張）。下載後用瀏覽器開啟 → Ctrl+P 列印。")
+                    dk_date = st.date_input("督核單日期", today_tw, key="dk_date")
+                    if df.empty:
+                        st.info("目前尚無評分資料。")
+                    else:
+                        dkd = df.copy()
+                        _dk_cols = ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分"]
+                        for _c in _dk_cols:
+                            dkd[_c] = pd.to_numeric(dkd[_c], errors="coerce").fillna(0) if _c in dkd.columns else 0
+                        dkd["扣分合計"] = dkd[_dk_cols].sum(axis=1)
+                        dkd = dkd[(dkd["日期"].astype(str) == str(dk_date)) & (dkd["扣分合計"] > 0)]
+                        if dkd.empty:
+                            st.success(f"🎉 {dk_date} 沒有扣分紀錄，不需要印督核單。")
+                        else:
+                            _slips = []
+                            for _cls, _g in dkd.groupby("班級"):
+                                _rows_html = ""
+                                for _, _r in _g.iterrows():
+                                    _detail = str(_r.get("違規細項", "") or "").strip()
+                                    _note = str(_r.get("備註", "") or "").strip()
+                                    _desc = "、".join([x for x in [_detail, _note] if x]) or "（見評分紀錄）"
+                                    _rows_html += f"<tr><td>{_r.get('評分項目','')}</td><td>{_desc}</td><td class='pt'>{_r['扣分合計']:g}</td><td>{_r.get('檢查人員','')}</td></tr>"
+                                _slips.append(f"""
+<div class='slip'>
+  <h2>中壢家商 整潔缺失督核單</h2>
+  <p class='meta'>班級：<b>{_cls}</b>　　日期：{dk_date}</p>
+  <table>
+    <thead><tr><th style='width:18%'>檢查項目</th><th>缺失事項</th><th style='width:10%'>扣分</th><th style='width:20%'>檢查糾察</th></tr></thead>
+    <tbody>{_rows_html}</tbody>
+  </table>
+  <p class='sign'>隊長確認：＿＿＿＿＿＿＿　　衛生股長：＿＿＿＿＿＿＿　　<b>導師簽名：＿＿＿＿＿＿＿</b></p>
+  <p class='appeal'>※ 對扣分不服者，請於 <b>3 日內</b>之中午時間至衛生組提出申訴。本單經導師簽名後，請衛生股長繳回衛生組。</p>
+</div>""")
+                            _dk_html = f"""<!DOCTYPE html><html lang='zh-Hant'><head><meta charset='UTF-8'><title>督核單 {dk_date}</title>
+<style>
+body{{font-family:'Noto Sans TC','Microsoft JhengHei',sans-serif;font-size:12pt;color:#2b2823;margin:0;background:#fff;}}
+.slip{{box-sizing:border-box;height:138mm;padding:10mm 12mm;border-bottom:1px dashed #999;page-break-inside:avoid;}}
+.slip:nth-child(2n){{page-break-after:always;}}
+h2{{font-size:16pt;text-align:center;margin:0 0 4mm;letter-spacing:.1em;}}
+.meta{{margin:0 0 2mm;}}
+table{{width:100%;border-collapse:collapse;font-size:12pt;}}
+th{{background:#fff;font-weight:800;text-align:left;padding:1.5mm 2mm;border-bottom:2.5px solid #2b2823;color:#1e6b50;}}
+td{{padding:1.5mm 2mm;border-bottom:1px solid #d8d3c8;vertical-align:top;}}
+td.pt{{font-weight:800;text-align:center;}}
+.sign{{margin-top:6mm;}}
+.appeal{{font-size:11pt;color:#6b6558;margin-top:2mm;}}
+@media print{{@page{{size:A4;margin:0;}}}}
+</style></head><body>{''.join(_slips)}</body></html>"""
+                            st.download_button(
+                                f"📥 下載督核單（{len(_slips)} 班，{dk_date}）",
+                                _dk_html.encode("utf-8"),
+                                file_name=f"督核單_{dk_date}.html",
+                                mime="text/html",
+                                key="dk_dl"
+                            )
 
             with t_appeal:
                 st.subheader("📣 申訴審核")
@@ -4674,6 +4803,93 @@ try:
             # Worker 與 Admin UI 共用，不再重複定義。
 
             # [新增] 愛校服務 2.0：愛校與欠時管理 Tab
+                # [V6 新增] 一鍵匯出學校正規時數檔（純讀取，不寫入任何資料）
+                st.markdown("---")
+                with st.expander("📥 匯出學校正規時數檔（期末交給幹事用）", expanded=False):
+                    st.caption("彙總 service_hours 各學生時數 → 反查名冊 → 產出與學校格式相同的 Excel（證明單分頁＋服務時數整批輸入表）。只讀取資料，不會寫入或修改任何內容。")
+                    _ec1, _ec2, _ec3 = st.columns(3)
+                    _exp_default_start = date(today_tw.year, 2, 1) if today_tw.month < 8 else date(today_tw.year, 8, 1)
+                    _exp_start = _ec1.date_input("統計起日", _exp_default_start, key="exp_start")
+                    _exp_end = _ec2.date_input("統計迄日", today_tw, key="exp_end")
+                    _roc = lambda dd: f"{dd.year-1911}{dd.month:02d}{dd.day:02d}"
+                    _exp_sign_date = _ec3.text_input("簽呈日期（民國格式）", value=_roc(today_tw), key="exp_sign")
+                    _date_span = f"{_roc(_exp_start)}~{_roc(_exp_end)}"
+                    st.write(f"證明單日期區間將填為：**{_date_span}**")
+
+                    if st.button("🚀 產生匯出檔", key="exp_go"):
+                        _openpyxl_ok = True
+                        try:
+                            import openpyxl  # noqa: F401
+                        except ImportError:
+                            _openpyxl_ok = False
+                            st.error("❌ 部署環境缺少 openpyxl 套件：請在 requirements.txt 加入一行 openpyxl 後重新部署，再使用本功能。")
+                        if _openpyxl_ok:
+                            with st.spinner("讀取 service_hours 與名冊資料中..."):
+                                _svc_ws = get_worksheet(SHEET_TABS["service_hours"])
+                                _svc_df = pd.DataFrame(_svc_ws.get_all_records()) if _svc_ws else pd.DataFrame()
+                            if _svc_df.empty or "學號" not in _svc_df.columns:
+                                st.warning("service_hours 分頁沒有資料。")
+                            else:
+                                _svc_df["日期"] = pd.to_datetime(_svc_df["日期"], errors="coerce").dt.date
+                                _svc_df["時數"] = pd.to_numeric(_svc_df["時數"], errors="coerce").fillna(0)
+                                _svc_df["學號"] = _svc_df["學號"].apply(clean_id)
+                                _svc_df = _svc_df[(_svc_df["日期"] >= _exp_start) & (_svc_df["日期"] <= _exp_end) & (_svc_df["時數"] > 0)]
+
+                                def _act_name(cat):
+                                    _c0 = str(cat).split("｜")[0].strip()
+                                    if "衛生糾察" in _c0 or "整潔評分" in _c0: return "衛生糾察值勤"
+                                    if "回收" in _c0 or "環保" in _c0: return "資源回收場值勤"
+                                    return _c0 or "其他服務"
+                                _svc_df["活動"] = _svc_df["類別"].apply(_act_name)
+                                _agg = _svc_df.groupby(["活動", "學號"])["時數"].sum().reset_index()
+
+                                # 反查名冊（roster 分頁需有：學號 / 班級 / 座號 / 姓名）
+                                _ros_ws = get_worksheet(SHEET_TABS["roster"])
+                                _ros_df = pd.DataFrame(_ros_ws.get_all_records()) if _ros_ws else pd.DataFrame()
+                                _colf = lambda df_, kw: next((c for c in df_.columns if kw in c), None)
+                                _c_id, _c_cls, _c_seat, _c_name = (_colf(_ros_df, k) for k in ["學號", "班級", "座號", "姓名"])
+                                _ros_map = {}
+                                if _c_id is not None:
+                                    for _, _rr in _ros_df.iterrows():
+                                        _ros_map[clean_id(_rr[_c_id])] = (
+                                            str(_rr[_c_cls]).strip() if _c_cls else "",
+                                            _rr[_c_seat] if _c_seat else "",
+                                            str(_rr[_c_name]).strip() if _c_name else "",
+                                        )
+                                _miss_cols = [n for n, c in [("座號", _c_seat), ("姓名", _c_name)] if c is None]
+                                if _miss_cols:
+                                    st.warning("⚠️ roster 分頁缺少欄位：" + "、".join(_miss_cols) + "，這些欄位將留白。建議至 Google Sheet 補齊後重新產生。")
+
+                                _buf = io.BytesIO()
+                                _hdr = ["班級", "座號", "學號\n(務必輸入)", "姓名", "服務活動名稱\n(事由：請簡略說明)", "服務類別\n(填入代號)", "地點", "日期\n(107年3月1日請填1070301)", "時數小時\n(超過8小請以另筆資料登錄)"]
+                                _batch_rows = []
+                                with pd.ExcelWriter(_buf, engine="openpyxl") as _xw:
+                                    for _act, _g in _agg.groupby("活動"):
+                                        _g = _g.sort_values("學號")
+                                        _recs = []
+                                        for _, _r in _g.iterrows():
+                                            _cls_v, _seat_v, _name_v = _ros_map.get(str(_r["學號"]), ("", "", ""))
+                                            if not _cls_v:
+                                                _cls_v = ROSTER_DICT.get(str(_r["學號"]), "")
+                                            _recs.append([_cls_v, _seat_v, str(_r["學號"]), _name_v, _act, "C043", "校內", _date_span, float(_r["時數"])])
+                                            _batch_rows.append([str(_r["學號"]), _exp_sign_date, _date_span, _date_span, "A001", "C043", float(_r["時數"]), _act])
+                                        for _i in range(0, len(_recs), 20):
+                                            _sheet_df = pd.DataFrame([["市立中壢高級家事商業職業學校服務學習證明"] + [""] * 8, _hdr] + _recs[_i:_i + 20])
+                                            _sheet_df.to_excel(_xw, sheet_name=f"{_act}{_i // 20 + 1}"[:31], index=False, header=False)
+                                    pd.DataFrame(_batch_rows, columns=["學號", "簽呈日期", "開始日期", "結束日期", "單位代碼", "服務內容代碼", "時數", "備註"]).to_excel(_xw, sheet_name="服務時數整批輸入表", index=False)
+
+                                st.success(f"✅ 完成！共 {len(_agg)} 筆學生時數、{_agg['活動'].nunique()} 種活動。")
+                                _no_name = [s for s in _agg["學號"].astype(str) if s not in _ros_map or not _ros_map[s][2]]
+                                if _no_name:
+                                    st.warning(f"⚠️ 有 {len(_no_name)} 個學號在名冊查不到姓名（欄位留白）：" + "、".join(_no_name[:15]) + ("…" if len(_no_name) > 15 else ""))
+                                st.download_button(
+                                    "📥 下載時數匯出檔 (.xlsx)",
+                                    _buf.getvalue(),
+                                    file_name=f"服務時數證明單_{_date_span}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key="exp_dl"
+                                )
+
             with t_debt:
                 st.subheader("🤝 愛校與欠時管理")
 
