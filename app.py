@@ -711,7 +711,8 @@ try:
                         is_dup = cur.fetchone() is not None
                 except Exception:
                     pass  # 查詢失敗不阻擋寫入
-                if not is_dup:
+                _dk = (t_date, str(sid), t_cat, t_cls_name)
+                if not is_dup and _dk not in dedup_keys:  # [V6.2 Fix] 批內互查：同批兩個任務含同一學生時只發一次
                     rows_to_write.append([
                         t_date, str(sid),
                         t_cls_name, t_cat,
@@ -719,7 +720,7 @@ try:
                         uuid.uuid4().hex[:8],
                         ""   # [方案A] 核發狀態：空白 = 未核發
                     ])
-                    dedup_keys.append((t_date, str(sid), t_cat, t_cls_name))
+                    dedup_keys.append(_dk)
         if not rows_to_write:
             return True, None  # 全部都是重複，視為成功
         try:
@@ -1200,6 +1201,32 @@ try:
                     load_appeals.clear()
                 except Exception: pass
                 print(f"[worker] appeal_review 完成：{_ar_record_id} → {_ar_status}")
+
+            elif task_type == "revoke_record":
+                # [V6.1] 組長直接撤分：將主紀錄標記為修正(TRUE)，排名計算即自動排除
+                _rv_id = payload.get("record_id", "")
+                _rv_reason = payload.get("reason", "")
+
+                def _do_rv():
+                    ws_main = get_worksheet(SHEET_TABS["main"])
+                    if not ws_main: raise Exception("無法取得 main 工作表")
+                    m_data = ws_main.get_all_records()
+                    m_row = next((j + 2 for j, mr in enumerate(m_data)
+                                  if str(mr.get("紀錄ID")) == str(_rv_id)), None)
+                    if not m_row:
+                        print(f"[worker revoke] 找不到紀錄 {_rv_id}，可能已被處理")
+                        return
+                    ws_main.update_cell(m_row, EXPECTED_COLUMNS.index("修正") + 1, "TRUE")
+                    try:
+                        _old_note = str(m_data[m_row - 2].get("備註", "") or "")
+                        _new_note = (_old_note + " | " if _old_note else "") + f"【組長撤分】{_rv_reason}"
+                        ws_main.update_cell(m_row, EXPECTED_COLUMNS.index("備註") + 1, _new_note)
+                    except Exception as _e:
+                        print(f"[worker revoke] 備註更新失敗（撤分本身已完成）: {_e}")
+                execute_with_retry(_do_rv)
+                try: load_main_data.clear()
+                except Exception: pass
+                print(f"[worker] revoke_record 完成：{_rv_id}")
 
             return True, None
         except Exception as e: return False, str(e)
@@ -2528,7 +2555,7 @@ try:
     st.sidebar.title("🏫 衛愛而生")
     st.sidebar.markdown("<div style='font-size:12px;color:rgba(255,255,255,0.4);margin-top:-12px;margin-bottom:16px;'>中壢家商 衛生組管理系統</div>", unsafe_allow_html=True)
 
-    menu_options = ["糾察底家👀", "班級負責人🥸", "晨掃志工隊🧹", "愛校任務認領 🤝", "組長ㄉ窩💃"]
+    menu_options = ["糾察底家👀", "班級負責人🥸", "組長ㄉ窩💃"]  # [V6.1] 愛校任務認領、晨掃志工隊已冷凍（程式碼保留，恢復時加回選單即可）
     app_mode = st.sidebar.radio("請選擇模式", menu_options)
 
     st.sidebar.markdown("---")
@@ -3199,13 +3226,16 @@ try:
                             # 照片與申訴整合（合併所有照片）
                             has_photo = len(all_photos) > 0
                             deadline = appeal_deadline_map.get(date_str, date.today())
-                            can_appeal = not ap_st and date.today() <= deadline and (tot > 0 or r['手機人數'] > 0)
+                            # [V6.1] 線上申訴管道已撤銷：改為現場申訴（3日內中午至衛生組），撤分由組長後台操作
+                            can_appeal = False  # 冷凍線上申訴，保留程式碼以備未來恢復
 
-                            if has_photo or can_appeal:
-                                with st.expander("📋 查看詳情" + (f"　|　📣 可申訴（截止 {deadline.strftime('%m/%d')}）" if can_appeal else "")):
+                            if has_photo or can_appeal or (tot > 0):
+                                with st.expander("📋 查看詳情" + ("　|　📣 可申訴（截止 " + deadline.strftime('%m/%d') + "）" if can_appeal else "")):
                                     if has_photo:
                                         st.markdown("**📷 評分照片**")
                                         st.image(all_photos, width=200)
+                                    if tot > 0 and not can_appeal:
+                                        st.info("📣 對扣分不服者，請於 **3 日內**之中午時間，由衛生股長至衛生組提出申訴。")
                                     if can_appeal:
                                         st.markdown("---")
                                         st.markdown("**📣 提出申訴**")
@@ -3535,9 +3565,9 @@ try:
                     st.code("\n".join(reversed(list(_WORKER_LOG))), language=None)
             st.divider()
 
-            t_dash, t_mon, t_hyg_rc, t_rollcall, t4, t_appeal, t_excellent, t2, t1, t_settings, t3, t_debt = st.tabs([
-                "📈 儀表板", "👀 衛生糾察", "🙋 衛生點名", "👮 環保糾察", "📝 扣分明細", "📣 申訴", "⭐ 優良審核", "📊 成績總表", 
-                "🧹 晨掃審核", "⚙️ 設定", "🎖️ 服務時數發放", "🤝 愛校與欠時管理"  # [新增] 愛校服務 2.0 / [V6] 衛生點名+儀表板
+            t_dash, t_mon, t_rollcall, t_appeal, t_excellent, t2, t1, t_settings, t3, t_debt = st.tabs([
+                "📈 儀表板與明細", "👀 衛生糾察", "🙋 出勤點名", "📣 申訴", "⭐ 優良審核", "📊 成績總表", 
+                "🧹 晨掃審核(停用)", "⚙️ 設定", "🎖️ 服務時數發放", "🤝 愛校與欠時管理"  # [V6.1] 點名合併、明細併入儀表板
             ])
             
             with t_dash:
@@ -3612,6 +3642,74 @@ try:
                         if _warn_cls:
                             st.warning("🚨 **連續兩週進入扣分前五名：** " + "、".join(_warn_cls) + "　→ 建議私下與導師聊聊，或安排糾察示範正確打掃方法。")
 
+
+                # [V6.1] 扣分明細與督核單併入儀表板分頁
+                st.markdown("---")
+                st.subheader("📝 扣分明細")
+                df = load_main_data()
+                if not df.empty:
+                    st.dataframe(df[["登錄時間", "日期", "班級", "評分項目", "檢查人員", "備註", "違規細項", "紀錄ID"]].sort_values("登錄時間", ascending=False))
+
+                # [V6 新增] 督核單批次列印：選日期 → 產出可列印 HTML（純讀取，不寫入任何資料）
+                st.markdown("---")
+                with st.expander("🖨️ 督核單批次列印", expanded=False):
+                    st.caption("選擇日期後，系統將該日所有扣分紀錄依班級彙整，每班一張督核單（A4 一頁兩張）。下載後用瀏覽器開啟 → Ctrl+P 列印。")
+                    dk_date = st.date_input("督核單日期", today_tw, key="dk_date")
+                    if df.empty:
+                        st.info("目前尚無評分資料。")
+                    else:
+                        dkd = df.copy()
+                        _dk_cols = ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分"]
+                        for _c in _dk_cols:
+                            dkd[_c] = pd.to_numeric(dkd[_c], errors="coerce").fillna(0) if _c in dkd.columns else 0
+                        dkd["扣分合計"] = dkd[_dk_cols].sum(axis=1)
+                        dkd = dkd[(dkd["日期"].astype(str) == str(dk_date)) & (dkd["扣分合計"] > 0)]
+                        if dkd.empty:
+                            st.success(f"🎉 {dk_date} 沒有扣分紀錄，不需要印督核單。")
+                        else:
+                            import html as _html_esc  # [V6.2 資安] 學生輸入寫進 HTML 前先跳脫，防 XSS
+                            _slips = []
+                            for _cls, _g in dkd.groupby("班級"):
+                                _rows_html = ""
+                                for _, _r in _g.iterrows():
+                                    _detail = str(_r.get("違規細項", "") or "").strip()
+                                    _note = str(_r.get("備註", "") or "").strip()
+                                    _desc = "、".join([x for x in [_detail, _note] if x]) or "（見評分紀錄）"
+                                    _rows_html += f"<tr><td>{_html_esc.escape(str(_r.get('評分項目','')))}</td><td>{_html_esc.escape(_desc)}</td><td class='pt'>{_r['扣分合計']:g}</td><td>{_html_esc.escape(str(_r.get('檢查人員','')))}</td></tr>"
+                                _slips.append(f"""
+<div class='slip'>
+  <h2>中壢家商 整潔缺失督核單</h2>
+  <p class='meta'>班級：<b>{_html_esc.escape(str(_cls))}</b>　　日期：{dk_date}</p>
+  <table>
+    <thead><tr><th style='width:18%'>檢查項目</th><th>缺失事項</th><th style='width:10%'>扣分</th><th style='width:20%'>檢查糾察</th></tr></thead>
+    <tbody>{_rows_html}</tbody>
+  </table>
+  <p class='sign'>隊長確認：＿＿＿＿＿＿＿　　衛生股長：＿＿＿＿＿＿＿　　<b>導師簽名：＿＿＿＿＿＿＿</b></p>
+  <p class='appeal'>※ 對扣分不服者，請於 <b>3 日內</b>之中午時間至衛生組提出申訴。本單經導師簽名後，請衛生股長繳回衛生組。</p>
+</div>""")
+                            _dk_html = f"""<!DOCTYPE html><html lang='zh-Hant'><head><meta charset='UTF-8'><title>督核單 {dk_date}</title>
+<style>
+body{{font-family:'Noto Sans TC','Microsoft JhengHei',sans-serif;font-size:12pt;color:#2b2823;margin:0;background:#fff;}}
+.slip{{box-sizing:border-box;height:138mm;padding:10mm 12mm;border-bottom:1px dashed #999;page-break-inside:avoid;}}
+.slip:nth-child(2n){{page-break-after:always;}}
+h2{{font-size:16pt;text-align:center;margin:0 0 4mm;letter-spacing:.1em;}}
+.meta{{margin:0 0 2mm;}}
+table{{width:100%;border-collapse:collapse;font-size:12pt;}}
+th{{background:#fff;font-weight:800;text-align:left;padding:1.5mm 2mm;border-bottom:2.5px solid #2b2823;color:#1e6b50;}}
+td{{padding:1.5mm 2mm;border-bottom:1px solid #d8d3c8;vertical-align:top;}}
+td.pt{{font-weight:800;text-align:center;}}
+.sign{{margin-top:6mm;}}
+.appeal{{font-size:11pt;color:#6b6558;margin-top:2mm;}}
+@media print{{@page{{size:A4;margin:0;}}}}
+</style></head><body>{''.join(_slips)}</body></html>"""
+                            st.download_button(
+                                f"📥 下載督核單（{len(_slips)} 班，{dk_date}）",
+                                _dk_html.encode("utf-8"),
+                                file_name=f"督核單_{dk_date}.html",
+                                mime="text/html",
+                                key="dk_dl"
+                            )
+
             with t_mon:
                 st.subheader("🕵️ 今日「衛生糾察」進度監控")
                 monitor_date = st.date_input("監控日期", today_tw, key="monitor_date")
@@ -3652,181 +3750,164 @@ try:
                         for p in missing_mob: st.warning(f"⚠️ {p['name']} \n ({p['role_desc']})")
                     else: st.success("🎉 全員完成！")
 
-            with t_hyg_rc:
-                # [V6 新增] 衛生糾察出勤點名：出勤與評分紀錄脫鉤，以現場點名為準
-                st.subheader("🙋 衛生糾察出勤點名")
-                st.info("💡 說明：衛生糾察每天全員應勤（機動人員除外）。一般糾察採【扣除法】勾缺席者；機動人員採【加入法】勾有到者。送出即發放當日時數。")
-
-                hyg_rc_date = st.date_input("出勤日期", today_tw, key="hyg_rc_date")
-                hyg_rc_hours = st.number_input("每人發放時數 (小時)", min_value=0.0, max_value=8.0, value=0.25, step=0.25, key="hyg_rc_hours")
-
-                def _is_hyg_member(p):
-                    r = p.get("raw_role", "")
-                    if "組長" in r or "環保" in r:
-                        return False
-                    return any(x in r for x in ["內掃", "外掃", "機動", "隊長"])
-
-                _hyg_all = [p for p in INSPECTOR_LIST if _is_hyg_member(p)]
-                _hyg_regular = [p for p in _hyg_all if "機動" not in p.get("raw_role", "")]
-                _hyg_mobile = [p for p in _hyg_all if "機動" in p.get("raw_role", "")]
-                reg_names = [p["label"] for p in _hyg_regular]
-                mob_names = [p["label"] for p in _hyg_mobile]
-
-                if not reg_names and not mob_names:
-                    st.warning("⚠️ 目前名單中沒有衛生糾察成員，請確認 inspectors 分頁的「負責項目」欄位。")
-                else:
-                    with st.form("hyg_rc_form"):
-                        st.write(f"📋 每日應勤名單共 {len(reg_names)} 人")
-                        hyg_absent = st.multiselect("❌ 勾選【請假 / 未到】的糾察 (扣除法)", reg_names)
-                        hyg_present_reg = [n for n in reg_names if n not in hyg_absent]
-
-                        hyg_present_mob = []
-                        if mob_names:
-                            hyg_present_mob = st.multiselect("🟠 機動人員【今日有出勤】者 (加入法)", mob_names)
-
-                        _hyg_final = hyg_present_reg + hyg_present_mob
-                        st.write(f"✅ 預計發放對象：共 {len(_hyg_final)} 人 (每人 {hyg_rc_hours} 小時)")
-
-                        if st.form_submit_button("🚀 發放衛生糾察時數"):
-                            if _block_future_date(hyg_rc_date, "出勤日期"):
-                                pass  # 未來日期被擋下，不繼續
-                            elif time.time() - st.session_state.last_action_time < 3:
-                                st.warning("⚠️ 系統處理中，請勿連續點擊！")
-                            else:
-                                st.session_state.last_action_time = time.time()
-                                hyg_ids = [name.split("學號:")[1].strip() for name in _hyg_final if "學號:" in name]
-                                if hyg_ids:
-                                    payload = {
-                                        "student_list": hyg_ids,
-                                        "date": str(hyg_rc_date),
-                                        "class_name": "糾察隊",
-                                        "category": "衛生糾察值勤",
-                                        "hours": float(hyg_rc_hours)
-                                    }
-                                    enqueue_task("service_hours_only", payload)
-                                    st.success(f"✅ 已排程發放 {len(hyg_ids)} 人的出勤時數！(系統會自動阻擋同一天的重複發放)")
-                                    time.sleep(1.5)
-                                    st.rerun()
-                                else:
-                                    st.warning("沒有可發放時數的對象")
-
             with t_rollcall:
-                st.subheader("👮 環保糾察 (資收場) 出勤點名")
-                st.info("💡 說明：此區專為資收場的環保糾察設計。先選班別，再勾選沒來的人，系統會自動幫有來的人發放時數。")
-                
-                rc_date = st.date_input("出勤日期", today_tw, key="insp_rc_date")
-                # [V6 新增] 環保糾察拆分中午班 / 下午班，兩班人員不同、分別點名
-                rc_shift = st.radio("點名班別", ["🕛 中午班 (資收場整理)", "🕒 下午班 (垃圾管制)"], horizontal=True, key="insp_rc_shift")
-                shift_tag = "中午" if "中午" in rc_shift else "下午"
-                rc_hours = st.number_input("每人發放時數 (小時)", min_value=0.0, max_value=8.0, value=0.25, step=0.25, key="insp_rc_hours")
-                
-                trash_inspectors = [p for p in INSPECTOR_LIST if "垃圾" in p.get("raw_role", "") or "回收" in p.get("raw_role", "") or "環保" in p.get("raw_role", "")]
-                _shift_tagged = [p for p in trash_inspectors if shift_tag in p.get("raw_role", "")]
-                if _shift_tagged:
-                    trash_inspectors = _shift_tagged
-                else:
-                    st.warning(f"⚠️ 名單中沒有人標註「{shift_tag}」班別，目前顯示全部環保糾察。建議至 Google Sheet 的 inspectors 分頁，在「負責項目」欄加註「中午」或「下午」，即可自動分班。")
-                insp_names = [p["label"] for p in trash_inspectors]
-                
-                if not insp_names:
-                    st.warning("⚠️ 目前名單中沒有負責「環保/垃圾/回收」的糾察。")
-                else:
-                    with st.form("insp_rc_form"):
-                        st.write(f"資收場糾察名單共 {len(insp_names)} 人")
-                        absent_insps = st.multiselect("❌ 勾選【請假 / 未到】的糾察 (扣除法)", insp_names)
-                        present_insps = [n for n in insp_names if n not in absent_insps]
-                        
-                        st.write(f"✅ 預計發放對象：共 {len(present_insps)} 人 (每人 {rc_hours} 小時)")
-                        
-                        if st.form_submit_button("🚀 發放環保糾察時數"):
-                            if _block_future_date(rc_date, "出勤日期"):
-                                pass  # 未來日期被擋下，不繼續
-                            elif time.time() - st.session_state.last_action_time < 3:
-                                st.warning("⚠️ 系統處理中，請勿連續點擊！")
-                            else:
-                                st.session_state.last_action_time = time.time()
-                                present_ids = [name.split("學號:")[1].strip() for name in present_insps if "學號:" in name]
-                                if present_ids:
-                                    payload = {
-                                        "student_list": present_ids,
-                                        "date": str(rc_date),
-                                        "class_name": "糾察隊",
-                                        "category": f"資源回收糾察({shift_tag})",  # [V6] 班別入類別，同日兩班可各自發放
-                                        "hours": float(rc_hours)
-                                    }
-                                    enqueue_task("service_hours_only", payload)
-                                    st.success(f"✅ 已排程發放 {len(present_ids)} 人的出勤時數！(系統會自動阻擋同一天的重複發放)")
-                                    time.sleep(1.5)
-                                    st.rerun()
-                                else:
-                                    st.warning("沒有可發放時數的對象")
-
-            with t4:
-                df = load_main_data()
-                if not df.empty:
-                    st.dataframe(df[["登錄時間", "日期", "班級", "評分項目", "檢查人員", "備註", "違規細項", "紀錄ID"]].sort_values("登錄時間", ascending=False))
-
-                # [V6 新增] 督核單批次列印：選日期 → 產出可列印 HTML（純讀取，不寫入任何資料）
+                # [V6.1] 衛生／環保點名合併為單一分頁，由使用者切換隊別
+                st.subheader("🙋 出勤點名")
+                rc_target = st.radio("點名隊別", ["🧹 衛生糾察", "♻️ 環保糾察 (資收場)"], horizontal=True, key="rc_target")
                 st.markdown("---")
-                with st.expander("🖨️ 督核單批次列印", expanded=False):
-                    st.caption("選擇日期後，系統將該日所有扣分紀錄依班級彙整，每班一張督核單（A4 一頁兩張）。下載後用瀏覽器開啟 → Ctrl+P 列印。")
-                    dk_date = st.date_input("督核單日期", today_tw, key="dk_date")
-                    if df.empty:
-                        st.info("目前尚無評分資料。")
+                if rc_target == "🧹 衛生糾察":
+                    # [V6 新增] 衛生糾察出勤點名：出勤與評分紀錄脫鉤，以現場點名為準
+                    st.info("💡 說明：衛生糾察每天全員應勤（機動人員除外）。一般糾察採【扣除法】勾缺席者；機動人員採【加入法】勾有到者。送出即發放當日時數。")
+
+                    hyg_rc_date = st.date_input("出勤日期", today_tw, key="hyg_rc_date")
+                    hyg_rc_hours = st.number_input("每人發放時數 (小時)", min_value=0.0, max_value=8.0, value=0.25, step=0.25, key="hyg_rc_hours")
+
+                    def _is_hyg_member(p):
+                        r = p.get("raw_role", "")
+                        if "組長" in r or "環保" in r:
+                            return False
+                        return any(x in r for x in ["內掃", "外掃", "機動", "隊長"])
+
+                    _hyg_all = [p for p in INSPECTOR_LIST if _is_hyg_member(p)]
+                    _hyg_regular = [p for p in _hyg_all if "機動" not in p.get("raw_role", "")]
+                    _hyg_mobile = [p for p in _hyg_all if "機動" in p.get("raw_role", "")]
+                    reg_names = [p["label"] for p in _hyg_regular]
+                    mob_names = [p["label"] for p in _hyg_mobile]
+
+                    if not reg_names and not mob_names:
+                        st.warning("⚠️ 目前名單中沒有衛生糾察成員，請確認 inspectors 分頁的「負責項目」欄位。")
                     else:
-                        dkd = df.copy()
-                        _dk_cols = ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分"]
-                        for _c in _dk_cols:
-                            dkd[_c] = pd.to_numeric(dkd[_c], errors="coerce").fillna(0) if _c in dkd.columns else 0
-                        dkd["扣分合計"] = dkd[_dk_cols].sum(axis=1)
-                        dkd = dkd[(dkd["日期"].astype(str) == str(dk_date)) & (dkd["扣分合計"] > 0)]
-                        if dkd.empty:
-                            st.success(f"🎉 {dk_date} 沒有扣分紀錄，不需要印督核單。")
-                        else:
-                            _slips = []
-                            for _cls, _g in dkd.groupby("班級"):
-                                _rows_html = ""
-                                for _, _r in _g.iterrows():
-                                    _detail = str(_r.get("違規細項", "") or "").strip()
-                                    _note = str(_r.get("備註", "") or "").strip()
-                                    _desc = "、".join([x for x in [_detail, _note] if x]) or "（見評分紀錄）"
-                                    _rows_html += f"<tr><td>{_r.get('評分項目','')}</td><td>{_desc}</td><td class='pt'>{_r['扣分合計']:g}</td><td>{_r.get('檢查人員','')}</td></tr>"
-                                _slips.append(f"""
-<div class='slip'>
-  <h2>中壢家商 整潔缺失督核單</h2>
-  <p class='meta'>班級：<b>{_cls}</b>　　日期：{dk_date}</p>
-  <table>
-    <thead><tr><th style='width:18%'>檢查項目</th><th>缺失事項</th><th style='width:10%'>扣分</th><th style='width:20%'>檢查糾察</th></tr></thead>
-    <tbody>{_rows_html}</tbody>
-  </table>
-  <p class='sign'>隊長確認：＿＿＿＿＿＿＿　　衛生股長：＿＿＿＿＿＿＿　　<b>導師簽名：＿＿＿＿＿＿＿</b></p>
-  <p class='appeal'>※ 對扣分不服者，請於 <b>3 日內</b>之中午時間至衛生組提出申訴。本單經導師簽名後，請衛生股長繳回衛生組。</p>
-</div>""")
-                            _dk_html = f"""<!DOCTYPE html><html lang='zh-Hant'><head><meta charset='UTF-8'><title>督核單 {dk_date}</title>
-<style>
-body{{font-family:'Noto Sans TC','Microsoft JhengHei',sans-serif;font-size:12pt;color:#2b2823;margin:0;background:#fff;}}
-.slip{{box-sizing:border-box;height:138mm;padding:10mm 12mm;border-bottom:1px dashed #999;page-break-inside:avoid;}}
-.slip:nth-child(2n){{page-break-after:always;}}
-h2{{font-size:16pt;text-align:center;margin:0 0 4mm;letter-spacing:.1em;}}
-.meta{{margin:0 0 2mm;}}
-table{{width:100%;border-collapse:collapse;font-size:12pt;}}
-th{{background:#fff;font-weight:800;text-align:left;padding:1.5mm 2mm;border-bottom:2.5px solid #2b2823;color:#1e6b50;}}
-td{{padding:1.5mm 2mm;border-bottom:1px solid #d8d3c8;vertical-align:top;}}
-td.pt{{font-weight:800;text-align:center;}}
-.sign{{margin-top:6mm;}}
-.appeal{{font-size:11pt;color:#6b6558;margin-top:2mm;}}
-@media print{{@page{{size:A4;margin:0;}}}}
-</style></head><body>{''.join(_slips)}</body></html>"""
-                            st.download_button(
-                                f"📥 下載督核單（{len(_slips)} 班，{dk_date}）",
-                                _dk_html.encode("utf-8"),
-                                file_name=f"督核單_{dk_date}.html",
-                                mime="text/html",
-                                key="dk_dl"
-                            )
+                        with st.form("hyg_rc_form"):
+                            st.write(f"📋 每日應勤名單共 {len(reg_names)} 人")
+                            hyg_absent = st.multiselect("❌ 勾選【請假 / 未到】的糾察 (扣除法)", reg_names)
+                            hyg_present_reg = [n for n in reg_names if n not in hyg_absent]
+
+                            hyg_present_mob = []
+                            if mob_names:
+                                hyg_present_mob = st.multiselect("🟠 機動人員【今日有出勤】者 (加入法)", mob_names)
+
+                            _hyg_final = hyg_present_reg + hyg_present_mob
+                            st.write(f"✅ 預計發放對象：共 {len(_hyg_final)} 人 (每人 {hyg_rc_hours} 小時)")
+
+                            if st.form_submit_button("🚀 發放衛生糾察時數"):
+                                if _block_future_date(hyg_rc_date, "出勤日期"):
+                                    pass  # 未來日期被擋下，不繼續
+                                elif time.time() - st.session_state.last_action_time < 3:
+                                    st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                                else:
+                                    st.session_state.last_action_time = time.time()
+                                    hyg_ids = [name.split("學號:")[1].strip() for name in _hyg_final if "學號:" in name]
+                                    if hyg_ids:
+                                        payload = {
+                                            "student_list": hyg_ids,
+                                            "date": str(hyg_rc_date),
+                                            "class_name": "糾察隊",
+                                            "category": "衛生糾察值勤",
+                                            "hours": float(hyg_rc_hours)
+                                        }
+                                        enqueue_task("service_hours_only", payload)
+                                        st.success(f"✅ 已排程發放 {len(hyg_ids)} 人的出勤時數！(系統會自動阻擋同一天的重複發放)")
+                                        time.sleep(1.5)
+                                        st.rerun()
+                                    else:
+                                        st.warning("沒有可發放時數的對象")
+
+                else:
+                    st.info("💡 說明：此區專為資收場的環保糾察設計。先選班別，再勾選沒來的人，系統會自動幫有來的人發放時數。")
+                
+                    rc_date = st.date_input("出勤日期", today_tw, key="insp_rc_date")
+                    # [V6 新增] 環保糾察拆分中午班 / 下午班，兩班人員不同、分別點名
+                    rc_shift = st.radio("點名班別", ["🕛 中午班 (資收場整理)", "🕒 下午班 (垃圾管制)"], horizontal=True, key="insp_rc_shift")
+                    shift_tag = "中午" if "中午" in rc_shift else "下午"
+                    rc_hours = st.number_input("每人發放時數 (小時)", min_value=0.0, max_value=8.0, value=0.25, step=0.25, key="insp_rc_hours")
+                
+                    trash_inspectors = [p for p in INSPECTOR_LIST if "垃圾" in p.get("raw_role", "") or "回收" in p.get("raw_role", "") or "環保" in p.get("raw_role", "")]
+                    _shift_tagged = [p for p in trash_inspectors if shift_tag in p.get("raw_role", "")]
+                    if _shift_tagged:
+                        trash_inspectors = _shift_tagged
+                    else:
+                        st.warning(f"⚠️ 名單中沒有人標註「{shift_tag}」班別，目前顯示全部環保糾察。建議至 Google Sheet 的 inspectors 分頁，在「負責項目」欄加註「中午」或「下午」，即可自動分班。")
+                    insp_names = [p["label"] for p in trash_inspectors]
+                
+                    if not insp_names:
+                        st.warning("⚠️ 目前名單中沒有負責「環保/垃圾/回收」的糾察。")
+                    else:
+                        with st.form("insp_rc_form"):
+                            st.write(f"資收場糾察名單共 {len(insp_names)} 人")
+                            absent_insps = st.multiselect("❌ 勾選【請假 / 未到】的糾察 (扣除法)", insp_names)
+                            present_insps = [n for n in insp_names if n not in absent_insps]
+                        
+                            st.write(f"✅ 預計發放對象：共 {len(present_insps)} 人 (每人 {rc_hours} 小時)")
+                        
+                            if st.form_submit_button("🚀 發放環保糾察時數"):
+                                if _block_future_date(rc_date, "出勤日期"):
+                                    pass  # 未來日期被擋下，不繼續
+                                elif time.time() - st.session_state.last_action_time < 3:
+                                    st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                                else:
+                                    st.session_state.last_action_time = time.time()
+                                    present_ids = [name.split("學號:")[1].strip() for name in present_insps if "學號:" in name]
+                                    if present_ids:
+                                        payload = {
+                                            "student_list": present_ids,
+                                            "date": str(rc_date),
+                                            "class_name": "糾察隊",
+                                            "category": f"資源回收糾察({shift_tag})",  # [V6] 班別入類別，同日兩班可各自發放
+                                            "hours": float(rc_hours)
+                                        }
+                                        enqueue_task("service_hours_only", payload)
+                                        st.success(f"✅ 已排程發放 {len(present_ids)} 人的出勤時數！(系統會自動阻擋同一天的重複發放)")
+                                        time.sleep(1.5)
+                                        st.rerun()
+                                    else:
+                                        st.warning("沒有可發放時數的對象")
 
             with t_appeal:
-                st.subheader("📣 申訴審核")
+                st.subheader("📣 申訴與撤分")
+                st.caption("線上申訴管道已關閉：申訴一律採現場制（扣分後 3 日內之中午，由衛生股長至衛生組提出）。申訴成立時，在下方直接撤銷該筆扣分。")
+
+                # [V6.1] 組長直接撤分工具
+                with st.container(border=True):
+                    st.markdown("#### ↩️ 撤銷扣分")
+                    _rv_df = load_main_data()
+                    if _rv_df.empty:
+                        st.info("目前尚無評分資料。")
+                    else:
+                        _rvd = _rv_df.copy()
+                        _rv_cols = ["內掃原始分", "外掃原始分", "垃圾原始分", "垃圾內掃原始分", "垃圾外掃原始分", "晨間打掃原始分"]
+                        for _c in _rv_cols:
+                            _rvd[_c] = pd.to_numeric(_rvd[_c], errors="coerce").fillna(0) if _c in _rvd.columns else 0
+                        _rvd["扣分合計"] = _rvd[_rv_cols].sum(axis=1)
+                        _rvd["_dt"] = pd.to_datetime(_rvd["日期"], errors="coerce").dt.date
+                        _rvd = _rvd[(_rvd["扣分合計"] > 0) & (_rvd["修正"] != True) & (_rvd["_dt"] >= today_tw - timedelta(days=14))]
+                        if _rvd.empty:
+                            st.info("近 14 天沒有可撤銷的扣分紀錄。")
+                        else:
+                            _rvd = _rvd.sort_values(["日期", "登錄時間"], ascending=False)
+                            _rv_opts = {}
+                            for _, _r in _rvd.iterrows():
+                                _hint = str(_r.get("違規細項", "") or _r.get("備註", "") or "")[:20]
+                                _rv_opts[f"{_r['日期']}｜{_r['班級']}｜{_r['評分項目']}｜扣 {_r['扣分合計']:g} 分｜{_hint}｜ID:{_r['紀錄ID']}"] = str(_r["紀錄ID"])
+                            _rv_sel = st.selectbox("選擇要撤銷的扣分紀錄（近 14 天內）", list(_rv_opts.keys()), key="rv_sel")
+                            _rv_reason = st.text_input("撤分原因（必填，會寫入該筆備註留下紀錄）", key="rv_reason", placeholder="例如：現場申訴成立／糾察誤評")
+                            _rv_confirm = st.checkbox("我確認要撤銷這筆扣分（撤銷後成績自動重算）", key="rv_confirm")
+                            if st.button("↩️ 確認撤分", key="rv_go"):
+                                if not _rv_reason.strip():
+                                    st.error("❌ 請填寫撤分原因")
+                                elif not _rv_confirm:
+                                    st.warning("⚠️ 請先勾選確認")
+                                elif time.time() - st.session_state.last_action_time < 3:
+                                    st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                                else:
+                                    st.session_state.last_action_time = time.time()
+                                    _tid = enqueue_task("revoke_record", {"record_id": _rv_opts[_rv_sel], "reason": _rv_reason.strip()})
+                                    if _tid:
+                                        st.success("✅ 已排入撤分佇列，約 10–30 秒後生效，儀表板與成績將自動重算。")
+                                    else:
+                                        st.error("❌ 排入佇列失敗，請重試或檢查網路連線。")
+
+                st.markdown("---")
+                st.markdown("#### 🗂️ 線上申訴審核（管道已關閉，此區僅處理先前遺留的案件）")
 
                 # [Fix] 用 session_state 紀錄本地已排入佇列的申訴 ID，避免重複顯示
                 if "queued_appeal_ids" not in st.session_state:
@@ -4200,6 +4281,8 @@ td.pt{{font-weight:800;text-align:center;}}
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                             )
             with t1:
+                # [V6.1] 晨掃制度已冷凍：學生端「晨掃志工隊」已自選單移除，此頁僅供處理遺留待審紀錄
+                st.warning("🗄️ 晨掃制度已停用：學生端入口已關閉，不會再有新的晨掃回報。此頁僅供處理停用前的遺留待審紀錄；全部清空後即可忽略此分頁。")
                 # [V5.29 Patch] 本週晨掃進度追蹤 (含過去缺交)
                 st.subheader("🕵️‍♀️ 晨掃進度追蹤 (本週)")
                 main_df = load_main_data()
@@ -4806,7 +4889,8 @@ td.pt{{font-weight:800;text-align:center;}}
                 # [V6 新增] 一鍵匯出學校正規時數檔（純讀取，不寫入任何資料）
                 st.markdown("---")
                 with st.expander("📥 匯出學校正規時數檔（期末交給幹事用）", expanded=False):
-                    st.caption("彙總 service_hours 各學生時數 → 反查名冊 → 產出與學校格式相同的 Excel（證明單分頁＋服務時數整批輸入表）。只讀取資料，不會寫入或修改任何內容。")
+                    st.caption("彙總 service_hours 各學生時數 → 反查名冊 → 產出與學校格式相同的 Excel（證明單分頁＋服務時數整批輸入表）。產檔成功後會將本批來源資料蓋上「匯出批號」以利追蹤與封存；除批號欄外不修改任何數字。")
+                    _exp_scope = st.radio("匯出範圍", ["🆕 僅未蓋章（尚未匯出過）的資料", "🔁 全部資料（重新匯出）"], horizontal=True, key="exp_scope")
                     _ec1, _ec2, _ec3 = st.columns(3)
                     _exp_default_start = date(today_tw.year, 2, 1) if today_tw.month < 8 else date(today_tw.year, 8, 1)
                     _exp_start = _ec1.date_input("統計起日", _exp_default_start, key="exp_start")
@@ -4830,10 +4914,15 @@ td.pt{{font-weight:800;text-align:center;}}
                             if _svc_df.empty or "學號" not in _svc_df.columns:
                                 st.warning("service_hours 分頁沒有資料。")
                             else:
+                                _svc_df["_row"] = range(2, len(_svc_df) + 2)  # [V6.2] 對應試算表實際列號（蓋章用）
                                 _svc_df["日期"] = pd.to_datetime(_svc_df["日期"], errors="coerce").dt.date
                                 _svc_df["時數"] = pd.to_numeric(_svc_df["時數"], errors="coerce").fillna(0)
                                 _svc_df["學號"] = _svc_df["學號"].apply(clean_id)
                                 _svc_df = _svc_df[(_svc_df["日期"] >= _exp_start) & (_svc_df["日期"] <= _exp_end) & (_svc_df["時數"] > 0)]
+                                if "🆕" in _exp_scope and "匯出批號" in _svc_df.columns:
+                                    _svc_df = _svc_df[_svc_df["匯出批號"].astype(str).str.strip() == ""]
+                                if _svc_df.empty:
+                                    st.warning("⚠️ 此範圍內沒有符合的資料。若選了「🆕 僅未蓋章」，代表這段期間的資料都已匯出過，可改選「🔁 全部資料」重新匯出。")
 
                                 def _act_name(cat):
                                     _c0 = str(cat).split("｜")[0].strip()
@@ -4878,7 +4967,24 @@ td.pt{{font-weight:800;text-align:center;}}
                                             _sheet_df.to_excel(_xw, sheet_name=f"{_act}{_i // 20 + 1}"[:31], index=False, header=False)
                                     pd.DataFrame(_batch_rows, columns=["學號", "簽呈日期", "開始日期", "結束日期", "單位代碼", "服務內容代碼", "時數", "備註"]).to_excel(_xw, sheet_name="服務時數整批輸入表", index=False)
 
-                                st.success(f"✅ 完成！共 {len(_agg)} 筆學生時數、{_agg['活動'].nunique()} 種活動。")
+                                # [V6.2] 匯出蓋章：本批來源資料標上匯出批號（只寫批號欄，不動任何數字）
+                                _batch_id = f"{_roc(today_tw)}-{time.strftime('%H%M')}"
+                                _stamped = 0
+                                if not _svc_df.empty:
+                                    try:
+                                        _hdr_row = _svc_ws.row_values(1)
+                                        if "匯出批號" in _hdr_row:
+                                            _stamp_col = _hdr_row.index("匯出批號") + 1
+                                        else:
+                                            _stamp_col = len(_hdr_row) + 1
+                                            _svc_ws.update_cell(1, _stamp_col, "匯出批號")
+                                        _cells = [gspread.Cell(row=int(_r), col=_stamp_col, value=_batch_id) for _r in _svc_df["_row"].tolist()]
+                                        if _cells:
+                                            _svc_ws.update_cells(_cells)
+                                            _stamped = len(_cells)
+                                    except Exception as _stamp_e:
+                                        st.warning(f"⚠️ 匯出檔已產生，但蓋章失敗（可重按一次或忽略）：{_stamp_e}")
+                                st.success(f"✅ 完成！共 {len(_agg)} 筆學生時數、{_agg['活動'].nunique()} 種活動；已蓋章 {_stamped} 列，批號 **{_batch_id}**。核對無誤、交件完成後，可用試算表選單「🧹 衛生組工具 → 📦 依匯出批號封存」將此批封存。")
                                 _no_name = [s for s in _agg["學號"].astype(str) if s not in _ros_map or not _ros_map[s][2]]
                                 if _no_name:
                                     st.warning(f"⚠️ 有 {len(_no_name)} 個學號在名冊查不到姓名（欄位留白）：" + "、".join(_no_name[:15]) + ("…" if len(_no_name) > 15 else ""))
@@ -4893,9 +4999,55 @@ td.pt{{font-weight:800;text-align:center;}}
             with t_debt:
                 st.subheader("🤝 愛校與欠時管理")
 
-                # ── 區塊 A：📥 待驗收愛校任務 ──
-                with st.expander("📥 待驗收愛校任務", expanded=True):
-                    _claimed_tasks = fetch_claimed_notion_tasks()
+                # ── [V6.1] 區塊 A0：✅ 愛校完成登記（現場版，取代 Notion 認領流程） ──
+                with st.expander("✅ 愛校完成登記（現場版）", expanded=True):
+                    st.caption("學生現場完成愛校工作後，在此登記。系統將自動處理：🟢 還時數→扣抵欠時＋寫入補打掃時數；🔔 消警告→寫入消警告紀錄（之後到下方「🖨️ 銷過單核發」產製表單）。糾察懲罰性愛校為現場完成即可，不需登記。")
+                    _cs_c1, _cs_c2 = st.columns(2)
+                    _cs_date = _cs_c1.date_input("完成日期", today_tw, key="cs_date")
+                    _cs_purpose = _cs_c2.radio("登記目的", ["🟢 還時數（補打掃）", "🔔 消警告"], horizontal=True, key="cs_purpose")
+                    _cs_c3, _cs_c4 = st.columns(2)
+                    _cs_hours = _cs_c3.number_input("時數 (小時)", min_value=0.25, max_value=8.0, value=1.0, step=0.25, key="cs_hours")
+                    _cs_time = _cs_c4.text_input("開始時間（選填，會印在銷過單上）", key="cs_time", placeholder="例如：12:10")
+                    _cs_area = st.text_input("工作內容（必填，例如：資收場整理、川堂拖地）", key="cs_area")
+                    _cs_sids_raw = st.text_area("學號（可多位，用逗號、空白或換行分隔）", key="cs_sids", placeholder="例如：311005, 311024\n411001")
+                    _cs_sids = re.findall(r"\d+", _cs_sids_raw or "")
+                    if _cs_sids:
+                        st.write(f"👥 解析到 {len(_cs_sids)} 位學生：{', '.join(_cs_sids)}")
+                    _cs_confirm = st.checkbox("我確認以上學生已完成愛校工作", key="cs_confirm")
+                    if st.button("📝 送出登記", key="cs_go"):
+                        if not _cs_sids:
+                            st.error("❌ 請輸入至少一位學號")
+                        elif not _cs_area.strip():
+                            st.error("❌ 請填寫工作內容")
+                        elif _block_future_date(_cs_date, "完成日期"):
+                            pass
+                        elif not _cs_confirm:
+                            st.warning("⚠️ 請先勾選確認")
+                        elif time.time() - st.session_state.last_action_time < 3:
+                            st.warning("⚠️ 系統處理中，請勿連續點擊！")
+                        else:
+                            st.session_state.last_action_time = time.time()
+                            _cs_tag = "消警告" if "消警告" in _cs_purpose else "還時數"
+                            # 重用 campus_service_verify Worker：格式與 Notion 認領完全相同，
+                            # 含 SQLite dedup、扣抵欠時、service_hours 寫入；notion_page_id 留空即略過 Notion 更新
+                            _tid = enqueue_task("campus_service_verify", {
+                                "claimants": [f"{_s}({_cs_tag})" for _s in _cs_sids],
+                                "task_title": _cs_area.strip(),
+                                "task_hours": float(_cs_hours),
+                                "task_date": str(_cs_date),
+                                "notion_page_id": "",
+                                "task_area": _cs_area.strip(),
+                                "time_start": _cs_time.strip()
+                            })
+                            if _tid:
+                                st.success(f"✅ 已排入處理佇列（{len(_cs_sids)} 人，{_cs_tag}）。約 10–30 秒後生效；消警告請稍後至「🖨️ 銷過單核發」產製表單。")
+                            else:
+                                st.error("❌ 排入佇列失敗，請重試或檢查網路連線。")
+
+                # ── 區塊 A：📥 Notion 待驗收（遺留區） ──
+                with st.expander("🗄️ Notion 待驗收（遺留區，僅供處理停用前的舊任務）", expanded=False):
+                    st.caption("愛校已改為現場登記制（上方區塊）。Notion 未連線時此區自動略過。")
+                    _claimed_tasks = fetch_claimed_notion_tasks() if get_notion_client() else []
                     if not _claimed_tasks:
                         st.success("🎉 目前沒有待驗收的任務！")
                     else:
