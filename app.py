@@ -1493,6 +1493,18 @@ try:
         df = pd.DataFrame(ws.get_all_records())
         id_c, cls_c = next((c for c in df.columns if "學號" in c), None), next((c for c in df.columns if "班級" in c), None)
         return {clean_id(row[id_c]): str(row[cls_c]).strip() for _, row in df.iterrows()} if id_c and cls_c else {}
+
+    def load_roster_name_map():
+        """[V6.3] 學號→姓名對照（roster 分頁需含姓名欄；查無回空 dict，銷過單姓名留白手寫）"""
+        try:
+            ws = get_worksheet(SHEET_TABS["roster"])
+            df = pd.DataFrame(ws.get_all_records()) if ws else pd.DataFrame()
+            id_c = next((c for c in df.columns if "學號" in c), None)
+            nm_c = next((c for c in df.columns if "姓名" in c), None)
+            if not id_c or not nm_c: return {}
+            return {clean_id(r[id_c]): str(r[nm_c]).strip() for _, r in df.iterrows()}
+        except Exception:
+            return {}
     
     @safe_cached(ttl=3600, default_factory=lambda: ([], []))
     def load_sorted_classes():
@@ -1949,9 +1961,11 @@ try:
         "b3BzL2FwcC54bWxQSwUGAAAAAAwADAAmAwAAuSgAAAAA"
     )
 
-    def generate_appeal_form_excel(student_id, cls_name, records):
-        """[愛校2.0] 生成消警告申請單 Excel，直接套用學校官方模板，100% 保留原版格式。"""
+    def generate_appeal_form_excel(student_id, cls_name, records, student_name=""):
+        """[愛校2.0] 生成消警告申請單 Excel，直接套用學校官方模板，100% 保留原版格式。
+        [V6.3] 姓名自動帶入、時數拆成每列 1 小時、時間欄置中換行、簽核區改四欄（移除主任教官）。"""
         import base64
+        from copy import copy as _cpy
         from openpyxl import load_workbook
 
         # 從嵌入模板載入（保留所有框線、合併、字型、列印設定）
@@ -1959,15 +1973,31 @@ try:
         wb = load_workbook(io.BytesIO(tmpl_bytes))
         ws = wb.active
 
-        # ── Row 3：填入班級 / 學號（姓名欄留空，手寫）──
-        # A3='班　級'(label) B3=班級值  C3='姓　名'(label) D3=空  E3='學　號'(label) F3:G3=學號值
+        # ── Row 3：填入班級 / 姓名 / 學號 ──
         from openpyxl.styles import Alignment
         _ac = Alignment(horizontal='center', vertical='center', wrap_text=True)
         ws['B3'] = cls_name
         ws['B3'].alignment = _ac          # [Fix] 置中
-        ws['D3'] = ''
+        ws['D3'] = str(student_name or '')   # [V6.3 #5] 姓名自動帶入（名冊查無則留空手寫）
+        ws['D3'].alignment = _ac
         ws['F3'] = str(student_id)        # F3:G3 merged，填左上角
         ws['F3'].alignment = _ac          # [Fix] 置中
+
+        # ── [V6.3 #2] 時數拆列：每 1 小時一列（1 小時銷 1 支警告），餘數自成一列 ──
+        _flat = []
+        for rec in records:
+            try: _h = float(rec.get('hours', 0))
+            except (ValueError, TypeError): _h = 0.0
+            _n = int(_h)
+            _parts = [1.0] * _n + ([round(_h - _n, 2)] if round(_h - _n, 2) > 0 else [])
+            if not _parts: _parts = [0.0]
+            for _p in _parts:
+                _flat.append({**rec, 'hours': _p})
+        if len(_flat) > 8:
+            # 超過 8 列裝不下：前 7 列各 1 小時，第 8 列吸收剩餘時數
+            _rest = round(sum(x['hours'] for x in _flat[7:]), 2)
+            _flat = _flat[:7] + [{**_flat[7], 'hours': _rest}]
+        records = _flat
 
         # ── Row 5-12：填入服務紀錄（最多 8 列）──
         # 欄對應：A=愛校事由, B=缺曠日期(留空), C:D(merged)=工作內容, E=時間起迄(含日期), F=師長驗收(留空), G=累計時數
@@ -1992,13 +2022,32 @@ try:
                 ws.cell(row=r, column=1).value = '消警告'
                 ws.cell(row=r, column=2).value = None          # [Fix] 缺曠日期留空，手填
                 ws.cell(row=r, column=3).value = rec.get('work_content', '')  # C:D merged，填C
-                ws.cell(row=r, column=5).value = time_str
-                ws.cell(row=r, column=7).value = h if h else None
+                _e = ws.cell(row=r, column=5); _e.value = time_str
+                _e.alignment = _ac                              # [V6.3 #4] 起訖時間：自動換行＋置中
                 total_hours += h
+                _g = ws.cell(row=r, column=7)
+                _g.value = round(total_hours, 2) if h else None  # [V6.3 #2] 累計時數逐列遞增
+                _g.alignment = _ac
             else:
                 # 空白列：清除可能殘留的樣板文字
                 for col in (1, 2, 3, 5, 7):
                     ws.cell(row=r, column=col).value = None
+
+        # ── [V6.3 #3] 審查簽核改四欄：導師｜生輔組長｜學務主任｜校長（移除主任教官）──
+        try:
+            for _rng in ("B16:C16", "B17:C17"):
+                if _rng in [str(x) for x in ws.merged_cells.ranges]:
+                    ws.unmerge_cells(_rng)
+            _lbl_font, _lbl_align = _cpy(ws['A16'].font), _cpy(ws['A16'].alignment)
+            for _c in ("B16", "D16", "E16"):   # G16 為 F16:G16 合併從屬格（唯讀），不可觸碰
+                ws[_c].value = None
+            ws['A16'] = '導師'; ws['C16'] = '生輔組長'; ws['E16'] = '學務主任'; ws['F16'] = '校長'
+            for _c in ("A16", "C16", "E16", "F16"):
+                ws[_c].font = _lbl_font; ws[_c].alignment = _lbl_align
+            for _rng in ("A16:B16", "C16:D16", "A17:B17", "C17:D17"):
+                ws.merge_cells(_rng)
+        except Exception as _sig_e:
+            print(f"[appeal_form] 簽核區改版失敗（沿用原版）: {_sig_e}")
 
         # ── Row 13：合計愛校時數 → F13（F13:G13 merged）──
         ws['F13'] = round(total_hours, 2)
@@ -4535,6 +4584,50 @@ td.pt{{font-weight:800;text-align:center;}}
                 st.info("若需修改名單請直接至 Google Sheet 修改 inspectors / roster / office_areas 分頁")
                 if st.button("🔄 重讀名單 (清除快取)"): st.cache_data.clear(); st.success("已清除快取！")
 
+                # ── [V6.3 新增] 📇 全校名冊匯入（roster 分頁） ──
+                st.markdown("---")
+                st.markdown("#### 📇 全校名冊匯入（roster 分頁）")
+                st.caption("上傳含「學號、班級、座號、姓名」欄位的名冊檔（xls／xlsx，可多分頁——學校服務時數 Excel 或註冊組名冊都可以）。寫入後：時數匯出自動帶班級座號姓名、銷過單自動帶姓名。每年開學更新一次即可。")
+                _ros_up = st.file_uploader("選擇名冊檔", type=["xls", "xlsx"], key="ros_up")
+                if _ros_up is not None:
+                    try:
+                        _sheets_all = pd.read_excel(_ros_up, sheet_name=None, dtype=str)
+                        _fix0 = lambda s: s[:-2] if str(s).endswith(".0") else str(s)
+                        _collected = {}
+                        for _sn, _sdf in _sheets_all.items():
+                            _sdf.columns = [str(c) for c in _sdf.columns]
+                            _cid = next((c for c in _sdf.columns if "學號" in c), None)
+                            _ccl = next((c for c in _sdf.columns if "班級" in c), None)
+                            _cse = next((c for c in _sdf.columns if "座號" in c), None)
+                            _cnm = next((c for c in _sdf.columns if "姓名" in c), None)
+                            if not _cid or not _cnm: continue
+                            for _, _rr in _sdf.iterrows():
+                                _s = clean_id(_rr.get(_cid, ""))
+                                if not _s or len(_s) < 4: continue
+                                _collected[_s] = [
+                                    _s,
+                                    _fix0(str(_rr.get(_ccl, "") or "").strip()) if _ccl else "",
+                                    _fix0(str(_rr.get(_cse, "") or "").strip()) if _cse else "",
+                                    str(_rr.get(_cnm, "") or "").strip(),
+                                ]
+                        if not _collected:
+                            st.error("❌ 檔案中找不到同時含「學號」與「姓名」欄位的分頁，請確認格式。")
+                        else:
+                            st.success(f"✅ 解析到 {len(_collected)} 位學生。預覽前 3 筆：{list(sorted(_collected.values()))[:3]}")
+                            if st.button(f"📥 寫入 roster 分頁（覆蓋既有內容，共 {len(_collected)} 筆）", key="ros_write"):
+                                _ros_ws2 = get_worksheet(SHEET_TABS["roster"])
+                                if _ros_ws2:
+                                    try: _ros_ws2.clear()
+                                    except Exception: pass
+                                    _ros_ws2.append_rows([["學號", "班級", "座號", "姓名"]] + sorted(_collected.values()), value_input_option="RAW")
+                                    try: load_roster_dict.clear()
+                                    except Exception: pass
+                                    st.success("✅ 名冊已寫入！時數匯出與銷過單將自動帶入班級與姓名（頁面重新整理後生效）。")
+                                else:
+                                    st.error("❌ 無法取得 roster 分頁")
+                    except Exception as _ros_e:
+                        st.error(f"❌ 讀取失敗：{_ros_e}（.xls 舊格式需環境含 xlrd 套件，可先在 Excel 另存為 .xlsx 再上傳）")
+
             with t3:
                 st.subheader("🎖️ 服務時數發放")
 
@@ -4919,6 +5012,7 @@ td.pt{{font-weight:800;text-align:center;}}
                                 _svc_df["時數"] = pd.to_numeric(_svc_df["時數"], errors="coerce").fillna(0)
                                 _svc_df["學號"] = _svc_df["學號"].apply(clean_id)
                                 _svc_df = _svc_df[(_svc_df["日期"] >= _exp_start) & (_svc_df["日期"] <= _exp_end) & (_svc_df["時數"] > 0)]
+                                _svc_df = _svc_df[~_svc_df["類別"].astype(str).str.contains("消警告", na=False)]  # [V6.3] 消警告=銷過用不計時數；補打掃照常計入
                                 if "🆕" in _exp_scope and "匯出批號" in _svc_df.columns:
                                     _svc_df = _svc_df[_svc_df["匯出批號"].astype(str).str.strip() == ""]
                                 if _svc_df.empty:
@@ -5433,6 +5527,7 @@ td.pt{{font-weight:800;text-align:center;}}
                                     _grouped[_sid].append(_rec)
 
                                 # 顯示摘要表格
+                                _NAME_MAP = load_roster_name_map()  # [V6.3] 銷過單姓名自動帶入
                                 _summary_rows = []
                                 for _sid, _recs in sorted(_grouped.items()):
                                     _cls_name = ROSTER_DICT.get(clean_id(_sid), "未知班級")
@@ -5476,7 +5571,7 @@ td.pt{{font-weight:800;text-align:center;}}
                                     _cls_name = ROSTER_DICT.get(clean_id(_sid), "未知班級")
                                     _parsed = [_parse_appeal_record(r) for r in _recs[:8]]
                                     if _parsed:
-                                        _excel_bytes = generate_appeal_form_excel(clean_id(_sid), _cls_name, _parsed)
+                                        _excel_bytes = generate_appeal_form_excel(clean_id(_sid), _cls_name, _parsed, student_name=_NAME_MAP.get(clean_id(_sid), ""))
                                         _zf.writestr(f"愛校申請單_{_cls_name}_{_sid}.xlsx", _excel_bytes)
                                         _gen_count += 1
                                         # [方案A] 收集本次產製的紀錄ID
@@ -5525,7 +5620,8 @@ td.pt{{font-weight:800;text-align:center;}}
 
                                 # 產製個別 Excel
                                 _excel_bytes = generate_appeal_form_excel(
-                                    clean_id(_sel_sid), _sel_cls, _parsed_recs
+                                    clean_id(_sel_sid), _sel_cls, _parsed_recs,
+                                    student_name=_NAME_MAP.get(clean_id(_sel_sid), "")
                                 )
                                 if st.download_button(
                                     label=f"📥 下載 {_sel_cls} {_sel_sid} 的銷過單",
