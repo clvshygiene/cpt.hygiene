@@ -1494,6 +1494,28 @@ try:
         id_c, cls_c = next((c for c in df.columns if "學號" in c), None), next((c for c in df.columns if "班級" in c), None)
         return {clean_id(row[id_c]): str(row[cls_c]).strip() for _, row in df.iterrows()} if id_c and cls_c else {}
 
+    def parse_roster_upload(uploaded_file):
+        """[V6.4 資安] 解析名冊檔為 {學號: [學號,班級,座號,姓名]}。
+        只存在當次瀏覽階段記憶體（session_state），關閉頁面即消失，絕不寫入任何雲端。"""
+        _sheets_all = pd.read_excel(uploaded_file, sheet_name=None, dtype=str)
+        _fix0 = lambda s: s[:-2] if str(s).endswith(".0") else str(s)
+        out = {}
+        for _sn, _sdf in _sheets_all.items():
+            _sdf.columns = [str(c) for c in _sdf.columns]
+            _cid = next((c for c in _sdf.columns if "學號" in c), None)
+            _ccl = next((c for c in _sdf.columns if "班級" in c), None)
+            _cse = next((c for c in _sdf.columns if "座號" in c), None)
+            _cnm = next((c for c in _sdf.columns if "姓名" in c), None)
+            if not _cid or not _cnm: continue
+            for _, _rr in _sdf.iterrows():
+                _s = clean_id(_rr.get(_cid, ""))
+                if not _s or len(_s) < 4: continue
+                out[_s] = [_s,
+                           _fix0(str(_rr.get(_ccl, "") or "").strip()) if _ccl else "",
+                           _fix0(str(_rr.get(_cse, "") or "").strip()) if _cse else "",
+                           str(_rr.get(_cnm, "") or "").strip()]
+        return out
+
     def load_roster_name_map():
         """[V6.3] 學號→姓名對照（roster 分頁需含姓名欄；查無回空 dict，銷過單姓名留白手寫）"""
         try:
@@ -4584,50 +4606,6 @@ td.pt{{font-weight:800;text-align:center;}}
                 st.info("若需修改名單請直接至 Google Sheet 修改 inspectors / roster / office_areas 分頁")
                 if st.button("🔄 重讀名單 (清除快取)"): st.cache_data.clear(); st.success("已清除快取！")
 
-                # ── [V6.3 新增] 📇 全校名冊匯入（roster 分頁） ──
-                st.markdown("---")
-                st.markdown("#### 📇 全校名冊匯入（roster 分頁）")
-                st.caption("上傳含「學號、班級、座號、姓名」欄位的名冊檔（xls／xlsx，可多分頁——學校服務時數 Excel 或註冊組名冊都可以）。寫入後：時數匯出自動帶班級座號姓名、銷過單自動帶姓名。每年開學更新一次即可。")
-                _ros_up = st.file_uploader("選擇名冊檔", type=["xls", "xlsx"], key="ros_up")
-                if _ros_up is not None:
-                    try:
-                        _sheets_all = pd.read_excel(_ros_up, sheet_name=None, dtype=str)
-                        _fix0 = lambda s: s[:-2] if str(s).endswith(".0") else str(s)
-                        _collected = {}
-                        for _sn, _sdf in _sheets_all.items():
-                            _sdf.columns = [str(c) for c in _sdf.columns]
-                            _cid = next((c for c in _sdf.columns if "學號" in c), None)
-                            _ccl = next((c for c in _sdf.columns if "班級" in c), None)
-                            _cse = next((c for c in _sdf.columns if "座號" in c), None)
-                            _cnm = next((c for c in _sdf.columns if "姓名" in c), None)
-                            if not _cid or not _cnm: continue
-                            for _, _rr in _sdf.iterrows():
-                                _s = clean_id(_rr.get(_cid, ""))
-                                if not _s or len(_s) < 4: continue
-                                _collected[_s] = [
-                                    _s,
-                                    _fix0(str(_rr.get(_ccl, "") or "").strip()) if _ccl else "",
-                                    _fix0(str(_rr.get(_cse, "") or "").strip()) if _cse else "",
-                                    str(_rr.get(_cnm, "") or "").strip(),
-                                ]
-                        if not _collected:
-                            st.error("❌ 檔案中找不到同時含「學號」與「姓名」欄位的分頁，請確認格式。")
-                        else:
-                            st.success(f"✅ 解析到 {len(_collected)} 位學生。預覽前 3 筆：{list(sorted(_collected.values()))[:3]}")
-                            if st.button(f"📥 寫入 roster 分頁（覆蓋既有內容，共 {len(_collected)} 筆）", key="ros_write"):
-                                _ros_ws2 = get_worksheet(SHEET_TABS["roster"])
-                                if _ros_ws2:
-                                    try: _ros_ws2.clear()
-                                    except Exception: pass
-                                    _ros_ws2.append_rows([["學號", "班級", "座號", "姓名"]] + sorted(_collected.values()), value_input_option="RAW")
-                                    try: load_roster_dict.clear()
-                                    except Exception: pass
-                                    st.success("✅ 名冊已寫入！時數匯出與銷過單將自動帶入班級與姓名（頁面重新整理後生效）。")
-                                else:
-                                    st.error("❌ 無法取得 roster 分頁")
-                    except Exception as _ros_e:
-                        st.error(f"❌ 讀取失敗：{_ros_e}（.xls 舊格式需環境含 xlrd 套件，可先在 Excel 另存為 .xlsx 再上傳）")
-
             with t3:
                 st.subheader("🎖️ 服務時數發放")
 
@@ -4993,6 +4971,14 @@ td.pt{{font-weight:800;text-align:center;}}
                     _date_span = f"{_roc(_exp_start)}~{_roc(_exp_end)}"
                     st.write(f"證明單日期區間將填為：**{_date_span}**")
 
+                    _ros_up_exp = st.file_uploader("📇 名冊檔（選填：xls/xlsx，僅存本次瀏覽階段記憶體、不寫入雲端，用來帶入班級座號姓名）", type=["xls", "xlsx"], key="exp_roster_up")
+                    if _ros_up_exp is not None:
+                        try:
+                            st.session_state["session_roster"] = parse_roster_upload(_ros_up_exp)
+                            st.success(f"✅ 名冊已載入（{len(st.session_state['session_roster'])} 位）。僅存在本次瀏覽階段，關閉頁面即自動消失。")
+                        except Exception as _pe:
+                            st.error(f"❌ 名冊讀取失敗：{_pe}（.xls 舊格式讀不了時，請先用 Excel 另存為 .xlsx）")
+
                     if st.button("🚀 產生匯出檔", key="exp_go"):
                         _openpyxl_ok = True
                         try:
@@ -5039,7 +5025,9 @@ td.pt{{font-weight:800;text-align:center;}}
                                             _rr[_c_seat] if _c_seat else "",
                                             str(_rr[_c_name]).strip() if _c_name else "",
                                         )
-                                _miss_cols = [n for n, c in [("座號", _c_seat), ("姓名", _c_name)] if c is None]
+                                for _s, _v in st.session_state.get("session_roster", {}).items():
+                                    _ros_map[_s] = (_v[1], _v[2], _v[3])  # [V6.4 資安] 階段名冊優先
+                                _miss_cols = [n for n, c in [("座號", _c_seat), ("姓名", _c_name)] if c is None and not st.session_state.get("session_roster")]
                                 if _miss_cols:
                                     st.warning("⚠️ roster 分頁缺少欄位：" + "、".join(_miss_cols) + "，這些欄位將留白。建議至 Google Sheet 補齊後重新產生。")
 
@@ -5440,6 +5428,18 @@ td.pt{{font-weight:800;text-align:center;}}
                 # ── 區塊 C：🖨️ 銷過單核發 (一鍵批次) ──
                 with st.expander("🖨️ 銷過單核發 (消警告單)", expanded=True):
                     st.info("💡 系統自動查詢所有「愛校服務(消警告)」紀錄，一鍵產製所有學生的《愛校服務申請單》。")
+                    # [V6.4 資安] 階段性名冊：僅存瀏覽器工作階段記憶體，關頁即消失，不寫入雲端
+                    if st.session_state.get("session_roster"):
+                        st.success(f"📇 名冊已載入本階段（{len(st.session_state['session_roster'])} 位），銷過單將自動帶入姓名與班級。")
+                    else:
+                        _ros_up_ap = st.file_uploader("📇 名冊檔（選填：帶入姓名與班級用，僅存本次瀏覽階段、不寫入雲端）", type=["xls", "xlsx"], key="appeal_roster_up")
+                        if _ros_up_ap is not None:
+                            try:
+                                st.session_state["session_roster"] = parse_roster_upload(_ros_up_ap)
+                                st.success(f"✅ 名冊已載入（{len(st.session_state['session_roster'])} 位）。")
+                                st.rerun()
+                            except Exception as _pe:
+                                st.error(f"❌ 名冊讀取失敗：{_pe}")
 
                     # [方案A] 顯示模式切換
                     _show_all_issued = st.checkbox(
@@ -5528,9 +5528,11 @@ td.pt{{font-weight:800;text-align:center;}}
 
                                 # 顯示摘要表格
                                 _NAME_MAP = load_roster_name_map()  # [V6.3] 銷過單姓名自動帶入
+                                _SESS_ROS = st.session_state.get("session_roster", {})
+                                _NAME_MAP.update({_s: _v[3] for _s, _v in _SESS_ROS.items()})  # [V6.4 資安] 階段名冊優先
                                 _summary_rows = []
                                 for _sid, _recs in sorted(_grouped.items()):
-                                    _cls_name = ROSTER_DICT.get(clean_id(_sid), "未知班級")
+                                    _cls_name = (_SESS_ROS.get(clean_id(_sid), ["","","",""])[1] or ROSTER_DICT.get(clean_id(_sid), "未知班級"))
                                     _total_h = sum(float(r.get("時數", 0)) for r in _recs)
                                     _issued_tag = "✅ 已核發" if all(str(r.get("核發狀態","")).strip() == "已核發" for r in _recs) else "⏳ 未核發"
                                     _summary_rows.append({
@@ -5599,7 +5601,7 @@ td.pt{{font-weight:800;text-align:center;}}
                         if _sel_appeal_student:
                             _sel_sid = _sel_appeal_student.split(" ")[0]
                             _sel_recs = _grouped.get(_sel_sid, [])
-                            _sel_cls = ROSTER_DICT.get(clean_id(_sel_sid), "未知班級")
+                            _sel_cls = (st.session_state.get("session_roster", {}).get(clean_id(_sel_sid), ["","","",""])[1] or ROSTER_DICT.get(clean_id(_sel_sid), "未知班級"))
 
                             if _sel_recs:
                                 _parsed_recs = [_parse_appeal_record(r) for r in _sel_recs[:8]]
