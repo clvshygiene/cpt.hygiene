@@ -3636,9 +3636,9 @@ try:
                     st.code("\n".join(reversed(list(_WORKER_LOG))), language=None)
             st.divider()
 
-            t_dash, t_mon, t_rollcall, t_appeal, t_excellent, t2, t1, t_settings, t3, t_debt = st.tabs([
-                "📈 儀表板與明細", "👀 衛生糾察", "🙋 出勤點名", "📣 申訴", "⭐ 優良審核", "📊 成績總表", 
-                "🧹 晨掃審核(停用)", "⚙️ 設定", "🎖️ 服務時數發放", "🤝 愛校與欠時管理"  # [V6.1] 點名合併、明細併入儀表板
+            t_dash, t_rollcall, t_appeal, t_excellent, t2, t_settings, t3, t_debt = st.tabs([
+                "📈 儀表板與明細", "🙋 出勤點名", "📣 申訴", "⭐ 優良審核", "📊 成績總表", 
+                "⚙️ 設定", "🎖️ 服務時數發放", "🤝 愛校與欠時管理"  # [V6.5] 移除監控與晨掃頁
             ])
             
             with t_dash:
@@ -3681,16 +3681,34 @@ try:
                             if dw.empty:
                                 st.success("🎉 本週目前無扣分紀錄！")
                             else:
-                                _rank = dw.groupby("班級")["扣分合計"].sum().sort_values(ascending=False)
-                                st.bar_chart(_rank)
+                                import altair as alt  # [V6.4] 中文標籤直式顯示
+                                _rank_df = dw.groupby("班級")["扣分合計"].sum().sort_values(ascending=False).reset_index()
+                                _rank_df.columns = ["班級", "扣分"]
+                                st.altair_chart(
+                                    alt.Chart(_rank_df).mark_bar().encode(
+                                        x=alt.X("班級:N", sort="-y", axis=alt.Axis(labelAngle=0, labelExpr="join(split(datum.label, ''), '\\n')", title=None, labelFontSize=13)),
+                                        y=alt.Y("扣分:Q", title=None),
+                                        tooltip=["班級", "扣分"]
+                                    ).properties(height=320),
+                                    use_container_width=True
+                                )
                         with col_item:
                             st.markdown("#### 🧾 常見違規細項 Top 10（近四週）")
                             _items = []
                             for _v in d4.get("違規細項", pd.Series(dtype=str)).fillna(""):
                                 _items += [x.strip() for x in str(_v).replace(",", "、").split("、") if x.strip()]
                             if _items:
-                                _icnt = pd.Series(_items).value_counts().head(10)
-                                st.bar_chart(_icnt)
+                                import altair as alt  # [V6.4] 中文標籤直式顯示
+                                _icnt_df = pd.Series(_items).value_counts().head(10).reset_index()
+                                _icnt_df.columns = ["違規項目", "次數"]
+                                st.altair_chart(
+                                    alt.Chart(_icnt_df).mark_bar().encode(
+                                        x=alt.X("違規項目:N", sort="-y", axis=alt.Axis(labelAngle=0, labelExpr="join(split(datum.label, ''), '\\n')", title=None, labelFontSize=13)),
+                                        y=alt.Y("次數:Q", title=None),
+                                        tooltip=["違規項目", "次數"]
+                                    ).properties(height=320),
+                                    use_container_width=True
+                                )
                                 st.caption("👉 從這裡看出全校最常發生的問題：是該「教方法」，還是該「加強盯場」。")
                             else:
                                 st.info("近四週沒有違規細項紀錄。")
@@ -3786,46 +3804,6 @@ td.pt{{font-weight:800;text-align:center;}}
                                 mime="text/html",
                                 key="dk_dl"
                             )
-
-            with t_mon:
-                st.subheader("🕵️ 今日「衛生糾察」進度監控")
-                monitor_date = st.date_input("監控日期", today_tw, key="monitor_date")
-                st.caption(f"📅 此區顯示負責「內掃、外掃、機動」的評分糾察進度。")
-
-                df = load_main_data()
-                # 監控只需近兩週
-                _nw = get_week_num(today_tw)
-                if _nw >= 3:
-                    df = df[df["週次"] >= _nw - 2]
-                submitted_names = set()
-                if not df.empty:
-                    today_records = df[df["日期"].astype(str) == str(monitor_date)]
-                    submitted_names = set(today_records["檢查人員"].unique())
-
-                cleaning_inspectors = [p for p in INSPECTOR_LIST if any(x in p.get("raw_role", "") for x in ["內掃", "外掃", "機動", "隊長", "組長"])]
-                
-                regular_inspectors, mobile_inspectors = [], []
-                for p in cleaning_inspectors:
-                    p_name = p["label"]
-                    is_mobile = len(p.get("assigned_classes", [])) == 0
-                    status_obj = {"name": p_name, "role_desc": p.get("raw_role", ""), "done": p_name in submitted_names}
-                    if is_mobile: mobile_inspectors.append(status_obj)
-                    else: regular_inspectors.append(status_obj)
-
-                col_reg, col_mob = st.columns(2)
-                with col_reg:
-                    st.write("#### 🔴 班級評分員 (未完成)")
-                    missing_reg = [x for x in regular_inspectors if not x["done"]]
-                    if missing_reg:
-                        for p in missing_reg: st.error(f"❌ {p['name']}")
-                    else: st.success("🎉 全員完成！")
-                with col_mob:
-                    st.write("#### 🟠 機動/隊長 (未完成)")
-                    st.caption("機動人員若今日無違規，可能不會送出資料。")
-                    missing_mob = [x for x in mobile_inspectors if not x["done"]]
-                    if missing_mob:
-                        for p in missing_mob: st.warning(f"⚠️ {p['name']} \n ({p['role_desc']})")
-                    else: st.success("🎉 全員完成！")
 
             with t_rollcall:
                 # [V6.1] 衛生／環保點名合併為單一分頁，由使用者切換隊別
@@ -4357,218 +4335,6 @@ td.pt{{font-weight:800;text-align:center;}}
                                 file_name=f"衛生成績_全學期_{today_tw.strftime('%Y%m%d')}.xlsx",
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                             )
-            with t1:
-                # [V6.1] 晨掃制度已冷凍：學生端「晨掃志工隊」已自選單移除，此頁僅供處理遺留待審紀錄
-                st.warning("🗄️ 晨掃制度已停用：學生端入口已關閉，不會再有新的晨掃回報。此頁僅供處理停用前的遺留待審紀錄；全部清空後即可忽略此分頁。")
-                # [V5.29 Patch] 本週晨掃進度追蹤 (含過去缺交)
-                st.subheader("🕵️‍♀️ 晨掃進度追蹤 (本週)")
-                main_df = load_main_data()
-                # 晨掃進度追蹤只需近兩週
-                _nw2 = get_week_num(today_tw)
-                if _nw2 >= 3:
-                    main_df = main_df[main_df["週次"] >= _nw2 - 2]
-                
-                from datetime import timedelta
-                # 計算本週一是哪一天
-                start_of_week = today_tw - timedelta(days=today_tw.weekday())
-                
-                weekly_assigned = {}
-                # 1. 抓取從本週一到今天，每天被排班的班級
-                for i in range((today_tw - start_of_week).days + 1):
-                    check_date = start_of_week + timedelta(days=i)
-                    c_duty_df, _ = get_daily_duty(check_date)
-                    if not c_duty_df.empty:
-                        for c in c_duty_df["負責班級"].dropna().astype(str).tolist():
-                            # [V5.30 Patch 2] 確保班級名稱沒有前後空白，避免對不上
-                            if c.strip(): weekly_assigned[c.strip()] = check_date
-                            
-                # 2. 抓取本週「有交過任何晨掃紀錄」(包含準時交跟跨日補掃) 的班級
-                submitted_classes = set()
-                for _, r in main_df.iterrows():
-                    if "晨間打掃" in str(r["評分項目"]):
-                        try:
-                            # 安全地將字串轉換為日期進行比較
-                            r_date = pd.to_datetime(str(r["日期"])).date()
-                            if start_of_week <= r_date <= today_tw:
-                                submitted_classes.add(str(r["班級"]))
-                        except Exception: pass  # 日期解析失敗忽略
-                        
-                # 3. 交叉比對找出缺交名單
-                today_missing = []
-                past_missing = []
-                
-                for cls, a_date in weekly_assigned.items():
-                    if cls not in submitted_classes:
-                        if a_date == today_tw:
-                            today_missing.append(cls)
-                        else:
-                            # 如果是過去缺交的，在後面加上 (月/日) 標籤
-                            past_missing.append(f"{cls} ({a_date.month}/{a_date.day})")
-                            
-                # 4. 將結果顯示在畫面上
-                if not weekly_assigned:
-                    st.info("本週至今無晨掃排班任務。")
-                elif not today_missing and not past_missing:
-                    st.success("🎉 太棒了！本週至今所有排定班級皆已完成晨掃回報！")
-                else:
-                    # 顯示今天的缺交狀態
-                    if today_missing:
-                        st.error(f"🚨 **今日尚未回報 ({len(today_missing)}班)：** {', '.join(sorted(today_missing))}")
-                    else:
-                        st.success("🎉 今日排定班級皆已完成回報！")
-                        
-                    # 顯示過去尚未補掃的狀態 (這就是妳要的功能！)
-                    if past_missing:
-                        st.warning(f"⚠️ **本週未補掃名單 ({len(past_missing)}班)：** {', '.join(sorted(past_missing))}")
-                        
-                st.markdown("---")
-                st.subheader("📝 待審核回報列表")
-
-                # [防跳掉] 用 session_state 記錄本地已審核的 ID，避免每次按鈕都刷新整頁
-                if "approved_morning_ids" not in st.session_state:
-                    st.session_state.approved_morning_ids = set()
-
-                df = main_df
-                
-                # [Fix] 找出本週已經有「審核完成」紀錄的班級+日期組合
-                # 這些班級的其他重複紀錄應視為已處理，不再顯示在待審列表
-                approved_cls_dates = set()
-                for _, r in df.iterrows():
-                    item_str = str(r["評分項目"])
-                    if item_str in ["晨間打掃(學期加分)", "晨間打掃(已駁回)"]:
-                        try:
-                            r_date = pd.to_datetime(str(r["日期"])).date()
-                            if start_of_week <= r_date <= today_tw:
-                                approved_cls_dates.add((str(r["班級"]).strip(), str(r["日期"]).strip()))
-                        except Exception:
-                            pass
-                
-                pending_df = df[
-                    df["評分項目"].isin(["晨間打掃", "晨間打掃(當日補掃)", "晨間打掃(補掃)"]) &
-                    (df["晨間打掃原始分"] == 0) &
-                    (~df["修正"]) &
-                    (~df["紀錄ID"].astype(str).isin(st.session_state.approved_morning_ids))
-                ].drop_duplicates(subset=["紀錄ID"])
-                
-                # [Fix] 排除已有審核完成紀錄的重複項目
-                if approved_cls_dates and not pending_df.empty:
-                    dup_mask = pending_df.apply(
-                        lambda r: (str(r["班級"]).strip(), str(r["日期"]).strip()) in approved_cls_dates,
-                        axis=1
-                    )
-                    dup_count = dup_mask.sum()
-                    pending_df = pending_df[~dup_mask]
-                    if dup_count > 0:
-                        st.info(f"ℹ️ 已自動排除 {dup_count} 筆重複紀錄（該班級同日已有審核結果）。")
-
-                if pending_df.empty:
-                    st.success("🎉 目前沒有待審核的晨掃回報！")
-                else:
-                    st.caption(f"共 {len(pending_df)} 筆待審核，審核後不會立刻跳頁，可以繼續審核其他筆。")
-
-                # [Fix Async] _do_approve_async：enqueue_task 同步排隊，檢查回傳值才顯示成功
-                def _do_approve_async(record_id, s_val, note_text, reply, col_ref, cached_main_df):
-                    """將晨掃審核排入佇列，Worker 背景處理"""
-                    matched = cached_main_df.loc[cached_main_df["紀錄ID"].astype(str) == str(record_id), "備註"]
-                    old_note = str(matched.iloc[0]) if not matched.empty else ""
-                    new_note = f"{old_note} \n組長回覆: {reply}" if reply else f"{old_note} \n組長核可: {note_text}"
-                    _tid = enqueue_task("morning_sweep_approve", {
-                        "record_id": str(record_id),
-                        "action": "approve",
-                        "score_val": s_val,
-                        "new_item": "晨間打掃(學期加分)",
-                        "new_note": new_note
-                    })
-                    if _tid:
-                        st.session_state.approved_morning_ids.add(str(record_id))
-                        col_ref.success(f"✅ 已排入佇列！學期加 {abs(s_val):g} 分（背景處理中）")
-                    else:
-                        col_ref.error("❌ 排入佇列失敗，請重試或檢查網路連線。")
-
-                for i, r in pending_df.iterrows():
-                    with st.container(border=True):
-                        c1, c2, c3 = st.columns([2, 2, 1.3])
-
-                        is_makeup = "補掃" in str(r["評分項目"])
-                        title_badge = "🩹 **[補掃]**" if is_makeup else "🧹"
-
-                        # ── 自動解析應到/實到人數，計算建議給分 ──
-                        note_str = str(r.get("備註", ""))
-                        inspector_str = str(r.get("檢查人員", ""))
-
-                        # 從備註解析應到人數（格式：[應到:4人 實到:3人 ...]）
-                        import re as _re
-                        m_req = _re.search(r"應到:(\d+)人", note_str)
-                        m_act = _re.search(r"實到:(\d+)人", note_str)
-                        # fallback：從檢查人員欄位解析實到
-                        if not m_act:
-                            m_act = _re.search(r"實到:(\d+)", inspector_str)
-
-                        n_required = int(m_req.group(1)) if m_req else None
-                        n_actual   = int(m_act.group(1)) if m_act else None
-
-                        # 計算建議給分：基礎分依應到人數，不足打折，補掃再打折
-                        if n_required is not None and n_actual is not None:
-                            base_score  = 2.0 if n_required >= 4 else 1.0
-                            full_attend = n_actual >= n_required
-                            attend_mult = 1.0 if full_attend else 0.5
-                            makeup_mult = 0.5 if is_makeup else 1.0
-                            suggested   = base_score * attend_mult * makeup_mult
-                            score_label = (f"應到 {n_required} 人，實到 {n_actual} 人"
-                                           f"{'（人數足夠）' if full_attend else '（人數不足）'}"
-                                           f"{'，補掃' if is_makeup else ''}"
-                                           f" → 建議給 **{suggested:g} 分**")
-                            score_val = -suggested  # 負數代表學期加分
-                        else:
-                            suggested   = None
-                            score_label = "⚠️ 無法自動解析人數，請手動判斷"
-                            score_val   = None
-
-                        c1.write(f"{title_badge} **{r['班級']}** | {inspector_str}")
-                        c1.caption(f"登錄時間：{r['登錄時間']}")
-                        c1.info(score_label)
-
-                        if "http" in str(r['照片路徑']):
-                            c2.image([p for p in str(r['照片路徑']).split(";") if "http" in p], width=150)
-
-                        reply_msg = c1.text_input("💬 給予回應 (可留白)", key=f"rm_{r['紀錄ID']}_{i}")
-
-                        # ── 審核按鈕：給分 or 駁回（全部改為 async） ──
-                        if score_val is not None:
-                            if c3.button(f"✅ 給分 ({suggested:g}分)", key=f"approve_{r['紀錄ID']}_{i}"):
-                                _do_approve_async(r["紀錄ID"], score_val,
-                                            f"給分{suggested:g}分（{score_label.split('→')[0].strip()}）",
-                                            reply_msg, c1, main_df)
-                        else:
-                            # 無法自動計算時，提供手動選項
-                            manual_score = c3.selectbox("給分", [2, 1, 0.5, 0.25], key=f"manual_{r['紀錄ID']}_{i}")
-                            if c3.button("✅ 給分", key=f"approve_{r['紀錄ID']}_{i}"):
-                                _do_approve_async(r["紀錄ID"], -manual_score, f"手動給分 {manual_score} 分",
-                                            reply_msg, c1, main_df)
-
-                        if c3.button("🗑️ 駁回", key=f"r_{r['紀錄ID']}_{i}"):
-                            old_note = str(r['備註'])
-                            rej_msg  = reply_msg if reply_msg else "未達標準，請見諒"
-                            new_note = f"{old_note} \n組長駁回: {rej_msg}"
-                            _tid = enqueue_task("morning_sweep_approve", {
-                                "record_id": str(r["紀錄ID"]),
-                                "action": "reject",
-                                "score_val": 0,
-                                "new_item": "晨間打掃(已駁回)",
-                                "new_note": new_note
-                            })
-                            if _tid:
-                                st.session_state.approved_morning_ids.add(str(r["紀錄ID"]))
-                                c1.error("🗑️ 已排入佇列（駁回處理中）")
-                            else:
-                                c1.error("❌ 排入佇列失敗，請重試或檢查網路連線。")
-
-                if not pending_df.empty or st.session_state.approved_morning_ids:
-                    if st.button("🔄 審核完畢，重新整理列表"):
-                        st.session_state.approved_morning_ids.clear()
-                        load_main_data.clear()
-                        st.rerun()
-
             with t_settings:
                 st.subheader("⚙️ 系統設定與維護")
                 curr = SYSTEM_CONFIG.get("semester_start")
@@ -5132,83 +4898,6 @@ td.pt{{font-weight:800;text-align:center;}}
                             else:
                                 st.error("❌ 排入佇列失敗，請重試或檢查網路連線。")
 
-                # ── 區塊 A：📥 Notion 待驗收（遺留區） ──
-                with st.expander("🗄️ Notion 待驗收（遺留區，僅供處理停用前的舊任務）", expanded=False):
-                    st.caption("愛校已改為現場登記制（上方區塊）。Notion 未連線時此區自動略過。")
-                    _claimed_tasks = fetch_claimed_notion_tasks() if get_notion_client() else []
-                    if not _claimed_tasks:
-                        st.success("🎉 目前沒有待驗收的任務！")
-                    else:
-                        for _ct in _claimed_tasks:
-                            with st.container(border=True):
-                                st.write(f"📌 **{_ct['title']}**")
-                                st.caption(f"📅 日期：{_ct['date']}　|　📝 內容：{_ct.get('area', '未填寫')}　|　認領學生：{', '.join(_ct['claimants'])}")
-
-                                # [Fix] 使用統一解析函式，避免重複邏輯
-                                _appeal_students = []
-                                _punish_students = []
-                                _debt_students = []
-                                _parsed_tags_display = []  # [Fix] 收集解析結果供管理員確認
-                                for _clm in _ct["claimants"]:
-                                    _sid, _tag = _parse_claimant_tag(_clm)
-                                    if _sid:
-                                        _parsed_tags_display.append(f"{_sid}→**{_tag}**")
-                                        if _tag == "消警告":
-                                            _appeal_students.append(_sid)
-                                        elif _tag == "糾察懲罰":
-                                            _punish_students.append(_sid)
-                                        else:
-                                            _debt_students.append(_sid)
-
-                                # 顯示各目的標籤摘要
-                                _tag_parts = []
-                                if _debt_students:
-                                    _tag_parts.append(f"🟢 還時數 {len(_debt_students)} 人")
-                                if _appeal_students:
-                                    _tag_parts.append(f"🔔 消警告 {len(_appeal_students)} 人")
-                                if _punish_students:
-                                    _tag_parts.append(f"⚫ 糾察懲罰 {len(_punish_students)} 人")
-                                if _tag_parts:
-                                    st.markdown("　".join(_tag_parts))
-
-                                # [Fix] 顯示每位學生的解析結果，方便管理員確認 tag 是否正確
-                                if _parsed_tags_display:
-                                    st.caption(f"🔍 標籤解析結果：{'、'.join(_parsed_tags_display)}")
-
-                                if _appeal_students:
-                                    st.info(f"💡 偵測到 {len(_appeal_students)} 位學生申請「消警告」（{', '.join(_appeal_students)}），驗收完成後請至下方「🖨️ 銷過單核發」區塊產製申請表單。")
-
-                                # 將按鈕名稱改得更符合實際動作
-                                if st.button("✅ 依標籤自動驗收", key=f"verify_{_ct['id']}"):
-                                    _hr_match = re.search(r"[\(\uff08]([\d.]+)\s*(?:hr|小時|h)[\)\uff09]", _ct["title"], re.IGNORECASE)
-                                    _task_hours = float(_hr_match.group(1)) if _hr_match else 1.0
-
-                                    _verify_payload = {
-                                        "notion_page_id": _ct["id"],
-                                        "task_title": _ct["title"],
-                                        "task_date": _ct.get("date", str(today_tw)),
-                                        "task_area": _ct.get("area", _ct["title"]),
-                                        "time_start": _ct.get("time_start", ""),
-                                        "task_hours": _task_hours,
-                                        "claimants": _ct["claimants"]
-                                    }
-                                    _tid = enqueue_task("campus_service_verify", _verify_payload)
-
-                                    if _tid:
-                                        msg_parts = ["✅ 已排入佇列！系統將背景完成以下操作："]
-                                        if _debt_students:
-                                            msg_parts.append(f"🟢 還時數 {len(_debt_students)} 人（扣欠時 + 發服務時數）")
-                                        if _appeal_students:
-                                            msg_parts.append(f"🔔 消警告 {len(_appeal_students)} 人（寫入 service_hours，稍後可產製銷過單）")
-                                        if _punish_students:
-                                            msg_parts.append(f"⚫ 糾察懲罰 {len(_punish_students)} 人（不發時數）")
-                                        msg_parts.append("📡 Notion 狀態將自動更新為「任務已驗收」")
-                                        st.success("\n".join(msg_parts))
-                                        st.caption(f"🔍 診斷資訊：task_id = `{_tid[:8]}...`　請在 task_queue_v3 搜尋此 ID 確認是否存在")
-                                        st.toast("✅ 驗收已排入佇列，背景處理中", icon="✅")
-                                    else:
-                                        st.error("❌ 排入佇列失敗，請重試。若持續失敗請檢查 Google Sheets 連線。")
-                                        
                 # ── 區塊 B：⚠️ 欠時懲處結算報表 ──
                 with st.expander("⚠️ 欠時懲處結算報表", expanded=True):
                     if st.button("🚀 結算滿 1 小時警告名單", key="debt_settle_btn"):
@@ -5248,117 +4937,6 @@ td.pt{{font-weight:800;text-align:center;}}
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                 key="debt_excel_dl"
                             )
-
-                # ── 區塊 B2：🔓 快速銷帳（補打掃完成） ── [Patch 14]
-                with st.expander("🔓 快速銷帳（補打掃完成）", expanded=False):
-                    st.info("💡 學生完成補打掃後，可在此直接銷帳扣減欠時數。不需繞 Notion 愛校任務。")
-
-                    if st.button("🔎 載入欠時數名單", key="btn_load_debts"):
-                        _all_debts_for_clear = load_student_debts()
-                        if not _all_debts_for_clear:
-                            st.success("🎉 目前沒有學生有欠時數！")
-                        else:
-                            # [Fix] 一次讀取所有備註，不逐筆呼叫 load_student_debt_note
-                            _all_notes_map = {}
-                            try:
-                                _ws_debts = get_worksheet(SHEET_TABS["student_debts"])
-                                if _ws_debts:
-                                    for _r in _ws_debts.get_all_records():
-                                        _nsid = clean_id(str(_r.get("學號", "")))
-                                        _nnote = str(_r.get("備註", "")).strip()
-                                        if _nsid and _nnote:
-                                            if _nsid not in _all_notes_map:
-                                                _all_notes_map[_nsid] = []
-                                            if _nnote not in _all_notes_map[_nsid]:
-                                                _all_notes_map[_nsid].append(_nnote)
-                            except Exception as _ne:
-                                print(f"[quick_clear] 讀取備註失敗: {_ne}")
-
-                            _debt_display = []
-                            for _dsid, _dhours in sorted(_all_debts_for_clear.items()):
-                                if _dhours > 0:
-                                    _cls = ROSTER_DICT.get(_dsid, "未知")
-                                    _note = "；".join(_all_notes_map.get(_dsid, []))
-                                    _debt_display.append({
-                                        "學號": _dsid, "班級": _cls,
-                                        "欠時數": _dhours, "欠時原因": _note
-                                    })
-
-                            if not _debt_display:
-                                st.success("🎉 目前沒有學生有欠時數！")
-                            else:
-                                st.session_state["_debt_display_cache"] = _debt_display
-
-                    # 從 session_state 讀取快取資料（按鈕點擊後才有）
-                    _debt_display = st.session_state.get("_debt_display_cache", [])
-                    if _debt_display:
-                        st.caption(f"共 {len(_debt_display)} 位學生有未完成時數")
-                        _debt_ref_df = pd.DataFrame(_debt_display)
-                        st.dataframe(_debt_ref_df, hide_index=True, use_container_width=True)
-
-                        with st.form("quick_clear_form"):
-                            st.markdown("##### 選擇要銷帳的學生")
-                            _clearable_sids = [f"{d['學號']} ({d['班級']}, 欠{d['欠時數']}hr)" for d in _debt_display]
-                            _sel_clear = st.multiselect("選擇學生（可多選）", _clearable_sids, key="clear_sids")
-
-                            _c_c1, _c_c2 = st.columns(2)
-                            _clear_hours = _c_c1.number_input("銷帳時數", value=2.0, step=0.5, min_value=0.5, key="clear_hours")
-                            _clear_date = _c_c2.date_input("完成日期", today_tw, key="clear_date")
-                            _clear_reason = st.text_input(
-                                "銷帳原因", key="clear_reason",
-                                value=f"{str(today_tw)} 補打掃完成",
-                                placeholder="例如：2/1 返校補掃完成"
-                            )
-
-                            if st.form_submit_button("🔓 確認銷帳"):
-                                if _block_future_date(_clear_date, "完成日期"):
-                                    pass  # 未來日期被擋下
-                                elif not _sel_clear:
-                                    st.error("❌ 請先選擇要銷帳的學生！")
-                                elif time.time() - st.session_state.last_action_time < 3:
-                                    st.warning("⚠️ 系統處理中，請勿連續點擊！")
-                                else:
-                                    st.session_state.last_action_time = time.time()
-                                    _clear_ok = 0
-                                    _clear_fail = []
-                                    _cleared_sids = []  # 收集成功銷帳的學號，用於補發服務時數
-                                    for _sel_item in _sel_clear:
-                                        _c_sid = _sel_item.split(" ")[0]
-                                        try:
-                                            _cok = update_student_debt(_c_sid, -_clear_hours, _clear_reason)
-                                            if _cok:
-                                                _clear_ok += 1
-                                                _cleared_sids.append(_c_sid)
-                                            else:
-                                                _clear_fail.append(_c_sid)
-                                        except Exception as _ce:
-                                            print(f"[銷帳] {_c_sid} 失敗: {_ce}")
-                                            _clear_fail.append(_c_sid)
-
-                                    # 銷帳成功的學生同時補發服務時數
-                                    _svc_written = 0
-                                    if _cleared_sids:
-                                        try:
-                                            _svc_date = str(_clear_date)
-                                            _svc_written = _write_service_hours_direct(
-                                                "補打掃", "返校打掃(補打掃)",
-                                                _clear_hours, _cleared_sids, _svc_date
-                                            )
-                                        except Exception as _se:
-                                            print(f"[銷帳→補發時數] 失敗: {_se}")
-                                            st.warning(f"⚠️ 欠時已銷帳，但補發服務時數失敗，請手動到「服務時數發放」補發。")
-
-                                    if _clear_ok > 0:
-                                        _msg = f"✅ 已為 {_clear_ok} 位學生銷帳 {_clear_hours}hr"
-                                        if _svc_written and _svc_written > 0:
-                                            _msg += f"，並補發 {_svc_written} 筆服務時數（返校打掃(補打掃) {_clear_hours}hr）"
-                                        st.success(_msg)
-                                        st.session_state.pop("_debt_display_cache", None)
-                                    if _clear_fail:
-                                        st.error(f"⚠️ 以下學號銷帳失敗：{', '.join(_clear_fail)}")
-                                    if _clear_ok > 0:
-                                        time.sleep(1.5)
-                                        st.rerun()
 
                 # ── 區塊 B3：📢 欠時數提醒通知 ──
                 with st.expander("📢 欠時數提醒通知", expanded=False):
@@ -5645,61 +5223,6 @@ td.pt{{font-weight:800;text-align:center;}}
                                         _mark_service_hours_issued(_single_rids)
 
                         st.caption("💡 下載後請用 Excel 開啟，確認格式無誤後列印 A4 紙張，再持表單至學務處完成後續流程。")
-
-                # ── 區塊 D：🛠️ 消警告資料補寫工具 ──
-                with st.expander("🛠️ 消警告資料補寫（修復遺失紀錄）", expanded=False):
-                    st.warning("⚠️ 此工具用於手動補寫因系統異常而遺失的消警告 service_hours 紀錄。請確認資料正確後再送出。")
-
-                    _rc1, _rc2 = st.columns(2)
-                    _rc_date = _rc1.date_input("服務日期", today_tw, key="rc_fix_date")
-                    if _block_future_date(_rc_date, "服務日期"):
-                        st.stop()
-                    _rc_hours = _rc2.number_input("服務時數", value=1.0, step=0.5, min_value=0.5, key="rc_fix_hours")
-                    _rc_work = st.text_input("工作內容", key="rc_fix_work", placeholder="例如：校園清潔、廁所打掃")
-                    _rc_time_start = st.text_input("起始時間（選填，格式 HH:MM）", key="rc_fix_time", placeholder="例如: 15:50")
-                    _rc_sids_raw = st.text_area(
-                        "學號清單（每行一個或逗號分隔）",
-                        key="rc_fix_sids",
-                        placeholder="例如：\n112001\n112002, 112003",
-                        height=100
-                    )
-
-                    # 即時解析
-                    _rc_valid_sids = []
-                    _rc_invalid_sids = []
-                    if _rc_sids_raw.strip():
-                        _rc_raw_list = [s.strip() for s in re.split(r'[\n,、，\s]+', _rc_sids_raw) if s.strip()]
-                        for _sid_r in _rc_raw_list:
-                            _csid = clean_id(_sid_r)
-                            if _csid in ROSTER_DICT:
-                                if _csid not in _rc_valid_sids:
-                                    _rc_valid_sids.append(_csid)
-                            else:
-                                if _sid_r not in _rc_invalid_sids:
-                                    _rc_invalid_sids.append(_sid_r)
-                    if _rc_valid_sids:
-                        st.success(f"✅ 有效學號 {len(_rc_valid_sids)} 人")
-                    if _rc_invalid_sids:
-                        st.error(f"❌ 無效學號：{', '.join(_rc_invalid_sids)}")
-
-                    if st.button("📝 補寫消警告紀錄", key="btn_fix_appeal"):
-                        if not _rc_valid_sids:
-                            st.error("❌ 請輸入至少一個有效學號！")
-                        elif not _rc_work.strip():
-                            st.error("❌ 請填寫工作內容！")
-                        elif _rc_invalid_sids:
-                            st.error("❌ 請先修正無效學號！")
-                        else:
-                            _class_field = f"{_rc_work.strip()}|{_rc_time_start.strip()}" if _rc_time_start.strip() else _rc_work.strip()
-                            _write_service_hours_direct(
-                                _class_field,
-                                "愛校服務(消警告)",
-                                _rc_hours,
-                                _rc_valid_sids,
-                                str(_rc_date)
-                            )
-                            st.success(f"✅ 已補寫 {len(_rc_valid_sids)} 位學生的消警告紀錄至 service_hours！")
-                            st.info("💡 補寫完成後，請到上方「🖨️ 銷過單核發」區塊查詢並產製銷過單。")
 
         elif pwd_input != "":
             st.error("密碼錯誤")
