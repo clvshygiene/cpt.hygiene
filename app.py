@@ -2057,7 +2057,7 @@ try:
                 _e.alignment = _ac                              # [V6.3 #4] 起訖時間：自動換行＋置中
                 total_hours += h
                 _g = ws.cell(row=r, column=7)
-                _g.value = round(total_hours, 2) if h else None  # [V6.3 #2] 累計時數逐列遞增
+                _g.value = round(h, 2) if h else None  # [V6.5] 每列填自己的時數（1,1,1），合計欄才是總數
                 _g.alignment = _ac
             else:
                 # 空白列：清除可能殘留的樣板文字
@@ -2639,10 +2639,7 @@ try:
     app_mode = st.sidebar.radio("請選擇模式", menu_options)
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown("📅 [衛生組行事曆](https://www.notion.so/312b7f229eea80c584a1e794c7b955a4)")
-    st.sidebar.markdown("📸 [衛生組 Instagram](https://www.instagram.com/clvs_captain.h/)")
-    st.sidebar.markdown("📂 [衛生組公開資料區](https://drive.google.com/drive/folders/14QcUILCmHKnKhDx2X1dIUl_6PNRndCub)")
-    st.sidebar.markdown("<div class='sidebar-footer'>衛生組長林ㄊㄩ製作@2025</div>", unsafe_allow_html=True)
+    st.sidebar.markdown("<div class='sidebar-footer'>林ㄊㄩ製作@2025</div>", unsafe_allow_html=True)  # [V6.5] 三連結已撤除
 
     # --- Mode: 愛校任務認領 🤝 ---
     if app_mode == "愛校任務認領 🤝":
