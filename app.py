@@ -4756,23 +4756,69 @@ td.pt{{font-weight:800;text-align:center;}}
                                 if _miss_cols:
                                     st.warning("⚠️ roster 分頁缺少欄位：" + "、".join(_miss_cols) + "，這些欄位將留白。建議至 Google Sheet 補齊後重新產生。")
 
-                                _buf = io.BytesIO()
+                                # [V6.5] 學校正式版型：標楷體12、表首粗體、固定20列、含簽表人列與◎注意事項
+                                import openpyxl as _oxl
+                                from openpyxl.styles import Font as _F, Alignment as _A, Border as _B, Side as _S
+                                _fk = lambda **kw: _F(name="標楷體", size=12, **kw)
+                                _thin = _S(style="thin")
+                                _bd = _B(left=_thin, right=_thin, top=_thin, bottom=_thin)
+                                _ac_c = _A(horizontal="center", vertical="center", wrap_text=True)
+                                _ac_l = _A(horizontal="left", vertical="center", wrap_text=True)
+                                _TITLE = "市立中壢高級家事商業職業學校服務學習證明登錄表"
                                 _hdr = ["班級", "座號", "學號\n(務必輸入)", "姓名", "服務活動名稱\n(事由：請簡略說明)", "服務類別\n(填入代號)", "地點", "日期\n(107年3月1日請填1070301)", "時數小時\n(超過8小請以另筆資料登錄)"]
+                                _NOTE = "◎學號欄請務必輸入才可匯入校務系統，核章後請將紙本送至學務處，另請將電子檔寄至jiang@g.clvs.tyc.edu.tw(助理員姜禮洪信箱)"
+                                _COLW = {"A": 9, "B": 6.5, "C": 12, "D": 11, "E": 26, "F": 11, "G": 8, "H": 17, "I": 13}
+
+                                def _build_cert_sheet(_ws2, _chunk):
+                                    for _cl, _wd in _COLW.items(): _ws2.column_dimensions[_cl].width = _wd
+                                    _ws2.merge_cells("A1:I1")
+                                    _t = _ws2["A1"]; _t.value = _TITLE
+                                    _t.font = _F(name="標楷體", size=16, bold=True); _t.alignment = _ac_c
+                                    _ws2.row_dimensions[1].height = 28
+                                    for _ci, _hv in enumerate(_hdr, start=1):
+                                        _c = _ws2.cell(row=2, column=_ci, value=_hv)
+                                        _c.font = _fk(); _c.alignment = _ac_c; _c.border = _bd
+                                    _ws2.row_dimensions[2].height = 42
+                                    for _ri in range(3, 23):  # 固定 20 列，不足留空格
+                                        _ws2.row_dimensions[_ri].height = 22
+                                        _row_vals = _chunk[_ri - 3] if _ri - 3 < len(_chunk) else [""] * 9
+                                        for _ci in range(1, 10):
+                                            _c = _ws2.cell(row=_ri, column=_ci, value=_row_vals[_ci - 1] if _row_vals[_ci - 1] != "" else None)
+                                            _c.font = _fk(); _c.alignment = _ac_c; _c.border = _bd
+                                    _ws2.merge_cells("A23:I23")
+                                    _n = _ws2["A23"]; _n.value = _NOTE
+                                    _n.font = _fk(); _n.alignment = _ac_l; _n.border = _bd
+                                    _ws2.row_dimensions[23].height = 24
+                                    for _rng, _lbl in [("A24:B24", "簽表人："), ("C24:E24", "單位主管："), ("F24:G24", "學務處認證人："), ("H24:I24", "學務處認證日期：")]:
+                                        _ws2.merge_cells(_rng)
+                                        _c = _ws2[_rng.split(":")[0]]; _c.value = _lbl
+                                        _c.font = _fk(); _c.alignment = _ac_l
+                                        for _cc in _ws2[_rng][0]: _cc.border = _bd
+                                    _ws2.row_dimensions[24].height = 26
+
+                                _buf = io.BytesIO()
+                                _wb = _oxl.Workbook()
+                                _wb.remove(_wb.active)
                                 _batch_rows = []
-                                with pd.ExcelWriter(_buf, engine="openpyxl") as _xw:
-                                    for _act, _g in _agg.groupby("活動"):
-                                        _g = _g.sort_values("學號")
-                                        _recs = []
-                                        for _, _r in _g.iterrows():
-                                            _cls_v, _seat_v, _name_v = _ros_map.get(str(_r["學號"]), ("", "", ""))
-                                            if not _cls_v:
-                                                _cls_v = ROSTER_DICT.get(str(_r["學號"]), "")
-                                            _recs.append([_cls_v, _seat_v, str(_r["學號"]), _name_v, _act, "C043", "校內", _date_span, float(_r["時數"])])
-                                            _batch_rows.append([str(_r["學號"]), _exp_sign_date, _date_span, _date_span, "A001", "C043", float(_r["時數"]), _act])
-                                        for _i in range(0, len(_recs), 20):
-                                            _sheet_df = pd.DataFrame([["市立中壢高級家事商業職業學校服務學習證明"] + [""] * 8, _hdr] + _recs[_i:_i + 20])
-                                            _sheet_df.to_excel(_xw, sheet_name=f"{_act}{_i // 20 + 1}"[:31], index=False, header=False)
-                                    pd.DataFrame(_batch_rows, columns=["學號", "簽呈日期", "開始日期", "結束日期", "單位代碼", "服務內容代碼", "時數", "備註"]).to_excel(_xw, sheet_name="服務時數整批輸入表", index=False)
+                                for _act, _g in _agg.groupby("活動"):
+                                    _g = _g.sort_values("學號")
+                                    _recs = []
+                                    for _, _r in _g.iterrows():
+                                        _cls_v, _seat_v, _name_v = _ros_map.get(str(_r["學號"]), ("", "", ""))
+                                        if not _cls_v:
+                                            _cls_v = ROSTER_DICT.get(str(_r["學號"]), "")
+                                        _recs.append([_cls_v, _seat_v, str(_r["學號"]), _name_v, _act, "C043", "校內", _date_span, float(_r["時數"])])
+                                        _batch_rows.append([str(_r["學號"]), _exp_sign_date, _date_span, _date_span, "A001", "C043", float(_r["時數"]), _act])
+                                    for _i in range(0, len(_recs), 20):
+                                        _ws_new = _wb.create_sheet(f"{_act}{_i // 20 + 1}"[:31])
+                                        _build_cert_sheet(_ws_new, _recs[_i:_i + 20])
+                                _ws_b = _wb.create_sheet("服務時數整批輸入表")
+                                for _ci, _hv in enumerate(["學號", "簽呈日期", "開始日期", "結束日期", "單位代碼", "服務內容代碼", "時數", "備註"], start=1):
+                                    _c = _ws_b.cell(row=1, column=_ci, value=_hv); _c.font = _fk(bold=True)
+                                for _ri, _rv in enumerate(_batch_rows, start=2):
+                                    for _ci, _v in enumerate(_rv, start=1):
+                                        _ws_b.cell(row=_ri, column=_ci, value=_v).font = _fk()
+                                _wb.save(_buf)
 
                                 # [V6.2] 匯出蓋章：本批來源資料標上匯出批號（只寫批號欄，不動任何數字）
                                 _batch_id = f"{_roc(today_tw)}-{time.strftime('%H%M')}"
