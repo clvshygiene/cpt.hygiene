@@ -3823,6 +3823,7 @@ td.pt{{font-weight:800;text-align:center;}}
 
                     hyg_rc_date = st.date_input("出勤日期", today_tw, key="hyg_rc_date")
                     hyg_rc_hours = st.number_input("每人發放時數 (小時)", min_value=0.0, max_value=8.0, value=0.25, step=0.25, key="hyg_rc_hours")
+                    st.caption("💡 定案標準：衛生糾察每次執勤 15 分鐘（0.25 小時）。開會、大掃除等額外時數請至「🎖️ 服務時數發放」處理。")
 
                     def _is_hyg_member(p):
                         r = p.get("raw_role", "")
@@ -3881,7 +3882,9 @@ td.pt{{font-weight:800;text-align:center;}}
                     # [V6 新增] 環保糾察拆分中午班 / 下午班，兩班人員不同、分別點名
                     rc_shift = st.radio("點名班別", ["🕛 中午班 (資收場整理)", "🕒 下午班 (垃圾管制)"], horizontal=True, key="insp_rc_shift")
                     shift_tag = "中午" if "中午" in rc_shift else "下午"
-                    rc_hours = st.number_input("每人發放時數 (小時)", min_value=0.0, max_value=8.0, value=0.25, step=0.25, key="insp_rc_hours")
+                    _rc_default = 0.33 if "中午" in rc_shift else 0.25  # [V6.5 定案] 中午班20分鐘≈0.33、下午班15分鐘=0.25
+                    rc_hours = st.number_input("每人發放時數 (小時)", min_value=0.0, max_value=8.0, value=_rc_default, step=0.01, format="%.2f", key=f"insp_rc_hours_{'noon' if '中午' in rc_shift else 'pm'}")
+                    st.caption("💡 定案標準：環保中午班 20 分鐘（0.33 小時）、下午班 15 分鐘（0.25 小時）。開會、大掃除等額外時數請至「🎖️ 服務時數發放」處理。")
                 
                     trash_inspectors = [p for p in INSPECTOR_LIST if "垃圾" in p.get("raw_role", "") or "回收" in p.get("raw_role", "") or "環保" in p.get("raw_role", "")]
                     _shift_tagged = [p for p in trash_inspectors if shift_tag in p.get("raw_role", "")]
