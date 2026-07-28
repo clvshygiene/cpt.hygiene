@@ -408,6 +408,15 @@ try:
             s = s[:-2]
         return s
 
+    def parse_dates_mixed(series):
+        """[V6.5 Fix] 解析混合格式日期欄（2026/4/14 與 2026-07-07 並存）。
+        pandas 2+ 以首筆推斷格式，混格式會把不符者變 NaT → 先統一分隔符再逐元素解析。"""
+        s = series.astype(str).str.strip().str.replace("/", "-", regex=False)
+        try:
+            return pd.to_datetime(s, errors="coerce", format="mixed").dt.date
+        except (TypeError, ValueError):  # 舊版 pandas 不支援 format="mixed"
+            return pd.to_datetime(s, errors="coerce").dt.date
+
     # ==========================================
     # 本機 SQLite（只保留 dedup + 監控狀態，不含 task_queue）
     # ==========================================
@@ -3758,7 +3767,8 @@ try:
                         for _c in _dk_cols:
                             dkd[_c] = pd.to_numeric(dkd[_c], errors="coerce").fillna(0) if _c in dkd.columns else 0
                         dkd["扣分合計"] = dkd[_dk_cols].sum(axis=1)
-                        dkd = dkd[(dkd["日期"].astype(str) == str(dk_date)) & (dkd["扣分合計"] > 0) & (dkd["扣分合計"] <= 20)]  # [V6.4] 排除異常值
+                        dkd["_dkdt"] = parse_dates_mixed(dkd["日期"])  # [V6.5 Fix] 混合日期格式
+                        dkd = dkd[(dkd["_dkdt"] == dk_date) & (dkd["扣分合計"] > 0) & (dkd["扣分合計"] <= 20)]  # [V6.4] 排除異常值
                         if dkd.empty:
                             st.success(f"🎉 {dk_date} 沒有扣分紀錄，不需要印督核單。")
                         else:
@@ -3933,7 +3943,7 @@ td.pt{{font-weight:800;text-align:center;}}
                         for _c in _rv_cols:
                             _rvd[_c] = pd.to_numeric(_rvd[_c], errors="coerce").fillna(0) if _c in _rvd.columns else 0
                         _rvd["扣分合計"] = _rvd[_rv_cols].sum(axis=1)
-                        _rvd["_dt"] = pd.to_datetime(_rvd["日期"], errors="coerce").dt.date
+                        _rvd["_dt"] = parse_dates_mixed(_rvd["日期"])  # [V6.5 Fix] 混合日期格式
                         _rvd = _rvd[(_rvd["扣分合計"] > 0) & (_rvd["修正"] != True) & (_rvd["_dt"] >= today_tw - timedelta(days=14))]
                         if _rvd.empty:
                             st.info("近 14 天沒有可撤銷的扣分紀錄。")
@@ -3960,68 +3970,6 @@ td.pt{{font-weight:800;text-align:center;}}
                                         st.success("✅ 已排入撤分佇列，約 10–30 秒後生效，儀表板與成績將自動重算。")
                                     else:
                                         st.error("❌ 排入佇列失敗，請重試或檢查網路連線。")
-
-                st.markdown("---")
-                st.markdown("#### 🗂️ 線上申訴審核（管道已關閉，此區僅處理先前遺留的案件）")
-
-                # [Fix] 用 session_state 紀錄本地已排入佇列的申訴 ID，避免重複顯示
-                if "queued_appeal_ids" not in st.session_state:
-                    st.session_state.queued_appeal_ids = set()
-
-                ap_df = load_appeals()
-                pending_aps = ap_df[ap_df["處理狀態"]=="待處理"]
-                # 過濾掉已排入佇列的
-                if not pending_aps.empty and st.session_state.queued_appeal_ids:
-                    pending_aps = pending_aps[~pending_aps["對應紀錄ID"].astype(str).isin(st.session_state.queued_appeal_ids)]
-                
-                if pending_aps.empty: 
-                    st.success("目前無待審核的申訴案件。")
-                else:
-                    st.caption(f"共 {len(pending_aps)} 筆待審核，審核後系統將背景處理，不需等待。")
-                    for i, r in pending_aps.iterrows():
-                        with st.container(border=True):
-                            c1, c2 = st.columns([3,2])
-                            c1.write(f"### {r['班級']} | {r['違規項目']} (扣 {r['原始扣分']} 分)")
-                            c1.write(f"**申訴理由**: {r['申訴理由']}")
-                            c1.caption(f"違規日期: {r['違規日期']} | 申訴時間: {r['登錄時間']}")
-                            
-                            img_urls = str(r.get('佐證照片', ''))
-                            if img_urls and "http" in img_urls:
-                                c2.image([p for p in img_urls.split(";") if "http" in p], width=250)
-                            else:
-                                c2.info("無佐證照片")
-                                
-                            reply_text = c1.text_input("💬 審核回覆 (填寫後學生將在查詢頁面看到此說明)", key=f"reply_{i}")
-                            
-                            col_btn1, col_btn2 = c1.columns(2)
-                            if col_btn1.button("✅ 核可並撤銷扣分", key=f"ok_{i}"): 
-                                _tid = enqueue_task("appeal_review", {
-                                    "record_id": str(r["對應紀錄ID"]),
-                                    "status": "已核可",
-                                    "reply_text": reply_text
-                                })
-                                if _tid:
-                                    st.session_state.queued_appeal_ids.add(str(r["對應紀錄ID"]))
-                                    c1.success("✅ 已排入佇列，系統將背景處理核可與撤銷扣分。")
-                                else:
-                                    c1.error("❌ 排入佇列失敗，請重試或檢查網路連線。")
-                            if col_btn2.button("🚫 駁回維持原判", key=f"ng_{i}"): 
-                                _tid = enqueue_task("appeal_review", {
-                                    "record_id": str(r["對應紀錄ID"]),
-                                    "status": "已駁回",
-                                    "reply_text": reply_text
-                                })
-                                if _tid:
-                                    st.session_state.queued_appeal_ids.add(str(r["對應紀錄ID"]))
-                                    c1.info("已排入佇列，系統將背景處理駁回。")
-                                else:
-                                    c1.error("❌ 排入佇列失敗，請重試或檢查網路連線。")
-
-                    if st.button("🔄 重新整理申訴列表", key="refresh_appeals"):
-                        st.session_state.queued_appeal_ids.clear()
-                        load_appeals.clear()
-                        load_main_data.clear()
-                        st.rerun()
 
             with t_excellent:
                 st.subheader("⭐ 優良審核")
@@ -4766,13 +4714,18 @@ td.pt{{font-weight:800;text-align:center;}}
                                 st.warning("service_hours 分頁沒有資料。")
                             else:
                                 _svc_df["_row"] = range(2, len(_svc_df) + 2)  # [V6.2] 對應試算表實際列號（蓋章用）
-                                _svc_df["日期"] = pd.to_datetime(_svc_df["日期"], errors="coerce").dt.date
+                                _n0 = len(_svc_df)
+                                _svc_df["日期"] = parse_dates_mixed(_svc_df["日期"])  # [V6.5 Fix] 混合日期格式
                                 _svc_df["時數"] = pd.to_numeric(_svc_df["時數"], errors="coerce").fillna(0)
                                 _svc_df["學號"] = _svc_df["學號"].apply(clean_id)
+                                _n_bad_date = int(_svc_df["日期"].isna().sum())
                                 _svc_df = _svc_df[(_svc_df["日期"] >= _exp_start) & (_svc_df["日期"] <= _exp_end) & (_svc_df["時數"] > 0)]
+                                _n1 = len(_svc_df)
                                 _svc_df = _svc_df[~_svc_df["類別"].astype(str).str.contains("消警告", na=False)]  # [V6.3] 消警告=銷過用不計時數；補打掃照常計入
+                                _n2 = len(_svc_df)
                                 if "🆕" in _exp_scope and "匯出批號" in _svc_df.columns:
                                     _svc_df = _svc_df[_svc_df["匯出批號"].astype(str).str.strip() == ""]
+                                st.caption(f"🔍 篩選診斷：全部 {_n0} 筆 → 日期時數符合 {_n1} 筆 → 排除消警告後 {_n2} 筆 → 未蓋章 {len(_svc_df)} 筆" + (f"（⚠️ {_n_bad_date} 筆日期無法解析）" if _n_bad_date else ""))
                                 if _svc_df.empty:
                                     st.warning("⚠️ 此範圍內沒有符合的資料。若選了「🆕 僅未蓋章」，代表這段期間的資料都已匯出過，可改選「🔁 全部資料」重新匯出。")
 
