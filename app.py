@@ -3654,6 +3654,12 @@ try:
                     for _c in _score_cols:
                         d[_c] = pd.to_numeric(d[_c], errors="coerce").fillna(0) if _c in d.columns else 0
                     d["扣分合計"] = d[_score_cols].sum(axis=1)
+                    # [V6.4] 異常值隔離：單筆合計 > 20 視為資料異常（誤填學號/電話等），排除統計並提示
+                    _bad = d[d["扣分合計"] > 20]
+                    if not _bad.empty:
+                        st.error("🚑 偵測到 " + str(len(_bad)) + " 筆分數異常的紀錄（單筆扣分 > 20，疑似誤填），已自動排除於統計之外。請至「📣 申訴與撤分」將其撤銷，或直接修正 main_data 分頁的分數欄：")
+                        st.dataframe(_bad[["日期", "班級", "評分項目", "檢查人員", "扣分合計", "紀錄ID"]], hide_index=True, use_container_width=True)
+                        d = d[d["扣分合計"] <= 20]
                     d["週次"] = pd.to_numeric(d.get("週次"), errors="coerce").fillna(0).astype(int)
                     _cur_w = get_week_num(today_tw)
                     _weeks = sorted([int(w) for w in d["週次"].unique() if w > 0], reverse=True)
@@ -3734,7 +3740,7 @@ try:
                         for _c in _dk_cols:
                             dkd[_c] = pd.to_numeric(dkd[_c], errors="coerce").fillna(0) if _c in dkd.columns else 0
                         dkd["扣分合計"] = dkd[_dk_cols].sum(axis=1)
-                        dkd = dkd[(dkd["日期"].astype(str) == str(dk_date)) & (dkd["扣分合計"] > 0)]
+                        dkd = dkd[(dkd["日期"].astype(str) == str(dk_date)) & (dkd["扣分合計"] > 0) & (dkd["扣分合計"] <= 20)]  # [V6.4] 排除異常值
                         if dkd.empty:
                             st.success(f"🎉 {dk_date} 沒有扣分紀錄，不需要印督核單。")
                         else:
@@ -5440,6 +5446,10 @@ td.pt{{font-weight:800;text-align:center;}}
                                 st.rerun()
                             except Exception as _pe:
                                 st.error(f"❌ 名冊讀取失敗：{_pe}")
+                    # [V6.4 Fix] 名冊對照表定義在區塊最上層，批次與單一下載路徑共用
+                    _SESS_ROS = st.session_state.get("session_roster", {})
+                    _NAME_MAP = load_roster_name_map()
+                    _NAME_MAP.update({_s: _v[3] for _s, _v in _SESS_ROS.items()})
 
                     # [方案A] 顯示模式切換
                     _show_all_issued = st.checkbox(
@@ -5527,9 +5537,6 @@ td.pt{{font-weight:800;text-align:center;}}
                                     _grouped[_sid].append(_rec)
 
                                 # 顯示摘要表格
-                                _NAME_MAP = load_roster_name_map()  # [V6.3] 銷過單姓名自動帶入
-                                _SESS_ROS = st.session_state.get("session_roster", {})
-                                _NAME_MAP.update({_s: _v[3] for _s, _v in _SESS_ROS.items()})  # [V6.4 資安] 階段名冊優先
                                 _summary_rows = []
                                 for _sid, _recs in sorted(_grouped.items()):
                                     _cls_name = (_SESS_ROS.get(clean_id(_sid), ["","","",""])[1] or ROSTER_DICT.get(clean_id(_sid), "未知班級"))
