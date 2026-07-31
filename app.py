@@ -3791,17 +3791,17 @@ try:
 </div>""")
                             _dk_html = f"""<!DOCTYPE html><html lang='zh-Hant'><head><meta charset='UTF-8'><title>督核單 {dk_date}</title>
 <style>
-body{{font-family:'Noto Sans TC','Microsoft JhengHei',sans-serif;font-size:12pt;color:#2b2823;margin:0;background:#fff;}}
-.slip{{box-sizing:border-box;height:138mm;padding:10mm 12mm;border-bottom:1px dashed #999;page-break-inside:avoid;}}
+body{{font-family:'Noto Sans TC','Microsoft JhengHei',sans-serif;font-size:12.5pt;font-weight:600;color:#000;margin:0;background:#fff;}}
+.slip{{box-sizing:border-box;height:138mm;padding:10mm 12mm;border-bottom:1.5px dashed #555;page-break-inside:avoid;}}
 .slip:nth-child(2n){{page-break-after:always;}}
-h2{{font-size:16pt;text-align:center;margin:0 0 4mm;letter-spacing:.1em;}}
-.meta{{margin:0 0 2mm;}}
-table{{width:100%;border-collapse:collapse;font-size:12pt;}}
-th{{background:#fff;font-weight:800;text-align:left;padding:1.5mm 2mm;border-bottom:2.5px solid #2b2823;color:#1e6b50;}}
-td{{padding:1.5mm 2mm;border-bottom:1px solid #d8d3c8;vertical-align:top;}}
-td.pt{{font-weight:800;text-align:center;}}
-.sign{{margin-top:6mm;}}
-.appeal{{font-size:11pt;color:#6b6558;margin-top:2mm;}}
+h2{{font-size:17pt;font-weight:900;text-align:center;margin:0 0 4mm;letter-spacing:.1em;}}
+.meta{{margin:0 0 2mm;font-weight:700;}}
+table{{width:100%;border-collapse:collapse;font-size:12.5pt;}}
+th{{background:#fff;font-weight:900;text-align:left;padding:1.5mm 2mm;border-bottom:3px solid #000;color:#000;}}
+td{{padding:1.5mm 2mm;border-bottom:1.2px solid #888;vertical-align:top;font-weight:600;}}
+td.pt{{font-weight:900;text-align:center;font-size:13pt;}}
+.sign{{margin-top:6mm;font-weight:700;}}
+.appeal{{font-size:11pt;font-weight:600;color:#333;margin-top:2mm;}}
 @media print{{@page{{size:A4;margin:0;}}}}
 </style></head><body>{''.join(_slips)}</body></html>"""
                             st.download_button(
