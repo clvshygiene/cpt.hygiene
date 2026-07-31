@@ -4767,7 +4767,7 @@ td.pt{{font-weight:900;text-align:center;font-size:13pt;}}
                                 _TITLE = "市立中壢高級家事商業職業學校服務學習證明登錄表"
                                 _hdr = ["班級", "座號", "學號\n(務必輸入)", "姓名", "服務活動名稱\n(事由：請簡略說明)", "服務類別\n(填入代號)", "地點", "日期\n(107年3月1日請填1070301)", "時數小時\n(超過8小請以另筆資料登錄)"]
                                 _NOTE = "◎學號欄請務必輸入才可匯入校務系統，核章後請將紙本送至學務處，另請將電子檔寄至jiang@g.clvs.tyc.edu.tw(助理員姜禮洪信箱)"
-                                _COLW = {"A": 9, "B": 6, "C": 12, "D": 10, "E": 24, "F": 11, "G": 7, "H": 24, "I": 27}  # [V6.6] H日期、I時數加寬防折行
+                                _COLW = {"A": 9, "B": 6, "C": 15, "D": 10, "E": 24, "F": 13, "G": 7, "H": 30, "I": 30}  # [V6.6] H日期、I時數加寬防折行
 
                                 def _build_cert_sheet(_ws2, _chunk):
                                     for _cl, _wd in _COLW.items(): _ws2.column_dimensions[_cl].width = _wd
@@ -4795,11 +4795,10 @@ td.pt{{font-weight:900;text-align:center;font-size:13pt;}}
                                     _n = _ws2["A23"]; _n.value = _NOTE
                                     _n.font = _fk(); _n.alignment = _ac_l; _n.border = _bd
                                     _ws2.row_dimensions[23].height = 20
-                                    for _rng, _lbl in [("A24:B24", "簽表人："), ("C24:E24", "單位主管："), ("F24:G24", "學務處認證人："), ("H24:I24", "學務處認證日期：")]:
+                                    for _rng, _lbl in [("A24:C24", "簽表人："), ("D24:E24", "單位主管："), ("F24:H24", "學務處認證人："), ("I24", "學務處認證日期：")]:
                                         _ws2.merge_cells(_rng)
                                         _c = _ws2[_rng.split(":")[0]]; _c.value = _lbl
                                         _c.font = _fk(); _c.alignment = _ac_l
-                                        for _cc in _ws2[_rng][0]: _cc.border = _bd
                                     _ws2.row_dimensions[24].height = 26
 
                                 _buf = io.BytesIO()
