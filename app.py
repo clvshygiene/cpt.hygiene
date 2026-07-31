@@ -2754,6 +2754,7 @@ try:
             }}
             </style>
             <div class="mascot-container-h">
+                <img src="{mascot_url}" class="mascot-img-h" />
                 <div class="speech-bubble-h">
                     <strong>📢 組長廣播 / 糾察重點：</strong><br>
                     {formatted_hygiene}
@@ -3506,6 +3507,7 @@ try:
                         }}
                         </style>
                         <div class="mascot-container">
+                            <img src="{mascot_url}" class="mascot-img" />
                             <div class="speech-bubble">
                                 <strong>📢 組長廣播 / 今日任務：</strong><br>
                                 {formatted_task}
@@ -4765,10 +4767,16 @@ td.pt{{font-weight:900;text-align:center;font-size:13pt;}}
                                 _TITLE = "市立中壢高級家事商業職業學校服務學習證明登錄表"
                                 _hdr = ["班級", "座號", "學號\n(務必輸入)", "姓名", "服務活動名稱\n(事由：請簡略說明)", "服務類別\n(填入代號)", "地點", "日期\n(107年3月1日請填1070301)", "時數小時\n(超過8小請以另筆資料登錄)"]
                                 _NOTE = "◎學號欄請務必輸入才可匯入校務系統，核章後請將紙本送至學務處，另請將電子檔寄至jiang@g.clvs.tyc.edu.tw(助理員姜禮洪信箱)"
-                                _COLW = {"A": 9, "B": 6.5, "C": 12, "D": 11, "E": 26, "F": 11, "G": 8, "H": 17, "I": 13}
+                                _COLW = {"A": 9, "B": 6, "C": 12, "D": 10, "E": 24, "F": 11, "G": 7, "H": 24, "I": 27}  # [V6.6] H日期、I時數加寬防折行
 
                                 def _build_cert_sheet(_ws2, _chunk):
                                     for _cl, _wd in _COLW.items(): _ws2.column_dimensions[_cl].width = _wd
+                                    # [V6.6] 橫向列印＋縮放至一頁寬，版面與學校原版一致
+                                    _ws2.page_setup.orientation = "landscape"
+                                    _ws2.page_setup.fitToWidth = 1
+                                    _ws2.page_setup.fitToHeight = 1
+                                    from openpyxl.worksheet.properties import PageSetupProperties as _PSP
+                                    _ws2.sheet_properties.pageSetUpPr = _PSP(fitToPage=True)
                                     _ws2.merge_cells("A1:I1")
                                     _t = _ws2["A1"]; _t.value = _TITLE
                                     _t.font = _F(name="標楷體", size=16, bold=True); _t.alignment = _ac_c
@@ -4776,7 +4784,7 @@ td.pt{{font-weight:900;text-align:center;font-size:13pt;}}
                                     for _ci, _hv in enumerate(_hdr, start=1):
                                         _c = _ws2.cell(row=2, column=_ci, value=_hv)
                                         _c.font = _fk(); _c.alignment = _ac_c; _c.border = _bd
-                                    _ws2.row_dimensions[2].height = 42
+                                    _ws2.row_dimensions[2].height = 36
                                     for _ri in range(3, 23):  # 固定 20 列，不足留空格
                                         _ws2.row_dimensions[_ri].height = 22
                                         _row_vals = _chunk[_ri - 3] if _ri - 3 < len(_chunk) else [""] * 9
@@ -4786,7 +4794,7 @@ td.pt{{font-weight:900;text-align:center;font-size:13pt;}}
                                     _ws2.merge_cells("A23:I23")
                                     _n = _ws2["A23"]; _n.value = _NOTE
                                     _n.font = _fk(); _n.alignment = _ac_l; _n.border = _bd
-                                    _ws2.row_dimensions[23].height = 24
+                                    _ws2.row_dimensions[23].height = 20
                                     for _rng, _lbl in [("A24:B24", "簽表人："), ("C24:E24", "單位主管："), ("F24:G24", "學務處認證人："), ("H24:I24", "學務處認證日期：")]:
                                         _ws2.merge_cells(_rng)
                                         _c = _ws2[_rng.split(":")[0]]; _c.value = _lbl
