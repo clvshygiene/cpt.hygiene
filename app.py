@@ -1593,7 +1593,24 @@ try:
             cls = str(r.get("班級", "")).strip()
             area = str(r.get("外掃區域", "")).strip()
             if cls and area:
-                result[cls] = area
+                # [V6.7] 一班可拆成多列（每列一個區域代號），同班多列以「 / 」串接
+                result[cls] = f"{result[cls]} / {area}" if cls in result else area
+        return result
+
+    # [V6.7] 區域代號 → (班級, 外掃區域)。inspectors 的「負責範圍」可直接填代號（如 14、A8），
+    #        由此對照回班級；沒有代號欄或代號查不到時，仍視為班級名稱（向下相容）。
+    @safe_cached(ttl=3600, default_factory=dict)
+    def load_area_code_map():
+        ws = get_worksheet(SHEET_TABS["class_areas"])
+        if not ws:
+            raise RuntimeError("class_areas worksheet unavailable")
+        result = {}
+        for r in ws.get_all_records():
+            code = str(r.get("區域代號", "")).strip()
+            cls  = str(r.get("班級", "")).strip()
+            area = str(r.get("外掃區域", "")).strip()
+            if code and cls:
+                result[code] = (cls, area)
         return result
 
     @safe_cached(ttl=21600, default_factory=lambda: {"semester_start": "2025-08-25", "standard_n": 4})
@@ -2210,8 +2227,22 @@ try:
         ws = get_worksheet(SHEET_TABS["inspectors"])
         if not ws:
             raise RuntimeError("inspectors worksheet unavailable")
-        df = pd.DataFrame(ws.get_all_records())
-        if df.empty: return list(_INSPECTOR_DEFAULT)
+        # [V6.7] 改用 get_all_values 自組表：只認有名字的欄位、同名取第一個，
+        #        D 欄以後的雜訊或重複標題不再讓整份名單失效；空表 raise 讓 safe_cached 不快取。
+        all_vals = ws.get_all_values()
+        if len(all_vals) < 2:
+            raise RuntimeError("inspectors 分頁沒有資料，不快取")
+        _hdr = [str(h).strip() for h in all_vals[0]]
+        _keep = []
+        for _i, _h in enumerate(_hdr):
+            if _h and _h not in [k[1] for k in _keep]:
+                _keep.append((_i, _h))
+        _recs = [{h: (row[i] if i < len(row) else "") for i, h in _keep}
+                 for row in all_vals[1:] if any(str(c).strip() for c in row)]
+        df = pd.DataFrame(_recs)
+        if df.empty:
+            raise RuntimeError("inspectors 分頁為空，不快取")
+        _code_map = load_area_code_map()
         inspectors, id_c, r_c, s_c = [], next((c for c in df.columns if "學號" in c or "編號" in c), None), next((c for c in df.columns if "負責" in c or "項目" in c), None), next((c for c in df.columns if "班級" in c or "範圍" in c), None)
         if id_c:
             for _, row in df.iterrows():
@@ -2235,12 +2266,22 @@ try:
                         
                     if not allowed: allowed = ["內掃檢查"]
 
-                s_classes = [c.strip() for c in str(row[s_c]).replace("、", ";").replace(",", ";").split(";") if c.strip()] if s_c and str(row[s_c]) else []
-                
+                _tokens = [c.strip() for c in str(row[s_c]).replace("、", ";").replace(",", ";").replace("，", ";").split(";") if c.strip()] if s_c and str(row[s_c]) else []
+                # [V6.7] 負責範圍可混填「區域代號」或「班級名稱」：代號→查 class_areas 對回班級並記下個人掃區
+                s_classes, area_map = [], {}
+                for _t in _tokens:
+                    if _t in _code_map:
+                        _cls, _area = _code_map[_t]
+                        if _cls not in s_classes: s_classes.append(_cls)
+                        if _area: area_map[_cls] = f"{area_map[_cls]} / {_area}" if _cls in area_map else _area
+                    elif _t not in s_classes:
+                        s_classes.append(_t)
+
                 inspectors.append({
                     "label": f"學號: {sid}", "allowed_roles": allowed, 
                     "assigned_classes": s_classes, "id_prefix": sid[0] if sid else "X",
-                    "raw_role": s_role
+                    "raw_role": s_role,
+                    "areas": area_map   # [V6.7] {班級: 該糾察負責的那一段外掃區}
                 })
         return inspectors or list(_INSPECTOR_DEFAULT)
 
@@ -2926,7 +2967,7 @@ try:
                             _table_rows = []
                             for _c in assigned_classes:
                                 _done = _c in completed_class_names
-                                _area = _class_area_map.get(_c, "（未設定區域，請通知管理員）")
+                                _area = curr_inspector.get("areas", {}).get(_c) or _class_area_map.get(_c, "（未設定區域，請通知管理員）")
                                 _table_rows.append({
                                     "狀態": "✅ 已檢查" if _done else "⏳ 待檢查",
                                     "班級": _c,
@@ -2945,7 +2986,7 @@ try:
 
                         # [新增] 外掃模式：點選班級後，再次提示該班外掃區域
                         if role == "外掃檢查" and sel_cls:
-                            _sel_area = _class_area_map.get(sel_cls, "（未設定區域）")
+                            _sel_area = curr_inspector.get("areas", {}).get(sel_cls) or _class_area_map.get(sel_cls, "（未設定區域）")
                             st.info(f"📍 **{sel_cls}** 外掃區域：**{_sel_area}**")
 
                         # 判斷這是不是最後一個缺少的班級
